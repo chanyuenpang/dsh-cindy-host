@@ -29,3 +29,7 @@ generated-*.png
 .DS_Store
 Thumbs.db
 *.tmp
+
+# claw per-task runtime bookkeeping (the plan.json beside it is the durable record)
+.claw/tasks/**/.runtime/
+
