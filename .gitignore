@@ -37,3 +37,6 @@ Thumbs.db
 # claw per-task runtime bookkeeping (the plan.json beside it is the durable record)
 .claw/tasks/**/.runtime/
 
+
+# npm pack 产物（构建物，不入库）
+*.tgz

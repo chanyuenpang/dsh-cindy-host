@@ -94,6 +94,33 @@ dsh plugin --profile <profile> add dsh-cindy-host-demo@<version>
 第 5 步是**唯一能证明"别人装得上"的一步**，不能省：本地 link 装法掩盖掉的白名单、原生依赖、
 入口导出问题，都会在这一步暴露。
 
+### 5.1 干净安装实际踩到的两个坑（2026-09-17，0.1.0）
+
+1. **可选能力被静态 import 变成硬要求**。`src/dsh-plugin.js` 顶层 `import` 了
+   `@deepseek-ai/dsh-host-apiproxy`（只有老 DSH 的 `apiProxy` 路径才用到），它的传递依赖
+   `@deepseek-ai/dsh-agent-presets` 在干净环境里解析到没有 `InvalidPresetIdError` 的副本，
+   **插件加载失败 → 整个 profile 起不来**。修法：改惰性 `require` + 失败降级，依赖移入
+   `optionalDependencies`。**规则：可选能力一律不得阻断 mount。**
+2. **原生依赖在 pnpm 10 下不会自动构建**。`keytar` 需要编译 `keytar.node`，而 pnpm 10 默认
+   **不执行依赖的构建脚本**，于是干净 profile 里没有二进制，顶层 `import keytar` 直接让插件加载
+   失败。修法同上（惰性 + 降级：读凭据回"无会话"，写凭据抛出 `CREDENTIAL_STORE_UNAVAILABLE`）。
+
+### 5.2 安装方须知（写进面向用户的说明）
+
+- **pnpm 用户**：需要显式允许构建脚本，否则 `keytar` 没有二进制。二选一：
+  - `pnpm approve-builds`（交互式勾选 `keytar`）；或
+  - 在 profile 的 `package.json` 里加 `"pnpm": { "onlyBuiltDependencies": ["keytar"] }` 后重装。
+- **npm 用户**：默认会跑构建脚本，通常无需额外操作；需要编译工具链（Windows 上通常是 VS Build Tools）。
+- **没有凭据库也能装**（0.1.1 起）：插件照常 mount，只是登录/凭据相关能力明确不可用——这是刻意的降级，
+  不是"装坏了"。
+
+### 5.3 测 tarball 时的一个陷阱
+
+**同名同版本的 `file:` 依赖，pnpm 不会刷新**：修改后重新 `npm pack`、再 `dsh plugin add` 同一个
+`dsh-cindy-host-demo-0.1.0.tgz`，装上去的还是**旧副本**（实测：tarball 里已是新代码，profile 里仍是
+旧代码）。要么先删掉 `profiles/<p>/node_modules/dsh-cindy-host-demo` 再装，要么——更贴近真实发布
+流程——**每次测试都升版本号**。
+
 ## 6. 回滚与撤版
 
 - **未发 registry（tarball 分发）**：装回上一个 tarball 即可，最干净。

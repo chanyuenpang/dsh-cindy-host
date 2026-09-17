@@ -5,6 +5,20 @@
 
 ## [Unreleased]
 
+## [0.1.1] - 2026-09-17
+
+打包与安装修复：两者都只在**干净安装**（干净 DSH_HOME + tarball）下才会出现，本地 link 装法不会暴露。
+
+### Fixed
+
+- **插件不再因为可选依赖而装不上**：`@deepseek-ai/dsh-host-apiproxy`（只有老 DSH 的 `apiProxy`
+  路径需要）由顶层静态 import 改为惰性加载，并移入 `optionalDependencies`。它在干净环境里会拖入不兼容的
+  `@deepseek-ai/dsh-agent-presets`，原先会让插件加载失败、整个 profile 起不来；现在缺失或不兼容时降级为
+  "该 seam 不提供服务"。
+- **`keytar` 缺失不再致命**：pnpm 10 默认不执行依赖的构建脚本，干净安装下没有 `keytar.node`，原先顶层
+  `import keytar` 会让插件加载失败。现在惰性加载：读凭据回"无会话"，写凭据抛
+  `CREDENTIAL_STORE_UNAVAILABLE`，插件照常挂载。（装法见 `doc/publishing.md` §5.2。）
+
 ## [0.1.0] - 2026-09-17
 
 首个发布版本。验证于 **DSH `0.1.5-rc.2`**（Web profile，Windows）。

@@ -1,9 +1,47 @@
-import keytar from 'keytar';
+import { createRequire } from 'node:module';
 import { createHash } from 'node:crypto';
 import { homedir } from 'node:os';
 import { resolve as resolvePath } from 'node:path';
 
 const SERVICE = 'DSH Cindy Host';
+
+/**
+ * `keytar` is a **native** module, so it is loaded lazily and its absence is not fatal.
+ *
+ * Measured on a clean install (a packed tarball into a fresh `DSH_HOME`): pnpm 10 does not run
+ * dependency build scripts by default, so `keytar.node` was never built, and a top-level import
+ * here made the whole plugin fail to load — the profile would not boot over a *credential store*
+ * it may never need. An optional capability must not be able to break mounting, so the module is
+ * required the moment it is used and a failure degrades to "no credential store": a read answers
+ * "no stored session" (the card asks for a login), and a write throws a named error instead of
+ * pretending to have saved.
+ *
+ * @returns the keytar module, or null when it cannot be loaded on this machine.
+ */
+let keytarModule;
+function keytar() {
+  if (keytarModule === undefined) {
+    try {
+      keytarModule = createRequire(import.meta.url)('keytar');
+    } catch {
+      keytarModule = null;
+    }
+  }
+  return keytarModule;
+}
+
+/** Whether a credential store is usable here, for callers that want to say so. */
+export function credentialStoreAvailable() {
+  return keytar() !== null;
+}
+
+/** The error a write raises when this machine has no usable credential store. */
+export class CredentialStoreUnavailableError extends Error {
+  constructor() {
+    super('this machine has no usable credential store (keytar is not built; on pnpm 10 approve the keytar build script)');
+    this.code = 'CREDENTIAL_STORE_UNAVAILABLE';
+  }
+}
 
 /**
  * The credential-store entry the default installation has always used.
@@ -67,16 +105,24 @@ export function credentialAccount(env = process.env, defaultHome = defaultDshHom
 
 export async function loadSession(ports = {}) {
   const account = ports.account ?? credentialAccount();
-  const value = await keytar.getPassword(SERVICE, account);
+  const store = keytar();
+  if (store === null) return null; // no store here: "no stored session", never a crash
+  const value = await store.getPassword(SERVICE, account);
   return value ? JSON.parse(value) : null;
 }
 
 export async function saveSession(session, ports = {}) {
   const account = ports.account ?? credentialAccount();
-  await keytar.setPassword(SERVICE, account, JSON.stringify(session));
+  const store = keytar();
+  if (store === null) throw new CredentialStoreUnavailableError();
+  await store.setPassword(SERVICE, account, JSON.stringify(session));
 }
 
 export async function clearSession(ports = {}) {
   const account = ports.account ?? credentialAccount();
-  await keytar.deletePassword(SERVICE, account);
+  const store = keytar();
+  // Clearing what does not exist is the outcome the caller wanted, so a missing store is not an
+  // error here — unlike a save, which must not report success it cannot deliver.
+  if (store === null) return;
+  await store.deletePassword(SERVICE, account);
 }
