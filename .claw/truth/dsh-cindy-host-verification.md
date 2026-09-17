@@ -56,20 +56,24 @@ Verification rules:
 - Gate 2: `dsh --profile cindy-smoke --no-open --port 3081` must show a running host
   with no Cindy authentication prompt; the card bundle is the `dsh-cindy-host-demo`
   entry of `window.__DSH_BOOT__`.
-- **The clean-install gate is a pair, and only the first half is ours.** Gate 1 is
-  run in a **brand-new `DSH_HOME`** (not the sandbox), and it is the only evidence
-  that a stranger can install this: `dsh plugin --profile <new> add <tarball>` →
-  exit 0, then `--dump-config` → exit 0 with the `dsh-cindy-host` / `dsh-cindy-host-demo`
-  row present, and `dsh plugin --profile <new> list` naming the installed version.
-  Gate 2 in that same brand-new home **does not come up on DSH `0.1.5-rc.2`**, for
-  DSH-side reasons only (`doc/publishing.md` §5.4): the fresh profile falls back to
-  DSH's own nested dependency tree. It has been observed twice with different faces —
-  first as a fail-loud `ctx.commands.registerFileReceiptResolver is not a function`
-  from `@deepseek-ai/dsh-client-file-upload`, later as a **silent hang with no output
-  and no bound port**. Neither frame names this package. Do the second half of the
-  pair in an environment **derived from a profile that already boots**; treat "compose
-  passes and this package is absent from the failure stack" as this layer's evidence,
-  and do not read the DSH-side failure as an install defect of ours.
+- **The clean-install gate is one gate, and it must prove loading.** It is run in a
+  **brand-new `DSH_HOME`** (not the sandbox) with a profile derived from a real one
+  (`--from-default-profile web`, so it has a web server to answer on):
+  `dsh plugin --profile <new> add <tarball>` → exit 0; then assert **`profile-local
+  @deepseek-ai == 0`** (the plugin must contribute nothing to the host's module tree);
+  then `--dump-config` → exit 0 with the `dsh-cindy-host` row; then **start it and read
+  `/api/dsh-cindy-host/status` → 200 `installed=true`**.
+- **Composition is not loading.** This paragraph used to claim the second half of the
+  pair was blocked "for DSH-side reasons only", with the evidence being a failing stack
+  that named `@deepseek-ai/dsh-client-file-upload`. That conclusion was **wrong**: the
+  stack named a DSH package because *we* had installed a whole other DSH generation
+  (28 `@deepseek-ai/*@^0.1.1-rc.2` behind our `optionalDependencies` entry) into the
+  profile, and the fresh profile then composed a mixture of two generations. `0.1.2`
+  fixed it, and the same fresh-home procedure now ends in `200 installed=true`. The
+  retained rule: when a stack frame names someone else's package, first ask **where that
+  copy resolved from and which generation it is**, and never accept `--dump-config`
+  passing as evidence that an entry can load — a missing named export composes fine and
+  kills the profile at load time. See `.claw/adr/0010`.
 - Release channel: 0.1.1 is distributed as a **GitHub Release tarball**
   (`v0.1.1` + `dsh-cindy-host-demo-0.1.1.tgz`), not through a registry, so the only
   installable artifact is the asset itself. A release is verified by downloading the

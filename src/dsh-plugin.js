@@ -1,5 +1,4 @@
 import Schema from '@deepseek-ai/schemastery';
-import { settingsNamespace } from '@deepseek-ai/dsh-settings';
 import { createRequire } from 'node:module';
 import { DEFAULT_HOST_SETTINGS, SETTINGS_NAMESPACE, validateHostSettings } from './host-settings.js';
 import { DshHostSource } from './dsh-host-source.js';
@@ -16,6 +15,26 @@ import { API_PREFIX, createHostRoutes } from './host-routes.js';
 
 export const name = 'dsh-cindy-host';
 export const inject = ['settings'];
+
+/**
+ * Brand a string as a settings namespace.
+ *
+ * This used to be `import { settingsNamespace } from '@deepseek-ai/dsh-settings'`, and that import
+ * is why the plugin could not be installed on a current DSH: the helper exists in
+ * `0.1.1-rc.2` but **is not exported by `0.1.5-rc.2`** (whose surface is `SettingsProvider`,
+ * `SettingsConflictError`, `redactSecrets`, `default`). Keeping it meant declaring an old DSH
+ * generation as a dependency, and installing that generation into a profile is what broke the
+ * host's own composition (`dsh-client-file-upload` / `dsh-session` mismatch → profile will not
+ * boot). See `doc/publishing.md` §5.6.
+ *
+ * The helper is a brand, not behaviour — validate, return the string — so it lives here now and
+ * costs nothing: the namespace is the value, the pattern is the contract.
+ */
+const SETTINGS_NAMESPACE_PATTERN = /^[a-z][a-z0-9-]*$/;
+function settingsNamespace(value) {
+  if (!SETTINGS_NAMESPACE_PATTERN.test(value)) throw new TypeError(`settings namespace "${value}" must match ${String(SETTINGS_NAMESPACE_PATTERN)}`);
+  return value;
+}
 const ControllerSchema = Schema.object({ state: Schema.union(['authorized', 'revoked']), displayName: Schema.string(), grantedAt: Schema.string(), revokedAt: Schema.string(), grantRevision: Schema.natural() });
 // The archive/delete/pin flags a controller writes: this Host's own answer to three
 // actions DSH has no concept of. `pinnedAt: ''` is a remembered unpin (settings

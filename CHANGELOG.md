@@ -15,7 +15,45 @@
   （`doc/cindy-phone-link.md` 原写 48 / 144）；README 的「尚未配置远端」改为已推送到公开远端并发了
   `v0.1.1` Release；CHANGELOG 补上 `[0.1.1]` 链接、去掉并不存在的 `v0.1.0` 死链。
 
+## [0.1.2] - 2026-09-17
+
+**这是 0.1.1 那个附件的修复版。0.1.1 装进别人的 profile 会让那个 profile 起不来**，所以请不要再用
+0.1.1 的 tarball 安装。
+
+### Fixed
+
+- **不再把 DSH 自己的一代装进 profile**：`@deepseek-ai/dsh-session` / `@deepseek-ai/dsh-settings` 由
+  `dependencies` 移到 `peerDependencies`，`@deepseek-ai/dsh-host-apiproxy` 改为 optional 的 peer
+  （`optionalDependencies` **不是**"可以不装"——pnpm 默认会装它）。此前它会牵出
+  `dsh-host-apiproxy@0.1.1-rc.2` 的 **28 个 `@deepseek-ai/*@^0.1.1-rc.2`**，整代装进 profile；
+  宿主 `0.1.5-rc.2` 再去组合这个混合体就失败：`ctx.commands.registerFileReceiptResolver is not a
+  function`（`dsh-client-file-upload`）、`@deepseek-ai/dsh-llm does not provide an export named
+  'CallId'`（`dsh-session`）。
+- **不再 import 只在旧代存在的导出**：`settingsNamespace` 只存在于
+  `@deepseek-ai/dsh-settings@0.1.1-rc.2`；`0.1.5-rc.2` 的导出面是 `SettingsProvider` /
+  `SettingsConflictError` / `redactSecrets` / `default`。它是"校验后原样返回字符串"的 brand，现已内联
+  到 `src/dsh-plugin.js`。这就是此前必须把旧代声明成依赖的原因。
+
+### 验收（干净安装，全新 `DSH_HOME` + `--from-default-profile web`）
+
+```
+dsh plugin add <0.1.2 tarball>   → exit 0
+profile-local @deepseek-ai       → 0        （不再拖任何一代 DSH 进来）
+dsh --profile <p> --dump-config  → exit 0，含 dsh-cindy-host 行
+dsh web                          → 启动，监听端口
+GET /api/dsh-cindy-host/status   → 200 installed=true
+npm test                         → 446/446
+```
+
+### 文档
+
+- `doc/publishing.md` §5.4 的结论**更正**：原先写"全新 profile 起不来是 DSH 侧的问题、与本包无关"，
+  这是错的，根因正是本包把旧一代 DSH 装进了 profile。§5.6 新增依赖规则与写死的检查步骤。
+
 ## [0.1.1] - 2026-09-17
+
+> **这个版本的附件有缺陷，不要用它安装**（见 0.1.2）。缺陷是"装进别人的 profile 会让它起不来"，
+> 不是插件功能本身。
 
 打包与安装修复：两者都只在**干净安装**（干净 DSH_HOME + tarball）下才会出现，本地 link 装法不会暴露。
 

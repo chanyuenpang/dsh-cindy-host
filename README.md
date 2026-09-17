@@ -85,7 +85,7 @@ rules are covered without a browser.
 
 `DshHostSource` has contract tests for the older public `InProcessApiClient(toFetchHandler(ctx.apiProxy))` adapter. Current DSH Web (`0.1.5-rc.2`) does not mount `apiProxy`; it exposes Typert remotes instead. Therefore this bundle mounts safely without a live DSH source when `apiProxy` is absent, and the isolated smoke test validates composition/lifecycle only.
 
-Do not enable Cindy transport in production yet. A separate compatibility slice must adapt the projection source to the current Typert session/event remotes, then add a real-host read-only smoke test. The external package must use only version-pinned public DSH packages and never resolve DSH's nested `node_modules`.
+**DSH's own packages are `peerDependencies`, never `dependencies`** — the host supplies them, and a plugin that installs its own copy drags a whole DSH generation into the profile and stops the profile from booting. That is what `0.1.1` did; see [`doc/publishing.md`](doc/publishing.md) §5.4 and §5.6 for the measured failure and the rule.
 
 ## 安装要求：需要编译原生模块
 
@@ -103,6 +103,8 @@ Do not enable Cindy transport in production yet. A separate compatibility slice 
   相关能力明确不可用。也就是说"需要编译"影响的是凭据能力，不是能否安装。
 
 细节与实测记录见 [`doc/publishing.md`](doc/publishing.md) §5.2。
+
+**同时：不要用 `0.1.1` 及更早的 tarball 装到别人的 profile 上。** 那些版本的 `package.json` 把 DSH 自己的包声明成了依赖，pnpm 会把**整整一代旧 DSH**（28 个 `@deepseek-ai/*`）一起装进 profile，宿主再组合这个混合体就会启动失败。`0.1.2` 起改为 `peerDependencies` 且不再 import 只在旧代存在的导出，实测干净安装可以启动（§5.4 / §5.6）。
 
 ## 发布指南
 

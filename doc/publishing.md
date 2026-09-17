@@ -52,9 +52,10 @@ dsh plugin --profile <profile> add dsh-cindy-host-demo@<version>
    改由 Typert remotes 暴露会话；本插件在缺席时安全挂载并在通道层回 `NOT_AVAILABLE`。发布前用
    一个干净 profile 复核这一点（`dsh --profile <p> --dump-config` 能 compose、`dsh --profile <p>`
    起得来且没有 Cindy 登录提示）。
-2. **只依赖版本锁定的公开 DSH 包，绝不去解析 DSH 自己的嵌套 `node_modules`**。依赖里写
-   `@deepseek-ai/dsh-session` 这类公开包是可以的；`require` 到 `dsh/node_modules/...` 的内部路径
-   在别人机器上必然碎。
+2. **DSH 自己的包一律 `peerDependencies`，绝不进 `dependencies`（也绝不进
+   `optionalDependencies`）**。宿主提供它们；插件自己装一份，就等于把**另一代 DSH** 装进别人的
+   profile，宿主再组合这个混合体便起不来。0.1.1 犯的正是这个错，实测与规则见 §5.4 / §5.6。
+   `dependencies` 里只放宿主不提供的库（本包是 `keytar` 与 `ws`）。
 3. **原生依赖要写清**：`keytar` 是原生模块（Windows 凭据管理器）。发布说明里必须写明平台/Node ABI
    要求（本包 `engines.node >= 22`），否则会出现"装上了但起不来"。
 4. **`private: true` 必须改成 `false`**（当前为 `true`，这是防止误发布的开关，不是发布配置）。
@@ -128,25 +129,50 @@ dsh plugin --profile <profile> add dsh-cindy-host-demo@<version>
 旧代码）。要么先删掉 `profiles/<p>/node_modules/dsh-cindy-host-demo` 再装，要么——更贴近真实发布
 流程——**每次测试都升版本号**。
 
-### 5.4 新建的 profile 会回落到 DSH 嵌套依赖，可能因此起不来（DSH 侧问题，2026-09-17）
+### 5.4 全新 profile 起不来：根因是我们把旧一代 DSH 装进了它的依赖树（0.1.1 的缺陷，2026-09-17 更正）
 
-在全新 `DSH_HOME` 里 `--from-default-profile web` 建出来的 profile，`dsh web` 会在 `file-upload`
-这一行启动失败：
+**这一节原先的结论是错的，错误本身值得留着。** 当时写成「新建 profile 会回落到 DSH 嵌套依赖，
+是 DSH 侧的问题，与本包无关」，理由是失败栈里出现的是 DSH 自己的包。实际上：
 
 ```
 @deepseek-ai/dsh-client-file-upload
   ctx.commands.registerFileReceiptResolver is not a function
 ```
 
-证据：失败帧来自 **DSH 自己的嵌套树**（`…/dsh/node_modules/@deepseek-ai/dsh-client-file-upload`，
-版本 `0.1.5-rc.2`），而新建 profile 与在用的 `web` profile **编出来的配置完全相同**
-（`file-upload` 行数都是 2）。区别只在解析路径：新建 profile 没有自己完整的依赖树，于是回落到 DSH
-嵌套的那份，而那份与同一安装里的 `dsh-commands` 内部不一致；长期在用的 profile 有自己的 `.pnpm`
-树，所以不受影响。
+失败栈里出现 DSH 的包**不代表** DSH 有问题——它也可能是我们把它**换成了另一代**。真正发生的是：
 
-**对本仓库的影响**：干净安装的验收要在**从一个能跑的 profile 派生出来的**环境里做，或者接受
-"compose 通过 + 插件不再出现在失败栈里"作为这一层的证据。这是 DSH 侧的问题，值得单独上报；不要
-把它误判成自己插件的安装缺陷（我们最初就这么怀疑过，是版本与解析路径的证据把它排除掉的）。
+1. `@deepseek-ai/dsh-host-apiproxy@0.1.1-rc.2` 的依赖是 **28 个 `@deepseek-ai/*@^0.1.1-rc.2`**
+   （`dsh-commands`、`dsh-llm`、`dsh-session`、`dsh-tools`…）。它当时在 `optionalDependencies` 里，
+   而 **pnpm 默认连 optionalDependency 也安装**，于是这一代被整体装进 profile。
+   实测：安装前 profile-local `@deepseek-ai` 为 0，安装后 21 个，全部 `0.1.1-rc.2`。
+2. 宿主是 `0.1.5-rc.2`。组合里于是混了两代：`file-upload` 拿到的是另一代的 `ctx.commands`
+   （缺 `registerFileReceiptResolver`）；`loader entry session (@deepseek-ai/dsh-session)` 里
+   0.1.1 的 `dsh-session` 去 import 宿主的 0.1.5 `dsh-llm`，后者没有 `CallId`。
+3. 我们之所以把旧代声明成依赖，是因为**代码 import 了只在旧代存在的导出**：
+   `settingsNamespace` 存在于 `@deepseek-ai/dsh-settings@0.1.1-rc.2`，而 `0.1.5-rc.2` 的导出面只有
+   `SettingsProvider / SettingsConflictError / redactSecrets / default`（直接 import 验证过）。
+   也就是说插件一直靠"把旧那代装进来"才能加载。
+
+**0.1.2 的修法**：把 `settingsNamespace` 内联进 `src/dsh-plugin.js`（它的实现只是个 brand：
+校验 `/^[a-z][a-z0-9-]*$/` 后原样返回字符串），DSH 的包全部改 `peerDependencies`，
+`dsh-host-apiproxy` 另标 `optional`。修完的实测（全新 `DSH_HOME` + `--from-default-profile web`）：
+
+```
+add exit=0；profile-local @deepseek-ai = 0
+compose exit=0（有 dsh-cindy-host 行）
+dsh web: http://127.0.0.1:3095/?token=…
+/api/dsh-cindy-host/status → 200 installed=true state=disconnected dataSource=session-controller
+```
+
+**教训（比结论更值钱）**：
+
+- 失败栈里出现别人的包，**先问"这个包是从哪解析来的、是哪一代"**，再问"谁的锅"。我们当时只看了
+  包名，就把它判给了 DSH。
+- `optionalDependencies` **不是**"可以不装"：pnpm 默认会装。想表达"宿主有就用、没有就算了"，
+  正确写法是 `peerDependencies` + `peerDependenciesMeta.optional`。
+- 一个**只在一个方向成立的现象**（"`file:` 装法坏、`link:` 装法好"）要当心：这里的真变量不是
+  安装形式，而是 pnpm 有没有**真的**把依赖图装进 profile。第一次改回 `link:` 时 pnpm 打了
+  `resolved 71, reused 1, added 0`（什么也没干），所以那次"好"是假象。
 
 ### 5.5 0.1.1 的实际发布方式：GitHub Release（不走 registry，2026-09-17）
 
@@ -156,10 +182,37 @@ dsh plugin --profile <profile> add dsh-cindy-host-demo@<version>
   同时打 tag `v0.1.1` 推远端，便于追溯与回滚。
 - **不 `npm publish`**，因此 `package.json` 保持 `private: true` 与 `license: UNLICENSED`——
   `private: true` 在这里是**防误发布的开关**，不是"还没准备好发布"的标记，别顺手改成 `false`。
-- 代价与理由：真机验收里"干净 profile 冷启动"这一层仍被 DSH 自身缺陷挡住（§5.4），而
-  `UNLICENSED` 的包公开进 registry 等于以"未授权"状态分发。tarball 渠道足够分发，且撤回成本最低。
+- 代价与理由：`UNLICENSED` 的包公开进 registry 等于以"未授权"状态分发；tarball 渠道足够分发，
+  且撤回成本最低。**0.1.1 的这个附件本身是有缺陷的**（会拖旧一代 DSH 进 profile，见 §5.4），
+  0.1.2 起才是可用的分发物。
 - **以后要转 registry**：先把 `private` 改 `false`、给一个正式许可证（如 MIT）、
   再按第 5 步的完整清单走一遍——尤其第 5 步的干净 profile 验证，不能省。
+
+### 5.6 依赖规则：DSH 的包只能是对等依赖（写死的检查）
+
+**规则一**：`dependencies` 里不出现任何 `@deepseek-ai/*`。装完后在 profile 里查：
+
+```powershell
+(Get-ChildItem "$env:DSH_HOME\profiles\<p>\node_modules\@deepseek-ai" -Directory -ErrorAction SilentlyContinue).Count
+# 期望 0 —— 非 0 就是我们把某个 DSH 代装进了别人的树
+```
+
+**规则二**：`peerDependencies` 的区间必须覆盖宿主当前那一代。semver 的预发布规则下
+`^0.1.1-rc.2` **匹配不到** `0.1.5-rc.2`（比对符的 `[major,minor,patch]` 必须一致），所以要写
+`^0.1.1-rc.2 || ^0.1.5-rc.2` 这样的或区间。生态里的参照：
+`dsh-codex` 用 `^0.1.5-rc.2`，`dsh-cost-meter` 用
+`^0.1.0-rc.6 || ^0.1.1-0 || ^0.1.2-0 || ^0.1.3-0 || ^0.1.5-0`。
+
+**规则三**：`import` 的每一个具名导出，都要在当前宿主上验一遍。发布前跑一次：
+
+```powershell
+dsh --profile <干净 profile> --dump-config   # compose 必须 exit 0 且含我们的行
+dsh --profile <干净 profile> --no-open --port <port>
+# 然后 GET /api/dsh-cindy-host/status → 200
+```
+
+只做 compose 不够：**缺一个导出同样能让 compose 通过**，它到加载时才炸，而且 DSH 把加载失败的
+entry 当作致命错误（整个 profile 起不来）。`0.1.1` 就是 compose 通过、加载失败。
 
 ## 6. 回滚与撤版
 
@@ -174,9 +227,12 @@ dsh plugin --profile <profile> add dsh-cindy-host-demo@<version>
 ```
 [ ] 门禁四项全绿（unit / audit / 沙盒 / 真机 105-105）
 [ ] 版本号已升，CHANGELOG 写明验证过的 DSH 版本
-[ ] private=false；files 白名单；依赖无内部路径
+[ ] private=false；files 白名单；dependencies 里没有任何 @deepseek-ai/*（§5.6 规则一）
 [ ] npm pack --dry-run 清单已人眼确认（无凭据/沙盒/日志/开发记录）
-[ ] 干净 profile：compose 通过 + 起得来 + 卡片被服务
+[ ] 干净 DSH_HOME + web 派生 profile 装 tarball：add exit 0
+[ ] 装完 profile-local @deepseek-ai 计数 == 0（没把某一代 DSH 拖进去）
+[ ] compose 通过 **并且真的启动**，GET /api/dsh-cindy-host/status → 200 installed=true
+      （只做 compose 不算数：缺一个具名导出同样能 compose 通过，却在加载时让整个 profile 起不来）
 [ ] 发布（npm 或 tarball），并打 tag 推远端
 [ ] 真机：告知 → 60s → 重启 → 复测现象
 [ ] 失败路径已想好（deprecate + 修复版本，而不是 unpublish）

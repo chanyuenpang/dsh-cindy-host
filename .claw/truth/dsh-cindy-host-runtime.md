@@ -3,7 +3,7 @@
 <!-- state: current -->
 ## Current behavior
 
-`dsh-cindy-host-demo` (package name `dsh-cindy-host-demo`, version `0.1.1`) is a DSH
+`dsh-cindy-host-demo` (package name `dsh-cindy-host-demo`, version `0.1.2`) is a DSH
 plugin bundle that mounts the 「Cindy 手机连接」 card in **Settings → Plugins** and
 lets this Host be reached from the Cindy mobile client. The Host is the only truth
 for connection state: the card writes settings and renders whatever the Host's
@@ -131,15 +131,28 @@ Failure containment and observability:
 
 ## Distribution
 
-- **0.1.1 ships as a GitHub Release tarball, not to a registry**: tag `v0.1.1` +
-  asset `dsh-cindy-host-demo-0.1.1.tgz` on
+- **0.1.2 ships as a GitHub Release tarball, not to a registry** (0.1.1 did too, and its
+  asset is defective — see below): tag `v0.1.2` + asset `dsh-cindy-host-demo-0.1.2.tgz` on
   `https://github.com/chanyuenpang/dsh-cindy-host/releases`. `package.json` therefore
   keeps `private: true` and `license: UNLICENSED`; `private` here is the
   accidental-publish switch, not a "not ready" marker (`doc/publishing.md` §5.5).
+- **DSH's own packages are peers, never dependencies** — this is the rule 0.1.1 broke.
+  Every `@deepseek-ai/*` the plugin uses is a `peerDependency`; `dependencies` holds only
+  what the host does not provide (`keytar`, `ws`). A DSH package declared as a dependency
+  (or as an **optional** dependency — pnpm installs those by default) drags a whole DSH
+  generation into the profile, and the host then composes a mixture of two generations and
+  dies at load. Measured on 0.1.1: 21 profile-local `@deepseek-ai` packages at
+  `0.1.1-rc.2` next to a `0.1.5-rc.2` host → `registerFileReceiptResolver is not a
+  function` / `dsh-llm does not provide CallId`. See `.claw/adr/0010`.
+- **Import only names the current host exports.** `settingsNamespace` existed in
+  `@deepseek-ai/dsh-settings@0.1.1-rc.2` and is gone in `0.1.5-rc.2` (whose surface is
+  `SettingsProvider`, `SettingsConflictError`, `redactSecrets`, `default`); it was the
+  reason the old generation had to be installed. It is a brand — validate
+  `/^[a-z][a-z0-9-]*$/`, return the string — so it now lives in `src/dsh-plugin.js`.
 - **Optional capabilities may never block mounting.** `@deepseek-ai/dsh-host-apiproxy`
   (only used on the older DSH `apiProxy` path) and `keytar` (native, and not built by
   default under pnpm 10) are both loaded **lazily, inside a try/catch, with a
-  degradation path**; the proxy dependency also lives in `optionalDependencies`. A
+  degradation path**; the proxy is an optional *peer* so it is never installed for us. A
   top-level `import` of either one turns an optional capability into a hard
   requirement that fails the whole profile at boot — that is exactly what 0.1.0 did.
 - **`keytar` is the one install-time compilation requirement** (`keytar.node`), because
@@ -149,6 +162,22 @@ Failure containment and observability:
 
 <!-- state: history -->
 ## Evolution history
+
+<!-- dated: 2026-09-17 -->
+### The dependency declarations poisoned the profile that installed them
+
+0.1.1's fix for "optional capabilities must not block mounting" was to load the proxy
+lazily and move it to `optionalDependencies`. That fixed the *load*, and left the
+*install* broken: pnpm installs optional dependencies by default, and
+`dsh-host-apiproxy@0.1.1-rc.2` pulls 28 `@deepseek-ai/*@^0.1.1-rc.2` packages, so
+installing the plugin wrote a whole old DSH generation into the profile. The host then
+composed two generations and would not boot (`registerFileReceiptResolver is not a
+function`; `dsh-llm` has no `CallId`). Its own `settingsNamespace` import is what had
+made that generation necessary. 0.1.2 moves every DSH package to `peerDependencies`,
+inlines the three-line brand, and the clean-install gate now asserts
+`profile-local @deepseek-ai == 0` and reads a live `/status` instead of trusting
+`--dump-config`. Full reasoning and the two diagnostics that hid it:
+`.claw/adr/0010`.
 
 <!-- dated: 2026-09-17 -->
 ### Optional capabilities became hard requirements
