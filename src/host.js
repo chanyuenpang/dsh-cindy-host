@@ -641,54 +641,53 @@ export async function startHost(initialSource, settings = DEFAULT_HOST_SETTINGS,
   }
 
   /**
-   * Forget a device's subscriptions because the relay says it is offline.
+   * Mark a device unreachable because the relay says so.
    *
-   * The failure this prevents, measured: the relay reported the phone `online:false` at
-   * 09:17:38, the phone's last request was 09:18:29, and the Host went on pushing rows and
-   * turn events at it for minutes — every frame dropped by a relay with no route, while the
-   * handset sat on 思考中 and only a manual re-entry fixed it. A subscription the relay
-   * cannot reach is not a subscription.
+   * **It does not touch the subscription set**, and that is the whole point. The first version
+   * deleted the device's topics here, on the reasoning that a subscription the relay cannot
+   * reach is not a subscription. Measured twice over, that reasoning is backwards:
+   *
+   * - the relay's presence is an *opinion* it never has to correct: it sends deltas, so a stale
+   *   `online:false` is never followed by a fresh `online:true` unless the device really
+   *   reconnects. At 09:48:04 it reported the handset offline while the user was watching it,
+   *   the topics went, and three minutes of 转圈 followed — the exact symptom the deletion was
+   *   meant to fix.
+   * - the repair was dead code in practice. `markDeviceReachable` below is triggered by an
+   *   inbound frame, and the client *stops sending them* while it believes the peer is
+   *   unavailable (it cancels its own peer recovery and filters the device out of its plans).
+   *   So the host could destroy its only record of who asked to be pushed and then wait for the
+   *   very device it had just gone silent on.
+   *
+   * The subscription set is this process's own record of *who asked to be pushed*. Reachability
+   * is a different fact, owned here, and it only decides whether a push is **counted as
+   * delivered** — never whether the record exists. `push` is a routed fire-and-forget frame
+   * with no acknowledgement, so an unreachable-device push costs one frame the relay discards;
+   * losing the record costs the session.
    *
    * @param deviceId - the device the relay reports offline.
-   * @returns the sessions it was watching, so a later re-link can be answered truthfully.
    */
-  function dropOfflineSubscriptions(deviceId) {
-    subscribers.delete(deviceId);
-    const watched = watchedSessionsByDevice.get(deviceId);
-    for (const [sessionId, devices] of sessionSubscribers) {
-      if (!devices.has(deviceId)) continue;
-      devices.delete(deviceId);
-      if (watched !== undefined) watched.add(sessionId);
-      if (devices.size === 0) sessionSubscribers.delete(sessionId);
-    }
-    return watched === undefined ? [] : [...watched];
+  function markDeviceUnreachable(deviceId) {
+    if (typeof deviceId !== 'string' || deviceId === '') return;
+    offlineDevices.add(deviceId);
   }
 
   /**
-   * Give a device back everything it was dropped from, because it has just talked to us.
+   * Revoke an unreachability verdict, because the device itself just proved otherwise.
    *
-   * Presence is the relay's opinion, and it can be wrong in the direction that hurts: measured,
-   * the relay reported the handset `online:false` at 09:48:04 while the user was watching it,
-   * the subscriptions went, and it stayed silent until the phone re-subscribed **by itself** at
-   * 09:51:13 — three minutes of a spinner and 没有收到你的这些操作记录, which is the same symptom
-   * the drop was meant to fix. An inbound frame is stronger evidence than a presence snapshot:
-   * the device is reachable *right now*, over the very link that was declared dead. So the
-   * verdict is revoked on the spot, the topics come back, and the session state it may have
-   * missed is pushed again.
+   * A frame from a device is stronger evidence than a presence snapshot: it arrived over the
+   * very link that was declared dead. The subscriptions are untouched (`markDeviceUnreachable`
+   * never removed them), so what is left to do is tell it what it may have missed — the turn
+   * state, so a spinner ends, and a view invalidation, so the transcript it is looking at is
+   * re-read instead of staying stale.
    *
-   * @returns the sessions it is watching again.
+   * This is an accelerator, not a lifeline: pushes are sent regardless of reachability, so a
+   * device that never speaks again still receives everything the relay can route to it.
+   *
+   * @returns the sessions it is watching.
    */
-  function restoreDeviceSubscriptions(deviceId) {
+  function markDeviceReachable(deviceId) {
     if (!offlineDevices.delete(deviceId)) return [];
     const sessions = [...(watchedSessionsByDevice.get(deviceId) ?? [])];
-    if (watchedListDevices.has(deviceId)) subscribers.add(deviceId);
-    for (const sessionId of sessions) {
-      const devices = sessionSubscribers.get(sessionId) ?? new Set();
-      devices.add(deviceId);
-      sessionSubscribers.set(sessionId, devices);
-    }
-    // What it missed while it was gone: the turn state (so a spinner ends) and a view
-    // invalidation (so the transcript it is looking at is re-read instead of staying stale).
     for (const sessionId of sessions) {
       announceWatchedTurnState(deviceId, sessionId);
       pushHistoryViewChanged(sessionId);
@@ -894,6 +893,13 @@ export async function startHost(initialSource, settings = DEFAULT_HOST_SETTINGS,
 
   /**
    * Push one session-scoped event to the controllers watching that session.
+   *
+   * The frame goes to every watcher, reachable or not — the relay discards what it cannot route,
+   * and a presence snapshot is not evidence enough to stop delivering to a device the user may
+   * be staring at. The **count** is what presence decides: a watcher the relay calls
+   * unreachable is not recorded as reached, so the terminal-state de-duplication stays honest
+   * and the repair announcement when it returns is still allowed to fire.
+   *
    * @param sessionId - the session the event belongs to.
    * @param channel - the push channel.
    * @param payload - the channel's payload.
@@ -901,7 +907,8 @@ export async function startHost(initialSource, settings = DEFAULT_HOST_SETTINGS,
   function pushSessionUpdate(sessionId, channel, payload) {
     const devices = sessionSubscribers.get(sessionId);
     const watchers = devices === undefined ? 0 : devices.size;
-    recordPush(sessionId, channel, watchers, payload);
+    const reachable = devices === undefined ? 0 : [...devices].filter((deviceId) => !offlineDevices.has(deviceId)).length;
+    recordPush(sessionId, channel, reachable, payload);
     if (watchers === 0) return;
     for (const deviceId of devices) {
       send({ v: PROTOCOL_VERSION, kind: 'push', dst: deviceId, payload: { channel, payload } });
@@ -1219,14 +1226,15 @@ export async function startHost(initialSource, settings = DEFAULT_HOST_SETTINGS,
       if (typeof clearTimeoutImpl === 'function') clearTimeoutImpl(timer);
     }
     setCachedRunning(sessionId, false);
-    // Who this announcement actually reaches, recorded before it is sent: the same
-    // `device × session` pair must not be told twice inside the window, whichever path
-    // tells it first. The subscribe path announces the terminal state to a controller
-    // that has just attached, and a re-link right afterwards reaches the very same
-    // device — one turn boundary, one `done`.
-    const reached = [...(sessionSubscribers.get(sessionId) ?? [])];
+    // The frame goes to every watcher; only the **reachable** ones are recorded as told. The
+    // same `device × session` pair must not be told twice inside the window, whichever path
+    // tells it first — and the re-link repair depends on that record meaning "it arrived", so a
+    // device the relay calls unreachable must not be written into it.
+    const watchers = [...(sessionSubscribers.get(sessionId) ?? [])];
     pushSessionUpdate(sessionId, 'maker:event', { sessionId, event: { type: 'done' } });
-    for (const deviceId of reached) noteTerminalAnnounce(deviceId, sessionId);
+    for (const deviceId of watchers) {
+      if (!offlineDevices.has(deviceId)) noteTerminalAnnounce(deviceId, sessionId);
+    }
     // …and, when nobody is watching, to the controllers that could still be waiting.
     //
     // A controller whose subscription died with the process (a Host restart, a reconnect)
@@ -1701,11 +1709,11 @@ export async function startHost(initialSource, settings = DEFAULT_HOST_SETTINGS,
           // frame into a void, and recording it would suppress the re-link announcement that
           // is supposed to repair exactly that.
           if (typeof snapshot.deviceId === 'string' && snapshot.deviceId !== '') offlineDevices.add(snapshot.deviceId);
-          dropOfflineSubscriptions(snapshot.deviceId);
+          markDeviceUnreachable(snapshot.deviceId);
         } else if (typeof snapshot.deviceId === 'string') {
           // Reachable again by the relay's own account: same restoration as an inbound frame,
           // so a device that comes back does not have to re-subscribe by hand to be pushed to.
-          restoreDeviceSubscriptions(snapshot.deviceId);
+          markDeviceReachable(snapshot.deviceId);
         }
         return;
       }
@@ -1713,7 +1721,7 @@ export async function startHost(initialSource, settings = DEFAULT_HOST_SETTINGS,
         if (typeof frame.id !== 'string' || typeof frame.src !== 'string') return;
         if (!policy.canAccept(frame.src)) return;
         // A link-open is itself proof the relay has a route to this device.
-        restoreDeviceSubscriptions(frame.src);
+        markDeviceReachable(frame.src);
         linkController(frame.src);
         send(acceptLink(frame, acceptedControllers));
         // A controller that has just re-linked knows nothing about this Host's live state.
@@ -1747,9 +1755,9 @@ export async function startHost(initialSource, settings = DEFAULT_HOST_SETTINGS,
         if (typeof frame.id !== 'string' || typeof frame.src !== 'string') return;
         // Before anything else: a frame from a device the relay declared unreachable revokes
         // that verdict, and everything it was dropped from comes back. See
-        // `restoreDeviceSubscriptions` — presence can be stale in the direction that leaves a
+        // `markDeviceReachable` — presence can be stale in the direction that leaves a
         // live handset with no pushes at all.
-        restoreDeviceSubscriptions(frame.src);
+        markDeviceReachable(frame.src);
         if (!policy.canAccept(frame.src)) {
           send({
             v: PROTOCOL_VERSION,

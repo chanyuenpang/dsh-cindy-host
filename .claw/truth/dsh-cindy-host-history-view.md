@@ -1,4 +1,4 @@
-﻿# Work-grouped history view channels
+# Work-grouped history view channels
 
 <!-- state: current -->
 ## Current behavior
@@ -43,17 +43,25 @@ Page and cursor semantics:
 
 Refusal and fallback semantics (fail closed, deliberately):
 
-- A transcript past `HISTORY_SCAN_MAX_ROWS = 20_000` answers `UNSUPPORTED_CAPABILITY`; with no
-  session API it answers `NOT_AVAILABLE`; an unreadable/absent transcript answers `NOT_FOUND`;
-  a missing session or an out-of-range detail cursor answers `BAD_REQUEST`.
-  `UNSUPPORTED_CAPABILITY` and `NOT_AVAILABLE` are both recognised by the controller as "no
-  view here" (`isHistoryViewUnavailable`), which sends it back to the raw window — the same
-  lever the desktop reference uses.
+- **`UNSUPPORTED_CAPABILITY` and `CHANNEL_NOT_ALLOWED` are reserved for "this Host has no
+  projection capability at all"** — a deployment fact. They must never answer a property of one
+  session, because the controller reads them as a **permanent** downgrade: its
+  `historyViewController.refresh()` returns immediately once its error matches that family
+  (`packages/maker-shared/src/historyViewController.ts:95`, `historyView.ts:8`) and only
+  `reset()` clears it, which re-entry does not reliably do. A code that kills the view for the
+  life of the screen is not a fallback.
+- A transcript of any length is therefore **served**. The reader's transcript
+  (`readMessages.all`) is already read and cached before any budget could be consulted, so
+  refusing saved no work while killing the view; `HISTORY_SCAN_MAX_ROWS` survives only as a
+  marker of the removed rule. With no session API it answers `NOT_AVAILABLE`; an
+  unreadable/absent transcript answers `NOT_FOUND`; a missing session or an out-of-range detail
+  cursor answers `BAD_REQUEST`. Those stay retryable.
 - **The `link-accept` capabilities are load-bearing.** The phone reads
   `device-link/historyViewCapability.ts` and will not call these three channels at all unless
   this Host advertised `history-view-v1`, which `HOST_CAPABILITIES` in
   `src/host-authorization.js` does. Serving the channels without advertising the capability is
-  indistinguishable from not implementing them.
+  indistinguishable from not implementing them — and withdrawing the view means withdrawing the
+  capability with it, never leaving registered channels to answer `CHANNEL_NOT_ALLOWED`.
 - Advertising must also survive the capability seam: the channel layer reads
   `capabilitiesNow().historyView`, so `capabilityProvider` in `src/dsh-plugin.js` has to
   forward `sources.historyView` (the project's seam-forwarding invariant test catches an

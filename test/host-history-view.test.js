@@ -6,8 +6,10 @@
  * and `apps/mobile/src/session/historyViewController.ts`):
  *  - a page's `items` are **chronological**, and `nextCursor` is the **oldest** id in it;
  *  - `hasMore` is what lights "load older", so an empty or dishonest value loses history;
- *  - an error the client recognises as "unavailable" (`UNSUPPORTED_CAPABILITY` here) sends
- *    it back to the raw 20-row window, which is the correct degradation;
+ *  - an error the client recognises as "unavailable" (`UNSUPPORTED_CAPABILITY`,
+ *    `CHANNEL_NOT_ALLOWED`) is **permanent** — its `refresh()` returns immediately and only
+ *    `reset()` clears it — so this Host reserves those codes for "no capability at all" and
+ *    must never answer one for a property of a single session;
  *  - **prose is not collapsible**: user prompts and assistant answers are top-level
  *    `messages` items, and only the activity between them folds into `work` items.
  */
@@ -15,6 +17,7 @@ import test from 'node:test';
 import assert from 'node:assert/strict';
 import {
   HISTORY_PAGE_ITEMS,
+  HISTORY_VIEW_VERSION,
   WORK_ITEM_MAX_ROWS,
   createHistoryViewController,
   firstIdOf,
@@ -262,20 +265,61 @@ test('details walk one work range forward, page by page', async () => {
   assert.equal(gone.code, 'NOT_FOUND');
 });
 
-test('an unprojectable transcript is declined the way the controller understands', async () => {
-  // The controller treats this code as "this Host has no view for me" and reads the raw
-  // window instead — the honest answer for a session past the scan budget.
-  const view = controller(transcript(2), { scanMaxRows: 3 });
+test('a transcript past the old scan budget is served, not refused', async () => {
+  // Inverted deliberately. This test used to assert `UNSUPPORTED_CAPABILITY` past
+  // `HISTORY_SCAN_MAX_ROWS`, on the reasoning that the scan would time out on the phone. Two
+  // things were wrong with that, and one of them is permanent:
+  //
+  // - it saved no scan: `rows` is the reader's own transcript cache (`readMessages.all`), so
+  //   the full read has already happened by the time the budget is consulted, and the page is
+  //   windowed out of that array in O(page);
+  // - it did not degrade, it killed the view. The controller's `refresh()` returns immediately
+  //   forever once its error matches `UNSUPPORTED_CAPABILITY` and only `reset()` clears it, and
+  //   the row count is a permanent property of the session — so re-entry re-poisons it.
+  const view = controller(transcript(4));
   const page = await view.page('s1');
-  assert.equal(page.ok, false);
-  assert.equal(page.code, 'UNSUPPORTED_CAPABILITY');
-  assert.match(page.message, /scan budget/);
+  assert.equal(page.ok, true, 'a long transcript still gets a view');
+  assert.equal(page.result.version, HISTORY_VIEW_VERSION, 'and it is the version the client checks');
+  assert.ok(page.result.items.length > 0);
+  assert.equal(typeof page.result.hasMore, 'boolean');
+  if (page.result.hasMore) assert.equal(page.result.nextCursor, firstIdOf(page.result.items[0]), 'the cursor walks older');
 
   // No transcript accessor at all (a profile without the session API) says NOT_AVAILABLE,
   // which is a different thing from "this session is too big".
   const absent = createHistoryViewController({ rows: undefined });
   assert.equal((await absent.page('s1')).code, 'NOT_AVAILABLE');
   assert.equal((await absent.page('')).code, 'BAD_REQUEST');
+});
+
+test('no answer this Host gives can poison the controller view', async () => {
+  // The controller's downgrade switch, copied from its own source
+  // (`packages/maker-shared/src/historyView.ts:8`, used by `historyViewController.refresh()`):
+  // an answer whose code matches this is permanent — `refresh()` returns immediately and only
+  // `reset()` clears it, which re-entry does not reliably do. The codes are reserved for "this
+  // Host has no projection capability at all", a deployment fact, and a session-specific input
+  // must never produce one.
+  const poison = /CHANNEL_NOT_ALLOWED|UNSUPPORTED_CAPABILITY|not registered|No handler/i;
+  const view = controller(transcript(3));
+
+  const answers = [
+    await view.page('s1'),
+    await view.page('s1', 's1:gone:0'),
+    await view.page(''),
+    await view.page('missing-session'),
+    await view.details('s1', { firstMessageId: 's1:gone:0', lastMessageId: 's1:also-gone:0' }),
+    await view.details('s1', null),
+    await view.intent('s1', []),
+    await view.intent('s1', 'not a list'),
+  ];
+  for (const answer of answers) {
+    const code = answer?.ok === true ? (answer.result === null ? 'OK' : 'OK') : answer?.code ?? '?';
+    assert.doesNotMatch(String(code), poison, `a session-specific answer must stay retryable, got ${code}`);
+    assert.doesNotMatch(String(answer?.message ?? ''), poison, 'and its message may not match either');
+  }
+
+  // The one genuine capability absence: no projector at all.
+  const absent = createHistoryViewController({ rows: undefined });
+  assert.equal((await absent.page('s1')).code, 'NOT_AVAILABLE', 'a retryable code, not the poison one');
 });
 
 test('expand intent replaces the set wholesale and refuses a shapeless request', async () => {

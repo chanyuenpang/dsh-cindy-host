@@ -95,6 +95,40 @@ always accepts the `ossKey` form. Without `thumbnail: true`, behaviour is unchan
 ## Decision evolution
 
 <!-- dated: 2026-09-17 -->
+### The scan budget was refused for a reason that does not hold, and the refusal was permanent
+
+This ADR decided "past `HISTORY_SCAN_MAX_ROWS = 20_000` answer `UNSUPPORTED_CAPABILITY`", and
+its Alternatives section rejected raising the budget because "a multi-minute scan simply times
+out on the phone". Both halves of that reasoning are wrong, and the second one is damage:
+
+- **It saved no scan.** The rows come from the reader's transcript
+  (`createHistoryViewController({ rows: (sessionId) => readMessages.all(sessionId) })`; `all` is
+  `ensureTranscript`), so the full read has already happened and been cached by the time the
+  budget is consulted, and `page()` windows that array in O(page). The refusal cost the client
+  everything and saved the host nothing.
+- **It did not degrade, it killed.** The controller's `historyViewController.refresh()` returns
+  immediately for the rest of the screen's life once its error matches `UNSUPPORTED_CAPABILITY`
+  (`packages/maker-shared/src/historyViewController.ts:95`), only `reset()` clears it, and the
+  row count is a permanent property of the session — so re-entry re-poisons the view. Since
+  `maker:history-view-changed` is the controller's **only** refresh trigger, every push this Host
+  sent for such a session landed on a dead path. The claimed fallback to the raw window is not
+  what happens.
+
+Amended decision: **serve the transcript at any length**, and reserve `UNSUPPORTED_CAPABILITY` /
+`CHANNEL_NOT_ALLOWED` for "this Host has no projection capability at all" — never for a property
+of one session. That is now an invariant in `test/host-history-view.test.js`: no answer this Host
+gives may match the controller's downgrade regex, and the budget test is inverted so the reversal
+is visible in the diff.
+
+Two constraints travel with it, both verified in client source:
+
+- Serve the tail page; never raise `HISTORY_VIEW_VERSION`. The client ignores `page.version`, so
+  a shape change would not surface as an error — it would draw wrong.
+- Withdrawing the view means withdrawing the capability. A registered channel answering
+  `CHANNEL_NOT_ALLOWED` reaches the client through the same `isHistoryViewUnavailable` family and
+  poisons it identically.
+
+<!-- dated: 2026-09-17 -->
 ### The channels first shipped without the capability that gates them
 
 The three view channels were implemented and registered before `link-accept` advertised

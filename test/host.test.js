@@ -390,12 +390,19 @@ test('view invalidations are coalesced, and the last one still fires', async () 
   }
 });
 
-test('a device the relay calls offline stops being pushed to, and is told the truth when it returns', async () => {
-  // Measured failure this pins: the relay reported the handset `online:false` at 09:17:38
-  // while the Host kept pushing rows and turn events at it for minutes — every frame dropped
-  // for want of a route, the phone frozen on 思考中, and only a manual re-entry fixing it.
-  // A subscription the relay cannot reach is not a subscription; the sessions it held are
-  // remembered so its re-link can be answered with the turn state instead.
+test('a device the relay calls offline keeps its subscriptions, and is told the truth when it returns', async () => {
+  // Inverted deliberately. This test used to assert that a presence-offline frame **deleted** the
+  // device's subscriptions ("an unreachable subscription is not a subscription"). That reasoning
+  // is backwards, twice over:
+  //
+  // - presence is an opinion the relay never has to correct (it sends deltas), and at 09:48:04 it
+  //   called the handset offline while the user was watching it. The topics went, and three
+  //   minutes of 转圈 followed — the symptom the deletion was meant to fix.
+  // - the repair was dead code: it waits for an inbound frame, and the client *stops sending
+  //   them* while it believes the peer is unavailable (it cancels its own peer recovery).
+  //
+  // So the subscription set is this process's own record of who asked to be pushed, and presence
+  // only decides whether a push is **counted as reached**.
   let clock = Date.parse('2026-01-01T00:00:00.000Z');
   const { runtime, socket } = await runtimeWithSocket({ now: () => new Date(clock) });
   const settle = () => new Promise((resolve) => setImmediate(resolve));
@@ -406,6 +413,7 @@ test('a device the relay calls offline stops being pushed to, and is told the tr
     && frame.payload.channel === 'maker:event'
     && frame.payload.payload.sessionId === 'remote-research'
     && frame.payload.payload.event?.type === 'done');
+  const lastPushOf = (channel) => runtime.getPushLog().filter((entry) => entry.channel === channel).pop();
   try {
     socket.emit('open');
     socket.frame({ v: 1, kind: 'hello-ack', payload: { serverProtocolVersion: 1, deviceId: 'dev-host', userId: 'user-1' } });
@@ -418,29 +426,32 @@ test('a device the relay calls offline stops being pushed to, and is told the tr
     // Attaching announces the turn state it finds, so the terminal truth is already out.
     assert.equal(doneFrames().length, 1, 'attaching announces the state it finds');
 
-    // The relay says the phone is gone: its subscriptions go with it, so the Host stops
-    // pushing into a void it has already been told about.
+    // The relay says the phone is gone. The record of what it asked for survives; only the
+    // accounting changes.
     socket.frame({ v: 1, kind: 'presence-changed', payload: { deviceId: 'phone-2', online: false, lastSeenAt: clock } });
     await settle();
-    assert.equal(runtime.watchersFor('remote-research'), 0, 'an unreachable subscription is dropped');
-    assert.deepEqual(runtime.getSubscriptions().devices, [], 'and so is the list topic');
-    const framesWhileOffline = socket.sent.length;
+    assert.equal(runtime.watchersFor('remote-research'), 1, 'the subscription survives the relay opinion');
+    assert.ok(runtime.getSubscriptions().devices.includes('phone-2'), 'and so does the list topic');
+
+    // A row and a turn boundary still go out — the relay discards what it cannot route, and a
+    // presence snapshot is not evidence enough to stop delivering to a device the user may be
+    // staring at. What presence decides is the count.
     runtime.pushSessionMessage('remote-research', { id: 'm1' });
-    // A turn that ends while the device is away is not "announced" to it either: the frame
-    // has no route, so counting it as delivered would suppress the re-link repair below.
+    assert.equal(lastPushOf('local-db:messages:created').watchers, 0, 'addressed, but not counted as reached');
     runtime.pushTurnIdle('remote-research');
-    assert.equal(socket.sent.length, framesWhileOffline, 'nothing is pushed at a device the relay cannot reach');
-    assert.equal(doneFrames().length, 1, 'and the dropped frame is not recorded as delivered');
+    assert.equal(doneFrames().length, 2, 'the turn boundary is still delivered at');
+    assert.equal(lastPushOf('maker:event').watchers, 0, 'and it is not claimed as received');
 
     // It comes back, after the de-duplication window the ordinary announcement opened: the
     // Host answers with the turn state of the sessions it was inside. `remote-research` is
     // not running in the fixture, so the spinner is cleared instead of waiting for the user
     // to re-enter the session by hand — 报「我必须要返回上一页退出会话重新进才能看到你的回答」.
+    // The frame sent while it was unreachable was never recorded as told, so this one is allowed.
     clock += 60_000;
     socket.frame({ v: 1, kind: 'link-open', id: 'open-1', src: 'phone-2' });
     await settle();
     const done = doneFrames();
-    assert.equal(done.length, 2, `the session it was inside is announced as finished (got ${JSON.stringify(pushesFor('remote-research'))})`);
+    assert.equal(done.length, 3, `the session it was inside is announced as finished (got ${JSON.stringify(pushesFor('remote-research'))})`);
     assert.deepEqual(done[0].payload.payload.event, { type: 'done' });
     assert.equal(done[0].dst, 'phone-2');
     // A session that *is* running must not be announced as finished by the same path.
@@ -573,23 +584,30 @@ test('a device the relay wrongly calls offline recovers the moment it talks to u
     await settle();
     assert.equal(runtime.watchersFor('remote-research'), 1);
 
-    // The relay's verdict, applied: nothing reaches the phone any more.
+    // The relay's verdict, applied: it is marked unreachable, and its subscription is **kept** —
+    // the record is the Host's own, and a presence snapshot is not allowed to destroy it.
     socket.frame({ v: 1, kind: 'presence-changed', payload: { deviceId: 'phone-2', online: false, lastSeenAt: clock } });
     await settle();
-    assert.equal(runtime.watchersFor('remote-research'), 0);
+    assert.equal(runtime.watchersFor('remote-research'), 1, 'the subscription survives the relay opinion');
     const before = socket.sent.length;
     runtime.pushSessionMessage('remote-research', { id: 'm1' });
-    assert.equal(socket.sent.length, before, 'an unreachable device is not pushed to');
+    assert.equal(socket.sent.length, before + 1, 'a row is still delivered at, not withheld');
+    assert.equal(
+      runtime.getPushLog().filter((entry) => entry.channel === 'local-db:messages:created').pop().watchers,
+      0,
+      'but it is not counted as reached while the relay calls the device offline',
+    );
 
     // …and then the device itself invokes, which is proof the relay is routing to it after all.
     clock += 60_000;
     socket.frame({ v: 1, kind: 'invoke', id: 'list-2', src: 'phone-2', payload: { channel: 'local-db:sessions:list', args: [] } });
     await settle();
 
-    assert.equal(runtime.watchersFor('remote-research'), 1, 'its session topic is back');
+    assert.equal(runtime.watchersFor('remote-research'), 1, 'its session topic is still there');
     assert.ok(runtime.getSubscriptions().devices.includes('phone-2'), 'and so is the list topic');
     // The turn state it may have missed, and a re-read of the view it is looking at — both
-    // addressed to the device that just proved it is alive.
+    // addressed to the device that just proved it is alive. The frames sent while it was marked
+    // unreachable were never recorded as told, so this announcement is allowed.
     assert.equal(doneFrames().length, 2, 'the terminal state is announced again');
     assert.equal(doneFrames()[1].dst, 'phone-2');
     assert.equal(viewPushes().length, 0, 'the invalidation rides the coalescing window');

@@ -51,11 +51,12 @@ import {
 export { HISTORY_DETAIL_PAGE_BYTES, HISTORY_PAGE_BYTES, HISTORY_PAGE_ITEMS, HISTORY_VIEW_VERSION };
 
 /**
- * Longest transcript this Host will project.
+ * Longest transcript this Host will project — **no longer a ceiling**.
  *
- * Past it the scan is not worth the controller's wait, and `UNSUPPORTED_CAPABILITY` is
- * the honest answer: the phone falls back to the raw window, which is exactly what it
- * does today for every session.
+ * Kept only so the removed refusal is visible where it used to be: the budget did not save the
+ * read (it had already happened and been cached) and refusing poisoned the controller's view
+ * permanently. See the comment in `transcriptFor` and ADR-0007's decision evolution. Nothing
+ * reads this constant; a future "this is too big" rule must find a retryable answer instead.
  */
 export const HISTORY_SCAN_MAX_ROWS = 20_000;
 
@@ -232,7 +233,6 @@ export function createHistoryViewController({
   pageItems = HISTORY_PAGE_ITEMS,
   pageBytes = HISTORY_PAGE_BYTES,
   detailBytes = HISTORY_DETAIL_PAGE_BYTES,
-  scanMaxRows = HISTORY_SCAN_MAX_ROWS,
 } = {}) {
   /** `sessionId` → the work keys the controller currently has expanded. */
   const expanded = new Map();
@@ -252,11 +252,26 @@ export function createHistoryViewController({
       return { ok: false, code: 'NOT_FOUND', message: 'this session has no readable transcript' };
     }
     if (!Array.isArray(all)) return { ok: false, code: 'INTERNAL', message: 'the transcript could not be read' };
-    // A transcript this long is the controller's own "use the raw window" case, which it
-    // recognises from the code alone.
-    if (all.length > scanMaxRows) {
-      return { ok: false, code: 'UNSUPPORTED_CAPABILITY', message: `this session's history view scan budget (${scanMaxRows} rows) was exceeded` };
-    }
+    // Long transcripts are **served**, not refused.
+    //
+    // This was `all.length > scanMaxRows → UNSUPPORTED_CAPABILITY`, on the reasoning that the
+    // scan would time out on the phone and the controller recognises that code as "no view
+    // here". Both halves are wrong, and the cost is permanent:
+    //
+    // - it saves no scan. `rows` is the reader's transcript (`readMessages.all`, i.e.
+    //   `ensureTranscript`), so the full read has **already happened and been cached** before
+    //   this function is entered; `page()` below only windows that array in O(page).
+    // - it does not degrade, it kills. The controller's `historyViewController.refresh()`
+    //   returns immediately **forever** once its error matches `UNSUPPORTED_CAPABILITY`
+    //   (`packages/maker-shared/src/historyViewController.ts:95`), and only `reset()` clears
+    //   that error — while re-entry does not reliably reset, and the row count is a permanent
+    //   property of the session, so a long session's view is dead for the life of the screen.
+    //   `maker:history-view-changed` is the controller's only refresh trigger, so every push
+    //   we send lands on that dead path.
+    //
+    // `UNSUPPORTED_CAPABILITY` and `CHANNEL_NOT_ALLOWED` are therefore reserved for "this Host
+    // has no projection capability at all" — a deployment fact — and never for a property of
+    // one session. See ADR-0007's decision evolution.
     return { ok: true, rows: all };
   }
 
