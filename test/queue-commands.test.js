@@ -31,9 +31,15 @@ function makeRouter({ items = [], control = {} } = {}) {
     listSessions: async () => ROWS,
     resolveCapabilities: () => ({
       queueControl: {
-        update: (payload) => {
+        // **Async on purpose, because the real one is.** The seam's `update` resolves the
+        // session's agent first, so DSH's refusal arrives as a *rejection*, not a throw. A
+        // synchronous fixture made a `try`/`catch` around an un-awaited call look correct,
+        // and the real thing ended the whole `dsh web` process instead
+        // (`fatal load failure: RemoteError: queued item is no longer pending`).
+        update: async (payload) => {
           calls.push(payload);
           if (control.throwOnUpdate) throw new Error('inbox rejected the item');
+          if (control.rejectWith !== undefined) throw control.rejectWith;
         },
         cancel: (payload) => calls.push({ cancelled: payload }),
       },
@@ -267,6 +273,33 @@ test('a queue command reports what DSH said when it refuses', async () => {
   assert.equal(result.payload.ok, false);
   assert.equal(result.payload.error.code, 'THREW');
   assert.match(result.payload.error.message, /inbox rejected/);
+});
+
+test('a refusal that arrives as a rejection is reported, not left floating', async () => {
+  // The measured outage, in one assertion. `queueControl.update` is async, so DSH's refusal
+  // to mutate an inbox it has already admitted arrives as a **rejected promise** — and a
+  // `try`/`catch` around an un-awaited call sees nothing. Two consequences, both fixed:
+  // the controller was told the mutation succeeded (so a cancelled row came straight back),
+  // and the unhandled rejection reached DSH's fail-loud handler, which printed
+  // `fatal load failure: RemoteError: queued item is no longer pending` and exited the whole
+  // `dsh web` process — taking the phone's relay link down with it.
+  const refusal = Object.assign(new Error('queued item is no longer pending'), { code: 'session/queue-item-not-found' });
+  const { router } = makeRouter({ items: [item('m1', 'c1', 'x')], control: { rejectWith: refusal } });
+
+  // A floating rejection would surface here (or, in the real process, kill it) rather than in
+  // the answer, so the answer is the only assertion that can prove the await happened.
+  const result = await router(request('maker:input:remove', ['s1', 'c1']));
+  assert.equal(result.payload.ok, false, 'a refused mutation is not reported as done');
+  assert.equal(result.payload.error.code, 'session/queue-item-not-found', 'and DSH’s own code travels');
+  assert.equal(result.payload.error.message, 'queued item is no longer pending');
+});
+
+test('the same refusal from a steer is reported instead of answered with true', async () => {
+  const refusal = Object.assign(new Error('queued item is no longer pending'), { code: 'session/queue-item-not-found' });
+  const { router } = makeRouter({ items: [item('m1', 'c1', 'queued text')], control: { rejectWith: refusal } });
+  const result = await router(request('maker:input:steer', ['s1', { clientId: 'c1' }]));
+  assert.equal(result.payload.ok, false, 'the promotion did not happen, and must not claim it did');
+  assert.equal(result.payload.error.code, 'session/queue-item-not-found');
 });
 
 test('a Host with no queue control refuses the queue commands it cannot perform', async () => {

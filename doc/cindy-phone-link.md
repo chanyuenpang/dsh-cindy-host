@@ -2183,29 +2183,73 @@ proc.on('unhandledRejection', handler)
 `exit(1)`**。`exit(1)` 是正常退出，系统层面因此什么都没有；而本插件住在同一个进程里，中继
 websocket 随之断开，手机看到的就是「掉线」，直到 2.5 分钟后手动重启才恢复。
 
-Cordis 不会替插件兜底——它的监听器分发没有 `try`/`catch`：
+### 抛出点：一个 async 方法被同步 try/catch 包着
 
-```js
-// @deepseek-ai/cordis/lib/index.js
-emit(...args) { this.dispatch("emit", args).map((cb) => cb(...args)); }
+终端里的那一行给出了答案：
+
+```
+fatal load failure: RemoteError: queued item is no longer pending
+    at SessionCommandController.updateQueue (…/dsh-api-session-controller/lib/index.js:842:33)
+    at Object.update (…/G:/Projects/DSH-cindy-host/src/dsh-plugin.js:636:36)
 ```
 
-所以一个插件抛出的异常不是「这个插件坏了」，而是「桌面的 DSH 没了」。据此把本插件所有边界
-都封住：
+`src/cindy-channels.js` 里的提交函数是这样写的：
+
+```js
+function commitQueueAction(control, sessionId, itemId, action) {
+  try {
+    control.update({ sessionId, itemId, action });   // ← 没有 await
+    return null;                                     // ← 永远返回「没失败」
+  } catch (error) { … }
+}
+```
+
+而 `queueControl.update` 是 `async` 的——它先 `await sessionController.resolveAgent(sessionId)`
+再提交（这个 `await` 是后来加的，为了让冷会话上的队列项也能改）：
+
+```js
+update: async ({ sessionId, itemId, action }) => {
+  const resolved = await sessionController.resolveAgent(sessionId);
+  if (resolved?.error !== undefined) throw resolved.error;
+  return sessionController.updateQueue({ sessionId, itemId, action });
+},
+```
+
+`updateQueue` 是同步方法，同步 `throw`——但它在一个 `async` 函数体里，于是变成**被拒绝的
+promise**。同步的 `try`/`catch` 什么也接不到，那个 promise 也没人接，直接落到 DSH 的
+fail-loud 处理器上。于是这一个改动同时造成了两个后果：
+
+1. **整个 dsh web 退出**，手机随之掉线（事故现场）；
+2. **每一次被 DSH 拒绝的队列操作都被当成成功回给控制器**——`null`（「没有失败」）是无条件
+   返回的。手机点了取消，行还在；这正是 `acceptance.mjs` 注释里那句「a cancel that reported
+   NOT_FOUND…a silent success」的反面版本。
+
+修法是把整条链改成真异步（`await control.update(...)`，`commitQueueAction` /
+`commitQueueActionAndReconcile` 变 `async`，三处调用点 `await`），并顺手做了通用加固：本插件
+所有边界都不允许异常逃逸——
 
 - socket `'message'` 监听器不再裸调 `handleFrame`；
 - invoke 应答路径（`fitReplyToFrame` + `send`）不再可能在 `.then(onOk)` 里抛；
 - 心跳、重连、设备目录、活跃会话播报这些浮动 promise 全部挂上 rejection handler；
 - Cordis 的 `session/event` 监听器整体包 `try`/`catch`——它跑在 DSH 自己的事件分发里，
-  抛出去就没人接。
+  抛出去就没人接：
+
+  ```js
+  // @deepseek-ai/cordis/lib/index.js
+  emit(...args) { this.dispatch("emit", args).map((cb) => cb(...args)); }
+  ```
+
+  也就是说，插件抛出的异常不是「这个插件坏了」，而是「桌面的 DSH 没了」。
 
 捕获到的东西统一进有界的 `handlerErrors` 环形缓冲，并通过 `/status` 的
 `diagnostics.handlerErrors` 暴露（含 `where`、`message`、前 6 行 `stack`）。**这个数组非空
 意味着刚刚挡住了一次会让整个 dsh web 退出的异常**，而不是「Host 扛住了」。
-`test/host.test.js` 钉住这一点：某个通道抛错时，控制器仍然收到 `INTERNAL` 应答，错误被记录
-而不是逃逸。
 
-排查同类问题的最快证据是**启动 `dsh web` 那个终端的 stderr**：那一行 `dsh: fatal load
+测试也补在了正确的位置：`test/queue-commands.test.js` 的 `queueControl.update` 夹具**故意
+写成 async**，因为真的那个就是 async——同步夹具让这个 bug 一路过关。新增两条断言拒绝路径，
+去掉修复后它们会以 `unhandledRejection` 失败（已实测），也就是事故本身的形状。
+
+排查同类问题的最快证据仍然是**启动 `dsh web` 那个终端的 stderr**：那一行 `dsh: fatal load
 failure:` 后面就是完整的堆栈，它指向真正的抛出点。
 
 ## 删除 / 归档 / 置顶: one channel, and only one of its fields had a counterpart

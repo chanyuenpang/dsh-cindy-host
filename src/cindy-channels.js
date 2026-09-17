@@ -92,11 +92,21 @@ function answerQueueCommand(request, capabilities, sessionId) {
 
 /**
  * Commit one queue mutation to DSH.
+ *
+ * `control.update` is **async** — it resolves the session's agent before asking DSH to change
+ * the inbox — so it reports a refusal by *rejecting*, not by throwing. A `try`/`catch` around
+ * a call that is not awaited therefore catches nothing and the rejection floats: measured, it
+ * reached DSH's fail-loud unhandled-rejection handler and ended the whole `dsh web` process
+ * (`fatal load failure: RemoteError: queued item is no longer pending`, thrown from
+ * `SessionCommandController.updateQueue`) while an acceptance probe edited a queue whose item
+ * DSH had already admitted. The same bug also reported every refused mutation as a success,
+ * because `null` (the "no failure" answer) was returned unconditionally.
+ *
  * @returns null on success, or `{ code, message }` to report.
  */
-function commitQueueAction(control, sessionId, itemId, action) {
+async function commitQueueAction(control, sessionId, itemId, action) {
   try {
-    control.update({ sessionId, itemId, action });
+    await control.update({ sessionId, itemId, action });
     return null;
   } catch (error) {
     // DSH's own code travels: `session/steer-unavailable` and
@@ -117,8 +127,8 @@ function commitQueueAction(control, sessionId, itemId, action) {
  * spinning on a turn that never started. The push is what tells it otherwise.
  * @returns null on success, or `{ code, message }` to report.
  */
-function commitQueueActionAndReconcile(capabilities, sessionId, itemId, action) {
-  const failure = commitQueueAction(capabilities.queueControl, sessionId, itemId, action);
+async function commitQueueActionAndReconcile(capabilities, sessionId, itemId, action) {
+  const failure = await commitQueueAction(capabilities.queueControl, sessionId, itemId, action);
   if (failure !== null) {
     const push = capabilities?.pushInputProjection;
     if (typeof push === 'function') push(sessionId);
@@ -895,7 +905,7 @@ export function createChannelRouter({
           if (typeof control !== 'object' || control === null) {
             return invokeError(request, 'NOT_AVAILABLE', 'This DSH Host cannot change the pending queue');
           }
-          const failure = commitQueueActionAndReconcile(capabilities, sessionId, dshId, { kind: 'steer' });
+          const failure = await commitQueueActionAndReconcile(capabilities, sessionId, dshId, { kind: 'steer' });
           if (failure !== null) return invokeError(request, failure.code, failure.message);
           // `mirror` only re-places an item the fold already holds, and this one may not be
           // there: the authoritative read that follows an enqueue can race DSH's splice and
@@ -1082,7 +1092,7 @@ export function createChannelRouter({
         // the only owner, and `updateQueue` is the only supported mutation.
         const ids = mirror?.itemIds(sessionId) ?? [];
         for (const itemId of ids) {
-          const outcome = commitQueueActionAndReconcile(capabilities, sessionId, itemId, { kind: 'remove' });
+          const outcome = await commitQueueActionAndReconcile(capabilities, sessionId, itemId, { kind: 'remove' });
           if (outcome !== null) return invokeError(request, outcome.code, outcome.message);
         }
         mirror?.clearSession(sessionId);
@@ -1113,7 +1123,7 @@ export function createChannelRouter({
       if (typeof capabilities.ensureAgent === 'function') await capabilities.ensureAgent(sessionId);
       const dshId = await resolveDshItemId(capabilities, sessionId, clientId);
       if (dshId === null) return invokeError(request, 'NOT_FOUND', `No queued item ${clientId}`);
-      const failure = commitQueueActionAndReconcile(capabilities, sessionId, dshId, action);
+      const failure = await commitQueueActionAndReconcile(capabilities, sessionId, dshId, action);
       if (failure !== null) return invokeError(request, failure.code, failure.message);
       mirror?.mirror(sessionId, clientId, action);
       return answerQueueCommand(request, capabilities, sessionId);
