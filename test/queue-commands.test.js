@@ -47,6 +47,9 @@ function makeRouter({ items = [], control = {} } = {}) {
         has: (sessionId, itemId) => tracker.hasItem(sessionId, itemId),
         dshItemId: (sessionId, controllerId) => tracker.dshItemId(sessionId, controllerId),
         mirror: (sessionId, itemId, action) => tracker.mirror(sessionId, itemId, action),
+        markSteering: (sessionId, payload) => tracker.markSteering(sessionId, payload),
+        markQueued: (sessionId, payload) => tracker.markQueued(sessionId, payload),
+        itemFor: (sessionId, itemId) => tracker.itemFor(sessionId, itemId),
         moveItem: (sessionId, itemId, index) => tracker.moveItem(sessionId, itemId, index),
         setExpanded: (sessionId, expanded) => tracker.setExpanded(sessionId, expanded),
         setEditLock: (sessionId, itemId, locked) => tracker.setEditLock(sessionId, itemId, locked),
@@ -111,6 +114,38 @@ test('steer with text DSH is not holding is still a new message', async () => {
   const result = await router(request('maker:input:steer', ['s1', { clientId: 'fresh', text: 'brand new' }]));
   assert.equal(result.payload.result, true);
   assert.deepEqual(calls[0], { sent: { sessionId: 's1', text: 'brand new', requestId: 'fresh', mode: 'steer' } });
+});
+
+test('a promoted steer keeps the text of the bubble the user is looking at', async () => {
+  // The reported symptom: 插入的气泡也马上插入了，但是插入之后里面的文字被清空了. The promotion
+  // upserts the item so `steeringQueueClientIds` goes true at once, and the first version
+  // restated it as `{ id, rpcId, message: { content: [] } }` — only the id was needed for the
+  // projection to name it, and the *content* is what the controller renders. So the bubble
+  // appeared empty, and the same empty item produced an empty pending transcript row.
+  const { router, tracker } = makeRouter({ items: [item('m1', 'c1', 'queued text')] });
+
+  const result = await router(request('maker:input:steer', ['s1', { clientId: 'c1' }]));
+  assert.equal(result.payload.ok, true);
+  // The controller answers a steer with a boolean and refetches, which is where the moved row
+  // shows up.
+  const projection = await router(request('maker:input:get-projection', ['s1']));
+  assert.deepEqual(projection.payload.result.steeringQueueClientIds, ['c1'], 'the row moved to steering');
+  assert.equal((projection.payload.result.pendingQueue ?? []).length, 0, 'and is no longer queued');
+
+  // What the phone renders the bubble from: the fold's record for that id.
+  const held = tracker.itemFor('s1', 'c1');
+  assert.deepEqual(held.message.content, [{ type: 'text', text: 'queued text' }], 'the bubble still has its text');
+});
+
+test('a promoted steer the fold never knew still carries the text the controller sent', async () => {
+  // The other half: the authoritative read that follows an enqueue can race DSH's splice, so
+  // the fold may not hold the item at promotion time. The controller sends the row back, and
+  // that text is the only honest source left — an empty bubble here is the same defect.
+  const { router, tracker } = makeRouter();
+
+  const result = await router(request('maker:input:steer', ['s1', { clientId: 'c9', text: 'what the user typed' }]));
+  assert.equal(result.payload.ok, true);
+  assert.deepEqual(tracker.itemFor('s1', 'c9').message.content, [{ type: 'text', text: 'what the user typed' }]);
 });
 
 test('the queue UI flags are recorded, not ignored', async () => {

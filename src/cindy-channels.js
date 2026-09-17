@@ -913,14 +913,35 @@ export function createChannelRouter({
           // nothing — measured as a 42-second gap (08:54:40 promoted → 08:55:22 durable)
           // with the phone's bubble abandoned in between. The upsert makes the steering id
           // true from this moment; the durable row's `retireQueuedItem` clears it again.
-          if (typeof capabilities.queueMirror?.markSteering === 'function') {
-            capabilities.queueMirror.markSteering(sessionId, {
-              id: namedId,
+          //
+          // The record has to carry the message **content**, because that is what the
+          // controller renders: the first version restated the id with `content: []`, and the
+          // bubble appeared with no text in it (「插入之后里面的文字被清空了」) while the same
+          // empty item produced an empty transcript row. The fold's own record is the
+          // authority when it has one; otherwise the text the controller sent with the row.
+          const mirror = capabilities.queueMirror;
+          const known = typeof mirror?.itemFor === 'function' ? mirror.itemFor(sessionId, namedId) : null;
+          const knownContent = Array.isArray(known?.message?.content) && known.message.content.length > 0
+            ? known.message.content
+            : null;
+          const carried = extractSendText(args[1]);
+          const content = knownContent
+            ?? (typeof carried === 'string' && carried !== '' ? [{ type: 'text', text: carried }] : []);
+          // Keyed on DSH's own id, not the controller's: the fold is keyed that way, and an
+          // upsert under the `clientId` left the original queued row in the fold beside the new
+          // steering one — a duplicate the projection then reported as both `queued` and
+          // `steering`. The controller's id travels as `rpcId`, which is what the projection
+          // names the row by.
+          const itemId = known?.id !== undefined && known?.id !== null ? String(known.id) : String(dshId);
+          if (typeof mirror?.markSteering === 'function') {
+            mirror.markSteering(sessionId, {
+              ...(known ?? {}),
+              id: itemId,
               rpcId: namedId,
-              message: { id: namedId, content: [] },
+              message: { ...(known?.message ?? {}), id: itemId, content },
             });
           } else {
-            capabilities.queueMirror?.mirror(sessionId, namedId, { kind: 'steer' });
+            mirror?.mirror(sessionId, namedId, { kind: 'steer' });
           }
           // The promotion moved the row from "queued" to "steering": tell the controller
           // that, or the row it is showing disappears in the hand-off.

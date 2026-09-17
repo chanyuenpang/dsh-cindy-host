@@ -463,6 +463,18 @@ export function createInputQueueTracker() {
     markQueued: (sessionId, item) => { markQueued(sessionId, item); },
     /** Prompts accepted but not yet durable, in the controller's message shape. */
     pendingTranscriptRows: (sessionId) => pendingTranscriptRows(sessionId),
+    /**
+     * The fold's own record for one item, by the controller's id or DSH's.
+     *
+     * Needed because the record carries the message **content**, and the projection and the
+     * pending transcript row both render from it: an upsert that only carried an id produced a
+     * bubble with no text (「插入之后里面的文字被清空了」) and an empty transcript row for a
+     * prompt the user could plainly see. Callers that re-place an item preserve what the fold
+     * already knew instead of restating it from memory.
+     */
+    itemFor: (sessionId, itemId) => queueFor(sessionId).find(
+      (item) => String(item?.id) === String(itemId) || String(item?.rpcId ?? '') === String(itemId),
+    ) ?? null,
     /** Every queued item id, newest fold first — used to clear a queue honestly. */
     itemIds: (sessionId) => (queues.get(sessionId) ?? []).map((item) => String(item?.id)),
   };
