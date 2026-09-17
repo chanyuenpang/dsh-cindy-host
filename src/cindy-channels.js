@@ -1027,7 +1027,15 @@ export function createChannelRouter({
         return invokeError(request, 'BAD_REQUEST', `${channel} carried no text and no attachment this Host can serve`);
       }
 
-      const steer = channel === 'maker:input:steer';
+      // A steer needs a **live turn**, and the user's tap can arrive a moment too late.
+      //
+      // Measured: the second 插入 of a session whose turn had already ended answered
+      // `session/steer-unavailable` — the phone showed 「current turn no longer running」 and the
+      // message the user was looking at was the one that suffered, for a request that only wanted
+      // to say something. DSH's own steer primitive refuses without a running agent; a normal
+      // prompt is the same intent one step later and starts the turn it would have steered into.
+      // So the mode follows the **session**, not the channel.
+      const steer = channel === 'maker:input:steer' && capabilities.isSessionRunning?.(sessionId) === true;
       if (typeof capabilities.sendMessage !== 'function') return invokeError(request, 'NOT_AVAILABLE', 'This DSH Host cannot send prompts yet');
       // The controller's own `clientId` is the prompt identity, and DSH persists
       // it as the queued item's `rpcId` — the field the controller retires its

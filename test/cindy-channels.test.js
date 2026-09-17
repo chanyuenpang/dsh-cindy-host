@@ -317,7 +317,8 @@ test('steer uses the same primitive in steer mode and answers a boolean', async 
   const subscribers = new Set();
   const router = createChannelRouter({
     listSessions: async () => ROWS,
-    resolveCapabilities: () => ({ sendMessage: async (input) => sent.push(input) }),
+    // A steer only exists while a turn runs, and the mode now follows the session.
+    resolveCapabilities: () => ({ isSessionRunning: () => true, sendMessage: async (input) => sent.push(input) }),
     subscribers,
   });
 
@@ -339,6 +340,7 @@ test('an accepted steer is visible as steering before it is durable', async () =
   const router = createChannelRouter({
     listSessions: async () => ROWS,
     resolveCapabilities: () => ({
+      isSessionRunning: () => true,
       sendMessage: async (input) => { sent.push(input); return { ok: true }; },
       pushInputProjection: (sessionId) => pushed.push(sessionId),
       queueMirror: { markSteering: (sessionId, item) => steering.push({ sessionId, item }) },
@@ -533,7 +535,8 @@ test('maker:send carries the controllers clientId as the prompt identity', async
   const sent = [];
   const router = createChannelRouter({
     listSessions: async () => ROWS,
-    resolveCapabilities: () => ({ sendMessage: async (input) => sent.push(input) }),
+    // A steer only exists while a turn runs, and the mode now follows the session.
+    resolveCapabilities: () => ({ isSessionRunning: () => true, sendMessage: async (input) => sent.push(input) }),
     subscribers: new Set(),
   });
   await router(request('maker:send', ['s1', { clientId: 'c1', text: 'hello' }, { clientId: 'c1' }]));
@@ -545,7 +548,8 @@ test('maker:send without a clientId still sends under the envelope id', async ()
   const sent = [];
   const router = createChannelRouter({
     listSessions: async () => ROWS,
-    resolveCapabilities: () => ({ sendMessage: async (input) => sent.push(input) }),
+    // A steer only exists while a turn runs, and the mode now follows the session.
+    resolveCapabilities: () => ({ isSessionRunning: () => true, sendMessage: async (input) => sent.push(input) }),
     subscribers: new Set(),
   });
   await router(request('maker:send', ['s1', 'bare text']));

@@ -30,6 +30,8 @@ function makeRouter({ items = [], control = {} } = {}) {
   const router = createChannelRouter({
     listSessions: async () => ROWS,
     resolveCapabilities: () => ({
+      // A steer is only meaningful while a turn runs, and this file's routers describe that case.
+      isSessionRunning: () => true,
       queueControl: {
         // **Async on purpose, because the real one is.** The seam's `update` resolves the
         // session's agent first, so DSH's refusal arrives as a *rejection*, not a throw. A
@@ -148,6 +150,30 @@ test('a promoted steer the fold never knew still carries the text the controller
   assert.deepEqual(tracker.itemFor('s1', 'c9').message.content, [{ type: 'text', text: 'what the user typed' }]);
 });
 
+test('an insert that arrives after the turn ended is a normal prompt, not a refusal', async () => {
+  // Measured: the second 插入 of a session whose turn had already ended came back as
+  // `session/steer-unavailable` and the phone showed 「current turn no longer running」 — for a
+  // request that only wanted to say something. DSH's steer primitive needs a live agent; a normal
+  // prompt is the same intent one step later, and it starts the turn the steer would have joined.
+  const sent = [];
+  const router = createChannelRouter({
+    listSessions: async () => ROWS,
+    resolveCapabilities: () => ({
+      // The turn is over: that is the whole point of this case.
+      isSessionRunning: () => false,
+      queueMirror: { dshItemId: () => null },
+      readSessionState: async () => ({ inbox: { 'next-turn': [], 'next-step': [] }, hasGoalKey: false }),
+      sendMessage: async (input) => sent.push(input),
+    }),
+    subscribers: new Set(),
+  });
+
+  const result = await router(request('maker:input:steer', ['s1', { clientId: 'late', text: 'sent a moment too late' }]));
+  assert.equal(result.payload.ok, true);
+  assert.equal(sent[0].mode, 'queue', 'a steer with no turn to steer into is sent as a prompt');
+  assert.equal(sent[0].text, 'sent a moment too late', 'and the words are not lost');
+});
+
 test('the queue UI flags are recorded, not ignored', async () => {
   // The controller sets these here and reads them back out of the projection, so
   // dropping them makes its panel forget what the user just did.
@@ -189,6 +215,8 @@ test('clear-session keeps going past an item DSH has already admitted', async ()
   const router = createChannelRouter({
     listSessions: async () => ROWS,
     resolveCapabilities: () => ({
+      // A steer is only meaningful while a turn runs, and this file's routers describe that case.
+      isSessionRunning: () => true,
       queueControl: {
         // The first item was already admitted: DSH refuses it, and the other two must still be
         // attempted. Awaited on purpose — the real seam method is async.
@@ -224,6 +252,8 @@ test('a clear-session that really fails says so, and does not claim the queue is
   const router = createChannelRouter({
     listSessions: async () => ROWS,
     resolveCapabilities: () => ({
+      // A steer is only meaningful while a turn runs, and this file's routers describe that case.
+      isSessionRunning: () => true,
       queueControl: { update: async () => { throw refusal; }, cancel: () => {} },
       queueMirror: {
         itemIds: (sessionId) => tracker.itemIds(sessionId),
@@ -302,6 +332,8 @@ test('a queue command tells the other watchers what the queue looks like now', a
   const router = createChannelRouter({
     listSessions: async () => ROWS,
     resolveCapabilities: () => ({
+      // A steer is only meaningful while a turn runs, and this file's routers describe that case.
+      isSessionRunning: () => true,
       queueControl: { update: () => {}, cancel: () => {} },
       queueMirror: {
         dshItemId: (sessionId, controllerId) => tracker.dshItemId(sessionId, controllerId),
@@ -326,6 +358,8 @@ test('an item the fold never learned is still addressable through the inbox', as
   const router = createChannelRouter({
     listSessions: async () => ROWS,
     resolveCapabilities: () => ({
+      // A steer is only meaningful while a turn runs, and this file's routers describe that case.
+      isSessionRunning: () => true,
       queueControl: { update: (payload) => updated.push(payload), cancel: () => {} },
       // The fold is permanently empty, exactly as it is when no frame arrives.
       queueMirror: { dshItemId: () => null, mirror: () => {} },
@@ -352,6 +386,7 @@ test('steer with a new message does not wait on a queue lookup', async () => {
   const router = createChannelRouter({
     listSessions: async () => ROWS,
     resolveCapabilities: () => ({
+      isSessionRunning: () => true,
       queueMirror: { dshItemId: () => null },
       readSessionState: async () => ({ inbox: { 'next-turn': [], 'next-step': [] }, hasGoalKey: false }),
       sendMessage: async (input) => sent.push(input),
@@ -445,6 +480,8 @@ test('a mutation waits for the queue frame that carries the durable id', async (
   const router = createChannelRouter({
     listSessions: async () => ROWS,
     resolveCapabilities: () => ({
+      // A steer is only meaningful while a turn runs, and this file's routers describe that case.
+      isSessionRunning: () => true,
       queueControl: { update: (payload) => updated.push(payload), cancel: () => {} },
       queueMirror: {
         dshItemId: (sessionId, controllerId) => {
@@ -470,6 +507,8 @@ test('an item that never appears is still refused, not retried forever', async (
   const router = createChannelRouter({
     listSessions: async () => ROWS,
     resolveCapabilities: () => ({
+      // A steer is only meaningful while a turn runs, and this file's routers describe that case.
+      isSessionRunning: () => true,
       queueControl: { update: () => {}, cancel: () => {} },
       queueMirror: { dshItemId: () => null },
     }),
