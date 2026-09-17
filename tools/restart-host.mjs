@@ -222,14 +222,25 @@ async function supervise({ port, graceSeconds, retries, dshHome }) {
         log(`supervise: launch output tail: ${readOutput().trim().split(/\r?\n/).slice(-3).join(' | ').slice(0, 600)}`);
         // **Up is not alive.** The first version of this file reported success on the first probe
         // and left; the instance it had started died seconds later and the user was the one who
-        // found out. So the last thing this does is wait and check that it is *still* answering,
-        // which is the only evidence that separates "started" from "running".
-        await new Promise((done) => setTimeout(done, 20_000));
-        const settled = await probe(port);
+        // found out. So the last thing this does is wait and check that it is *still* answering.
+        //
+        // And it retries, because one failed probe is not a death: measured, a 1.5s probe during
+        // the boot window (cost-meter backfilling, sessions replaying) timed out and this logged
+        // `NOT ALIVE` for an instance that was in fact up for the next two minutes. A check that
+        // cries wolf is worse than no check, so the verdict needs more than one sample.
+        let settled = null;
+        let waited = 0;
+        for (let attempt = 0; attempt < 6 && settled === null; attempt += 1) {
+          const pause = attempt === 0 ? 20_000 : 5_000;
+          await new Promise((done) => setTimeout(done, pause));
+          waited += pause;
+          settled = await probe(port, 5_000);
+        }
         if (settled === null) {
-          log('supervise: NOT ALIVE 20s after it came up — check ' + childLog + '; the instance is DOWN');
+          log(`supervise: NOT ALIVE after ${Math.round(waited / 1000)}s of probes — check ${childLog}; the instance is DOWN`);
+          log(`supervise: last launch output: ${readOutput().trim().split(/\r?\n/).slice(-3).join(' | ').slice(0, 400)}`);
         } else {
-          log(`supervise: still alive 20s later (state=${settled.status?.state ?? '?'}, uptime=${settled.diagnostics?.boundaries?.uptimeMs ?? '?'}ms)`);
+          log(`supervise: still alive ${Math.round(waited / 1000)}s later (state=${settled.status?.state ?? '?'}, uptime=${settled.diagnostics?.boundaries?.uptimeMs ?? '?'}ms)`);
         }
         // Then let go and go away: the child's output is a file, so exiting costs it nothing (the
         // pipe version of this line is what killed the instance it had just started).
