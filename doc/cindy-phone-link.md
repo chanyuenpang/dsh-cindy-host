@@ -1308,8 +1308,8 @@ refusal to be classified**. The current state:
 
 ```
 channels a controller may name: 192
-  served:      48
-  declined:    144
+  served:      52
+  declined:    140
   unclassified: 0
 ```
 
@@ -2134,8 +2134,9 @@ moment the relay ever said so. Three changes follow from that one fact:
 - ~~**`presence-changed{online:false}` drops the device's subscriptions**~~ — 这是当时的做法（`sessions`
   主题和它的每一个 `session:*` 主题），前提是「推给中继已经不认的路由不算送达」。这个前提在 09:48:04
   反噬了（见下），所以**现在只把设备记进 `offlineDevices`，订阅一个都不删**（`markDeviceUnreachable`）：
-  `pushSessionUpdate` 仍然发给每一个 watcher，可达性只决定这次推送**算不算已送达**（`reachable`
-  只进计数与去重账）。
+  `pushSessionUpdate` 仍然发给每一个 watcher，可达性只决定这次推送**算不算已送达**（局部变量
+  `reachable` 只进推送计数 `pushLog[].watchers`；终端状态的去重账另走一路，它自己判断
+  `offlineDevices.has(deviceId)`）。
 - **The sessions it was inside are remembered** (`watchedSessionsByDevice`), so its next
   `link-open` can be answered with the turn state instead of silence. The announcement is
   sent only when the cached row positively says the turn is over: a cold row is never read
@@ -2585,11 +2586,16 @@ mergePendingByTime(items, pending, { newestFirst })
 `local-db:messages:list` 是新到旧（`newestFirst: true`），`messages:view` 是旧到新——同一个函数
 两个方向，因为两个页面用的是同一份“用户敲下的顺序”。
 
+**但钉底只作用于升序的那个方向。** `mergePendingByTime` 里的 `runsNow` 带 `!newestFirst` 前提
+（`src/cindy-channels.js:142`）：`messages:view` 这种旧到新的页面里，运行中的卡片被钉在最后；
+新到旧的 `local-db:messages:list` 不重排，运行中的卡片本来就在最前——那份列表没有「最后一行」
+可言，`test/pending-order.test.js:80-84` 明确断言它不会因为这条规则被重排。
+
 **这是一个预测，而且它不总是对。** 排队项要到下一个 turn 边界才投递，所以它仍可能落到那条
 超过它的插话之后；行会移动一次，移动的时机是它变成 durable 的那一刻。投递顺序是转录的，
 而在什么都还没投递之前，用户看的就是**敲下的顺序**。
 
-正在工作的卡片单独处理：页面最后一项是 `isStreaming === true` 的 `work` 段时，排序在它之后的
+正在工作的卡片单独处理：升序页面里最后一项是 `isStreaming === true` 的 `work` 段时，排序在它之后的
 （包括刚接受、还没落盘的提示）统统挪到它上面——运行中的卡片永远是最后一行。理由是「正在工作」
 是现在时，它属于用户说过的所有话**之下**，否则刚发出去的那句话会被顶到自己对话的中间。
 
@@ -2653,8 +2659,10 @@ pulseRepair(sessionId)   // REPAIR_PULSE_MS = 30_000，每会话最多一次
                          // 补的正是丢掉的 push 会带的两帧：input projection + 视图失效
 ```
 
-没人看这个会话时它什么都不做；收到任何一条 `args[0]` 指向被监视会话的入站帧也会撤销该设备的
-不可达判定，并把该会话的 turn 状态与视图失效补给它。
+没人看这个会话时它什么都不做。**它补的是丢掉的 push 会带的那两帧——input projection 与视图失效；
+turn 状态不在这里**：那是 `markDeviceReachable` 的活，它在**任何**一条入站帧到达时撤销不可达判定
+并补发该设备在看的每个会话的 turn 状态（且只在设备确实曾被打上离线标记时才有事可做，
+`src/host.js:700`）。
 
 ### 边界：Host 收到了、手机却没更新（这一条不是我们的）
 
@@ -2681,12 +2689,18 @@ Host 侧唯一能看到的签名是**客户端在反复重发同一个读**：
 
 如果它收到了答复，就不会一秒问两次；这也解释了它为什么自认健康——它只按「发送是否成功」判断。
 
+**这是真机观测，不是仓库内可复现的因果。** 上表与「官方客户端同样复现」都来自一次真人实测，
+留存的记录在 `.claw/truth/dsh-cindy-host-mobile-resume-limitation.md`；`src/` 与 `test/` 里没有
+对应的日志或测试，所以这一节的证据强度与其它节不同——不要把它当成可以从代码验出来的结论。
+
 现场处理：**等约 1 分钟**（入站有时会自行恢复，durable 行随后送达）；仍不出现就**退出会话再进**，
 强制重建连接。复发时先做三件事，省掉重新取证的时间：
 
 1. `/status` 的 `subscriptions.sessions` 里手机还在不在（在 → 不是订阅问题）；
 2. `recentInvokes` 里它是不是在**重复发同一个读**（是 → 答复没到它，方向性问题）；
-3. `recentPushes[].watchers` 是否 > 0（> 0 → Host 有目标可推，问题在通道而不在 Host）。
+3. `pushTotals` 是否还在自增（在 → Host 确实在推，问题在通道而不在 Host）。**不要**用
+   `recentPushes[].watchers` 判断这一条：那个数是「算不算已送达」，中继把手机标成离线时它就是 0，
+   而这恰好是这种故障的常态。
 
 ## harness 的后台任务通知不是用户说的话
 
@@ -2728,9 +2742,10 @@ if (sourceKind !== null && !RENDERABLE_SOURCE_KINDS.has(sourceKind)) return rows
 3. 发一张照片，或让 agent 画一张图并打开——应显示图片（内联缩图路径），不再出现「取图失败」。
 4. 「加载更早」应当即时返回（transcript 缓存 + 50 ms 级翻页）。
 5. **转圈不再需要手动重进**：让 agent 答完一句话，然后息屏／切走让中继把手机标成离线，
-   再回到会话——答案应当直接出现，思考中应当自己结束。可在 `/status` 对照：
-   `presence-changed … online:false` 之后 `subscriptions.sessions` 里**仍然有这台手机**，
-   且 `recentPushes[].watchers` 仍 > 0——推送照发，presence 只影响「算不算已送达」。
+   再回到会话——答案应当直接出现，思考中应当自己结束。可在 `/status` 对照两件事：
+   `subscriptions.sessions` 里**仍然有这台手机**（订阅没被删），以及 `pushTotals` 仍在自增
+   （推送照发）。注意 **`recentPushes[].watchers` 在手机离线期间会降到 0**——那个计数是
+   「算不算已送达」，它变 0 正是这条策略的证据，不代表 Host 没推。
 6. **插话**（agent 正在回答时发一句）：应当作为插话进入当前 turn；如果 DSH 已经过了可插话的
    点，它应当变成下一条普通消息，而不是报 `current turn no longer accepts steering`，更不应
    从对话里消失。
@@ -2740,6 +2755,6 @@ if (sourceKind !== null && !RENDERABLE_SOURCE_KINDS.has(sourceKind)) return rows
    `/status` 的 `diagnostics.suppressedNotices` 应当随之增加（不是静默消失）。
 9. **息屏／切走再回来仍收不到**（答案不出现、进度不动、没有重连提示）时，先按上一节的三步
    取证：`subscriptions.sessions` 有没有这台手机、`recentInvokes` 里它是否在重复发同一个读、
-   `recentPushes[].watchers` 是否 > 0。三步都指向「通道」而不是「Host」时，这就是那条 OS 侧
-   限制——等约 1 分钟，或退出会话再进。
+   `pushTotals` 是否在自增（不要用 `recentPushes[].watchers`，它会被 presence 清零）。三步都指向
+   「通道」而不是「Host」时，这就是那条 OS 侧限制——等约 1 分钟，或退出会话再进。
 

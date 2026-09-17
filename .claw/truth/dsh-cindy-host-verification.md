@@ -98,4 +98,36 @@ Code anchors:
 - `doc/publishing.md` (§5.1–§5.5: the clean-install traps, the install requirement, the
   tarball re-install trap, the DSH-side fresh-profile failure, and the 0.1.1 release
   channel)
-- `doc/cindy-phone-link.md` ("Verifying by hand"; 「收尾：媒体取件补齐 + 历史视图通道」)
+- `doc/cindy-phone-link.md` ("Verifying by hand"; 「收尾：媒体取件补齐 + 历史视图通道」；
+  「真机复测清单（累计）」)
+
+## 文档断言的复核（2026-09-17）
+
+一次独立复核用了比会话默认更强的模型（`deepseek-official / deepseek-v4-pro`），三个 reviewer 并行、
+各自只读，分工是：新增四节 vs 源码与测试、两处「已被推翻」表述的横向一致性、发布文档 vs 可验证的
+客观事实（`package.json`、`npm pack --dry-run`、`git tag`、`gh release view`、各数字断言实际跑出来）。
+每个 reviewer 的立场是**怀疑**：找不到证据的算 unsupported，与代码相反的算 contradicted，两者都必须
+给出 `文件:行号` 或命令输出。
+
+结果值得记下来，因为**错误的类型比数量更有信息量**：
+
+| 类型 | 实例 |
+|---|---|
+| 把只在一个方向成立的行为写成通例 | 「运行中的卡片永远是最后一行」——`mergePendingByTime` 的 `runsNow` 带 `!newestFirst` 前提，新到旧的列表不重排 |
+| 把两处代码的功劳写在一起 | `pulseRepair` 补的是输入投影 + 视图失效；turn 状态是 `markDeviceReachable` 补的 |
+| 计数口径写错 | 用 `recentPushes[].watchers` 判断「推送还在发」——那个数是 `recordPush` 收到的**可达数**，`offlineDevices` 会让它变 0 |
+| 陈旧数字 | README「407 项」vs 实测 446；`doc/cindy-phone-link.md`「48 served / 144 declined」vs 实测 52 / 140 |
+| 与实现相反的注释 | `src/host.js` 5 处仍写「订阅会因 presence 离线被删」 |
+| 断链 | CHANGELOG 的 `[0.1.0]` 指向不存在的 release，`[0.1.1]` 没有链接定义 |
+
+**留下的规则**：文档里每一句关于行为的断言都要能落到「文件:行号」或一条可跑的命令；不能这样落地的
+（例如鸿蒙那条 OS 侧观测）必须**明确标注**为真机观测、并指向留存的记录，不能让读者以为它可以
+从代码验出来。数字类断言一律**实际跑命令**再写，不引用文档里另一处的说法。
+
+仍然无法在仓库内验证的：那条 OS 侧读方向失效本身（只有一次真人实测的留存记录），以及各文档中未被
+本次覆盖的章节（`doc/publishing.md` §1/§2/§4/§6、README 其余数字、CHANGELOG 历史条目、
+`doc/cindy-phone-link.md` 前四节）。
+
+Code anchors:
+
+- `.claw/truth/dsh-cindy-host-mobile-resume-limitation.md`（那条 OS 侧观测的留存记录）

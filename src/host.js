@@ -600,10 +600,11 @@ export async function startHost(initialSource, settings = DEFAULT_HOST_SETTINGS,
   /**
    * Every session a device has held a subscription to, remembered past a disconnect.
    *
-   * Subscriptions are dropped when the relay reports the device offline (there is no route
-   * to push into), but the device still believes it is inside those sessions. When it links
-   * again, this is what lets the Host tell it the truth about each one instead of leaving a
-   * stale spinner until the user re-enters the session by hand.
+   * The relay may declare the device offline while it is still looking at these sessions — a
+   * presence snapshot is an opinion, not a fact, and **it never removes the subscription**. What
+   * it removes is the device's right to be *counted as reached*. This map is what lets the Host
+   * tell the device the truth about each session when it speaks again, instead of leaving a stale
+   * spinner until the user re-enters the session by hand.
    */
   const watchedSessionsByDevice = new Map();
   /**
@@ -617,7 +618,8 @@ export async function startHost(initialSource, settings = DEFAULT_HOST_SETTINGS,
   /**
    * Devices the relay has told us it cannot route to.
    *
-   * Their subscriptions are already gone; this is what keeps the *unwatched* fallback in
+   * Their subscriptions are **untouched** — see {@link markDeviceUnreachable} for why deleting
+   * them was the wrong repair. This is what keeps the *unwatched* fallback in
    * {@link announceTurnIdle} from sending into the same void and then recording the frame as
    * delivered. Cleared the moment the device links again, which is itself proof of a route.
    */
@@ -626,8 +628,10 @@ export async function startHost(initialSource, settings = DEFAULT_HOST_SETTINGS,
    * Devices that subscribed to the `sessions` topic at least once.
    *
    * Their session topics are remembered in {@link watchedSessionsByDevice}; the list topic has
-   * no session id to hang off, so it is remembered here — otherwise a device dropped for being
-   * unreachable would silently stop receiving row patches even after it started talking again.
+   * no session id to hang off, so it is remembered here.
+   *
+   * Left over from the reversed policy above: nothing reads this any more (the subscription it
+   * was meant to restore is never removed), so it is bookkeeping with no consumer.
    */
   const watchedListDevices = new Set();
 
@@ -790,8 +794,9 @@ export async function startHost(initialSource, settings = DEFAULT_HOST_SETTINGS,
     for (const topic of topics) {
       if (topic === 'sessions') {
         subscribers.add(deviceId);
-        // Remembered for the same reason a session topic is: a device that is dropped for
-        // being unreachable has to be given its topics back the moment it proves it is not.
+        // Remembered for the same reason a session topic is (the device's turn state has to be
+        // announced when it speaks again). Nothing reads it today: it existed to hand the topic
+        // back to a device that had been dropped for being unreachable, and that drop is gone.
         watchedListDevices.add(deviceId);
       } else if (topic.startsWith('session:')) {
         const sessionId = topic.slice('session:'.length);
@@ -1773,15 +1778,16 @@ export async function startHost(initialSource, settings = DEFAULT_HOST_SETTINGS,
         //
         // Measured failure this prevents: the relay reported the handset `online:false` at
         // 09:17:38 while the Host kept pushing rows and turn events at it for minutes — each
-        // frame dropped with no route, the phone frozen on 思考中, and only a manual
-        // re-entry fixing it. A subscription the relay cannot reach is not a subscription;
-        // the sessions it held are remembered so its re-link can be answered truthfully.
+        // frame dropped with no route, the phone frozen on 思考中. What presence decides is that
+        // those frames are **not counted as delivered** (so the re-link announcement is still
+        // allowed to fire); it does **not** delete the subscription. See
+        // `markDeviceUnreachable` — the first version did delete it, and a stale `online:false`
+        // at 09:48:04 then silenced a handset the user was holding.
         if (snapshot.online !== true) {
-          // Remembered *before* the subscriptions go, because the terminal announcement for a
+          // Marked unreachable *before* anything else, because the terminal announcement for a
           // turn that ends while the device is away must not be counted as delivered: it is a
           // frame into a void, and recording it would suppress the re-link announcement that
           // is supposed to repair exactly that.
-          if (typeof snapshot.deviceId === 'string' && snapshot.deviceId !== '') offlineDevices.add(snapshot.deviceId);
           markDeviceUnreachable(snapshot.deviceId);
         } else if (typeof snapshot.deviceId === 'string') {
           // Reachable again by the relay's own account: same restoration as an inbound frame,

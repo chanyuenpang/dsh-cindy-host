@@ -111,7 +111,9 @@ Do not enable Cindy transport in production yet. A separate compatibility slice 
 
 ## 仓库治理
 
-分支 `main`，当前只有本地提交（尚未配置远端）。
+分支 `main`，远端 `origin` = <https://github.com/chanyuenpang/dsh-cindy-host>（公开）。`v0.1.1`
+已打 tag、推远端，并以 GitHub Release 形式附 tarball 分发（**不进 npm registry**，见
+[`doc/publishing.md`](doc/publishing.md) §5.5）。
 
 **入库的内容**：`src/`（插件与运行时）、`lib/`（设置页客户端入口）、`test/`（单测）、
 `tools/`（验收脚本与活体探针）、`doc/`、`package.json` / `package-lock.json`、
@@ -131,7 +133,7 @@ Do not enable Cindy transport in production yet. A separate compatibility slice 
 **验证入口**：
 
 ```bash
-npm test                                                              # 单测（407 项）
+npm test                                                              # 单测（446 项）
 npm run audit:channels                                                # 通道判定表（served 52 / declined 140 / unclassified 0）
 node tools/acceptance.mjs --base http://127.0.0.1:3080 --with-prompts # 端到端（105 项）
 npm run verify                                                        # 上面三者的串行组合

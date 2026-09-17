@@ -49,4 +49,6 @@
 
 1. 看 `/status` 的 `subscriptions.sessions`：手机是否仍在订阅表里（在 → 不是订阅问题）。
 2. 看 `recentInvokes` 里手机是否在**重复发同一个读**：是 → 答复没到它，方向性问题。
-3. 看 `recentPushes` 的 `watchers` 是否 > 0：> 0 说明 Host 有目标可推，问题在通道而不在 Host。
+3. 看 `pushTotals` 是否仍在自增：在 → Host 有目标可推且在推，问题在通道而不在 Host。
+   **不要用 `recentPushes[].watchers` 判断这一条**：它是「算不算已送达」的计数，中继把手机标成离线
+   时它就是 0，而那正是这种故障的常态（`recordPush` 收到的是过滤掉 `offlineDevices` 之后的数量）。

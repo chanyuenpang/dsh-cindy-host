@@ -64,10 +64,11 @@ dsh plugin --profile <profile> add dsh-cindy-host-demo@<version>
 建议的 `files` 白名单：
 
 ```json
-"files": ["src", "lib", "cordis.patch.yml", "README.md", "doc/"]
+"files": ["src", "lib", "cordis.patch.yml", "README.md", "CHANGELOG.md", "doc/"]
 ```
 
-（`test/`、`tools/`、`.claw/` 留在仓库里；需要随包分发测试时再加。）
+（`package.json` 里的实际白名单和这里一致；`test/`、`tools/`、`.claw/` 留在仓库里，需要随包分发
+测试时再加。）
 
 ## 4. 版本与兼容性声明
 

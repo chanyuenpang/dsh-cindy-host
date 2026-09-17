@@ -5,6 +5,16 @@
 
 ## [Unreleased]
 
+### 文档与注释（无行为变化）
+
+- 一次独立复核（更强模型对抗式核对）发现若干**与实现相反**的说法，已修正：presence 报离线
+  **不会**删除设备订阅（它只决定一次推送算不算「已送达」）；运行工作组的「钉底」只作用于升序的
+  `messages:view` 页，新到旧的 `local-db:messages:list` 不重排；`pulseRepair` 补的是输入投影与
+  视图失效，turn 状态由 `markDeviceReachable` 补发。`src/host.js` 里 5 处描述旧行为的注释一并更正。
+- 陈旧的数字断言更正：单测 446（README 原写 407）、通道 52 served / 140 declined
+  （`doc/cindy-phone-link.md` 原写 48 / 144）；README 的「尚未配置远端」改为已推送到公开远端并发了
+  `v0.1.1` Release；CHANGELOG 补上 `[0.1.1]` 链接、去掉并不存在的 `v0.1.0` 死链。
+
 ## [0.1.1] - 2026-09-17
 
 打包与安装修复：两者都只在**干净安装**（干净 DSH_HOME + tarball）下才会出现，本地 link 装法不会暴露。
@@ -22,6 +32,9 @@
 ## [0.1.0] - 2026-09-17
 
 首个发布版本。验证于 **DSH `0.1.5-rc.2`**（Web profile，Windows）。
+
+> 这一版**没有打 tag、也没有分发**：它的干净安装缺陷（见上）由 `0.1.1` 修掉，实际发布并从
+> `v0.1.1` 起算。所以这里没有 `[0.1.0]` 的链接可指——它没有对应的 release。
 
 ### Added
 
@@ -65,5 +78,5 @@
 - 真机 219 会话冷启动时，`local-db:sessions:list` 仍可能出现超时（已有上述三层保护）。
 - 当前 DSH 不再挂 `apiProxy`；本插件在没有它时安全挂载，并在相关通道回 `NOT_AVAILABLE`。
 
-[Unreleased]: https://github.com/chanyuenpang/dsh-cindy-host/compare/v0.1.0...HEAD
-[0.1.0]: https://github.com/chanyuenpang/dsh-cindy-host/releases/tag/v0.1.0
+[Unreleased]: https://github.com/chanyuenpang/dsh-cindy-host/compare/v0.1.1...HEAD
+[0.1.1]: https://github.com/chanyuenpang/dsh-cindy-host/releases/tag/v0.1.1
