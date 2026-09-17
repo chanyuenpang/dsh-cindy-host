@@ -74,11 +74,15 @@ Verification rules:
   copy resolved from and which generation it is**, and never accept `--dump-config`
   passing as evidence that an entry can load — a missing named export composes fine and
   kills the profile at load time. See `.claw/adr/0010`.
-- Release channel: 0.1.1 is distributed as a **GitHub Release tarball**
-  (`v0.1.1` + `dsh-cindy-host-demo-0.1.1.tgz`), not through a registry, so the only
-  installable artifact is the asset itself. A release is verified by downloading the
-  asset back and installing **that** file — not the locally built tarball — and by
-  matching its sha256 against the published value.
+- Release channel: **0.1.2 is on the npm registry** (`npm publish --access public`;
+  `dsh plugin --profile <p> add dsh-cindy-host-demo@0.1.2`). A release is verified by
+  installing **from the channel a user would use**, into a brand-new home: for the
+  registry that means `add dsh-cindy-host-demo@<version>` with no local path, then
+  `profile-local @deepseek-ai == 0`, then a real start and a `/status` read. Reading the
+  version back with `npm view` is part of it, and a `404` in the first minute after
+  publishing is replication lag, not a failed publish.
+  0.1.1 was a **GitHub Release tarball** instead (`v0.1.1` + `dsh-cindy-host-demo-0.1.1.tgz`)
+  and its asset is defective — kept as history, never to be installed.
 - Live endpoint check on that port: `GET /api/dsh-cindy-host/status` → `200`, an
   unknown route → `404`, `POST …/login/request-code` with an empty identifier → `400`.
 - Switch-off proof: after turning the switch off, status returns `disconnected`,

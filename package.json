@@ -1,9 +1,9 @@
 {
   "name": "dsh-cindy-host-demo",
   "version": "0.1.2",
-  "private": true,
+  "private": false,
   "description": "Cindy 手机客户端连接 DSH 的 Host 侧插件：会话/消息/审批/todo/goal 的手机通道，以及配套的设置卡片",
-  "license": "UNLICENSED",
+  "license": "MIT",
   "repository": {
     "type": "git",
     "url": "git+https://github.com/chanyuenpang/dsh-cindy-host.git"
@@ -25,6 +25,7 @@
     "cordis.patch.yml",
     "README.md",
     "CHANGELOG.md",
+    "LICENSE",
     "doc"
   ],
   "type": "module",

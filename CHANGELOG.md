@@ -18,7 +18,8 @@
 ## [0.1.2] - 2026-09-17
 
 **这是 0.1.1 那个附件的修复版。0.1.1 装进别人的 profile 会让那个 profile 起不来**，所以请不要再用
-0.1.1 的 tarball 安装。
+0.1.1 的 tarball 安装。本版**发布到 npm registry**（MIT）：`dsh plugin --profile <p> add
+dsh-cindy-host-demo@0.1.2`。
 
 ### Fixed
 

@@ -131,11 +131,13 @@ Failure containment and observability:
 
 ## Distribution
 
-- **0.1.2 ships as a GitHub Release tarball, not to a registry** (0.1.1 did too, and its
-  asset is defective — see below): tag `v0.1.2` + asset `dsh-cindy-host-demo-0.1.2.tgz` on
-  `https://github.com/chanyuenpang/dsh-cindy-host/releases`. `package.json` therefore
-  keeps `private: true` and `license: UNLICENSED`; `private` here is the
-  accidental-publish switch, not a "not ready" marker (`doc/publishing.md` §5.5).
+- **0.1.2 ships through the npm registry** (`dsh plugin --profile <p> add
+  dsh-cindy-host-demo@0.1.2`), MIT, `private: false`. 0.1.1 was a GitHub Release tarball
+  instead, and **its asset is defective** (it drags an old DSH generation into the
+  profile — see below); the 0.1.1 Release entry is kept as history rather than deleted.
+  Verified from the registry: install into a brand-new home → `profile-local
+  @deepseek-ai == 0`, `dsh web` starts, `/api/dsh-cindy-host/status` → `200
+  installed=true`.
 - **DSH's own packages are peers, never dependencies** — this is the rule 0.1.1 broke.
   Every `@deepseek-ai/*` the plugin uses is a `peerDependency`; `dependencies` holds only
   what the host does not provide (`keytar`, `ws`). A DSH package declared as a dependency

@@ -89,6 +89,15 @@ rules are covered without a browser.
 
 ## 安装要求：需要编译原生模块
 
+装（**0.1.2 起发布在 npm registry**，MIT）：
+
+```bash
+dsh plugin --profile <profile> add dsh-cindy-host-demo@0.1.2
+```
+
+**不要用 0.1.1 的 tarball 安装**——那个版本会把整个旧一代 DSH 装进你的 profile，让 profile 起不来
+（详见 [`doc/publishing.md`](doc/publishing.md) §5.4）。
+
 这个包**在安装时需要编译**，原因是它的凭据存储用的是原生模块：
 
 - `keytar` 是原生模块（Windows 凭据管理器 / macOS Keychain / Linux Secret Service），安装时要编译出

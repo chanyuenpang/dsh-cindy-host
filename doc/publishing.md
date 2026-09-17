@@ -39,7 +39,7 @@ dsh plugin --profile <profile> add <本仓库路径>
 npm pack                       # 产出 dsh-cindy-host-demo-<version>.tgz
 dsh plugin --profile <profile> add ./dsh-cindy-host-demo-<version>.tgz
 
-# c) registry（正式发布）
+# c) registry（**0.1.2 起这是正式渠道**）
 dsh plugin --profile <profile> add dsh-cindy-host-demo@<version>
 ```
 
@@ -58,7 +58,8 @@ dsh plugin --profile <profile> add dsh-cindy-host-demo@<version>
    `dependencies` 里只放宿主不提供的库（本包是 `keytar` 与 `ws`）。
 3. **原生依赖要写清**：`keytar` 是原生模块（Windows 凭据管理器）。发布说明里必须写明平台/Node ABI
    要求（本包 `engines.node >= 22`），否则会出现"装上了但起不来"。
-4. **`private: true` 必须改成 `false`**（当前为 `true`，这是防止误发布的开关，不是发布配置）。
+4. **`private` 必须是 `false`**（发布到 registry 的必要条件；它是防止误发布的开关，不是发布配置。
+   0.1.2 起本包为 `false` + `license: MIT`，仓库根有 `LICENSE`）。
 5. **包内容必须是白名单**，而不是"整个目录"。`.sandbox/`（含凭据与会话）、`.claw/runtime`、验收日志、
    `.claw/tasks` 的开发记录**都不该进包**——它们在 git 里是资产，在 npm 包里是负担与风险。
 
@@ -174,19 +175,32 @@ dsh web: http://127.0.0.1:3095/?token=…
   安装形式，而是 pnpm 有没有**真的**把依赖图装进 profile。第一次改回 `link:` 时 pnpm 打了
   `resolved 71, reused 1, added 0`（什么也没干），所以那次"好"是假象。
 
-### 5.5 0.1.1 的实际发布方式：GitHub Release（不走 registry，2026-09-17）
+### 5.5 发行渠道的历史：0.1.1 走 GitHub Release，0.1.2 起走 npm registry（2026-09-17）
 
-按上面第 6 步的"仅发 tarball"分支执行：
+**0.1.1（历史，且附件有缺陷）**：当时按上面第 6 步的"仅发 tarball"分支执行——发 GitHub Release
+`v0.1.1` 并把 `dsh-cindy-host-demo-0.1.1.tgz` 作为附件，同时打 tag 推远端。选它的理由是当时
+`license` 还是 `UNLICENSED`（公开进 registry 等于以未授权状态分发），而"干净 profile 冷启动"那一层
+又失败（后来查明是**我们自己的依赖污染**，见 §5.4）。**那个附件会让装它的 profile 起不来**，不要再
+用它安装。
 
-- **发 GitHub Release `v0.1.1`，把 `npm pack` 出来的 `dsh-cindy-host-demo-0.1.1.tgz` 作为附件**；
-  同时打 tag `v0.1.1` 推远端，便于追溯与回滚。
-- **不 `npm publish`**，因此 `package.json` 保持 `private: true` 与 `license: UNLICENSED`——
-  `private: true` 在这里是**防误发布的开关**，不是"还没准备好发布"的标记，别顺手改成 `false`。
-- 代价与理由：`UNLICENSED` 的包公开进 registry 等于以"未授权"状态分发；tarball 渠道足够分发，
-  且撤回成本最低。**0.1.1 的这个附件本身是有缺陷的**（会拖旧一代 DSH 进 profile，见 §5.4），
-  0.1.2 起才是可用的分发物。
-- **以后要转 registry**：先把 `private` 改 `false`、给一个正式许可证（如 MIT）、
-  再按第 5 步的完整清单走一遍——尤其第 5 步的干净 profile 验证，不能省。
+**0.1.2（当前渠道：npm registry）**：`private: false` + `license: MIT` + 仓库根 `LICENSE`，然后
+
+```bash
+npm publish --access public          # → dsh-cindy-host-demo@0.1.2
+npm view dsh-cindy-host-demo version # 读回来确认（刚发布时会有几十秒的复制延迟，404 不等于失败）
+```
+
+安装方向就变成按包名（§2 的 c）：
+
+```bash
+dsh plugin --profile <profile> add dsh-cindy-host-demo@0.1.2
+```
+
+实测（全新 `DSH_HOME` + `--from-default-profile web`）：`add` exit 0、profile-local
+`@deepseek-ai` = 0、`dsh web` 启动、`/api/dsh-cindy-host/status` → `200 installed=true`。
+`registry` 上读回的 `dependencies` 只有 `keytar, ws`（§5.6 规则一的直接证据）。
+
+**撤版方式也随之改变**：见 §6。
 
 ### 5.6 依赖规则：DSH 的包只能是对等依赖（写死的检查）
 
@@ -216,7 +230,9 @@ entry 当作致命错误（整个 profile 起不来）。`0.1.1` 就是 compose 
 
 ## 6. 回滚与撤版
 
-- **未发 registry（tarball 分发）**：装回上一个 tarball 即可，最干净。
+- **未发 registry（tarball 分发）**：装回上一个 tarball 即可，最干净。0.1.1 的实例正是这条：
+  它是 GitHub Release 附件而不是 registry 版本，所以"撤版"只需要一条说明加一个修复版本
+  （0.1.2），不需要动 registry。
 - **已发 npm**：`npm deprecate dsh-cindy-host-demo@<bad> "原因"` 并立刻发一个修复版本；
   `npm unpublish` 有 72 小时窗口且被 registry 策略限制，不要把它当成回滚方案。
 - **插件侧**：`dsh plugin --profile <p> add dsh-cindy-host-demo@<上一个版本>` + 重启。
@@ -227,13 +243,16 @@ entry 当作致命错误（整个 profile 起不来）。`0.1.1` 就是 compose 
 ```
 [ ] 门禁四项全绿（unit / audit / 沙盒 / 真机 105-105）
 [ ] 版本号已升，CHANGELOG 写明验证过的 DSH 版本
-[ ] private=false；files 白名单；dependencies 里没有任何 @deepseek-ai/*（§5.6 规则一）
+[ ] private=false；license 是 MIT 且有 LICENSE 文件；files 白名单
+[ ] dependencies 里没有任何 @deepseek-ai/*（§5.6 规则一）
 [ ] npm pack --dry-run 清单已人眼确认（无凭据/沙盒/日志/开发记录）
 [ ] 干净 DSH_HOME + web 派生 profile 装 tarball：add exit 0
 [ ] 装完 profile-local @deepseek-ai 计数 == 0（没把某一代 DSH 拖进去）
 [ ] compose 通过 **并且真的启动**，GET /api/dsh-cindy-host/status → 200 installed=true
       （只做 compose 不算数：缺一个具名导出同样能 compose 通过，却在加载时让整个 profile 起不来）
-[ ] 发布（npm 或 tarball），并打 tag 推远端
+[ ] 发布：`npm publish --access public`，再用 `npm view dsh-cindy-host-demo version` 读回确认
+      （刚发布后几十秒内可能 404，那是复制延迟，不是失败）；同时打 tag 推远端
+[ ] **从 registry 再装一次**到干净 home 并启动成功（发布渠道自己也要走一遍验收，不能只验本地 tarball）
 [ ] 真机：告知 → 60s → 重启 → 复测现象
 [ ] 失败路径已想好（deprecate + 修复版本，而不是 unpublish）
 ```
