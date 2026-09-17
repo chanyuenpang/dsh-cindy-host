@@ -544,6 +544,31 @@ test('an error on the invoke path answers the controller and is recorded, never 
   }
 });
 
+test('a live turn is visible on a Host that has never read a session list', async () => {
+  // Measured right after a restart: `local-db:messages:view` marked the running work group
+  // `isStreaming: false` while the agent was working, so the phone drew no live card and the
+  // "running card is last" rule could never fire. `isSessionRunning` read the **row cache**, and
+  // that cache is only filled by a list read — a Host that just started has read nothing, so
+  // `turn/start` had no row to write to and the fact was dropped.
+  const { runtime } = await runtimeWithSocket();
+  try {
+    // No invoke at all: no list read, so the row cache is empty.
+    assert.equal(runtime.isSessionRunning('remote-research'), false, 'nothing is known yet');
+
+    runtime.pushTurnRunning('remote-research');
+    assert.equal(
+      runtime.isSessionRunning('remote-research'),
+      true,
+      'DSH said the turn started, and that is the authority — not whether a row was ever read',
+    );
+
+    runtime.pushTurnIdle('remote-research');
+    assert.equal(runtime.isSessionRunning('remote-research'), false, 'and the end clears it');
+  } finally {
+    await runtime.stop();
+  }
+});
+
 test('a device the relay wrongly calls offline recovers the moment it talks to us', async () => {
   // The live failure this pins, measured at 09:48–09:51: the relay reported the handset
   // `online:false` at 09:48:04 while the user was watching it, so its subscriptions went and

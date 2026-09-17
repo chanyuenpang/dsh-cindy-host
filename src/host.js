@@ -1094,7 +1094,7 @@ export async function startHost(initialSource, settings = DEFAULT_HOST_SETTINGS,
        * It decides whether an accepted prompt queues or is admitted immediately,
        * which is the difference between showing a 队列中 row and inventing one.
        */
-      isSessionRunning: (sessionId) => sessionRowFor(sessionId)?.running === true,
+      isSessionRunning: (sessionId) => isSessionRunningNow(sessionId),
       /**
        * Tell a session's watchers the turn is over.
        *
@@ -1192,6 +1192,13 @@ export async function startHost(initialSource, settings = DEFAULT_HOST_SETTINGS,
    * arm dozens of timers.
    */
   const pendingReconciles = new Map();
+  /**
+   * sessionId -> whether a turn is live, from DSH's own 	urn/start / 	urn/end.
+   *
+   * Deliberately not the row cache: see {@link setCachedRunning} — the cache is empty until
+   * something reads the session list, and a Host that has just restarted has read nothing.
+   */
+  const liveTurnState = new Map();
 
   /**
    * Keep the cached row's turn state in step with an authoritative boundary.
@@ -1208,8 +1215,24 @@ export async function startHost(initialSource, settings = DEFAULT_HOST_SETTINGS,
    * @param running - whether a turn is live.
    */
   function setCachedRunning(sessionId, running) {
+    // The authoritative state lives **outside** the row cache.
+    //
+    // The cache is populated by list reads, so right after a restart — or simply before any
+    // controller has listed sessions — there is no row to write to and the old version dropped the
+    // fact on the floor. Measured consequence: a live turn reported `isSessionRunning: false`, so
+    // `local-db:messages:view` marked the running work group `isStreaming: false` and the phone
+    // neither drew the live card nor let this Host pin it to the end of the page
+    // (「你一直在我的对话之上在工作」). The map is fed by every authority the cache is, and is the
+    // one thing that is true whether or not a row has ever been read.
+    liveTurnState.set(sessionId, running === true);
     const cached = sessionRowCache.get(sessionId);
     if (cached !== undefined) cached.running = running === true;
+  }
+
+  /** The turn state from DSH's own boundaries, falling back to a read row when none was seen. */
+  function isSessionRunningNow(sessionId) {
+    const known = liveTurnState.get(sessionId);
+    return known === undefined ? sessionRowFor(sessionId)?.running === true : known;
   }
 
   /**
@@ -1938,6 +1961,7 @@ export async function startHost(initialSource, settings = DEFAULT_HOST_SETTINGS,
     acceptedControllers.clear();
     subscribers.clear();
     sessionSubscribers.clear();
+    liveTurnState.clear();
     directoryAsked.clear();
     // A question asked over a link that is going away can never be answered;
     // settling them cancelled is what releases DSH's awaiting turn.
@@ -2136,7 +2160,7 @@ export async function startHost(initialSource, settings = DEFAULT_HOST_SETTINGS,
       if (pendingReconciles.has(sessionId)) return;
       const timer = setTimeoutImpl(() => {
         pendingReconciles.delete(sessionId);
-        if (sessionRowFor(sessionId)?.running === true) return;
+        if (isSessionRunningNow(sessionId)) return;
         announceTurnIdle(sessionId);
       }, TURN_RECONCILE_MS);
       pendingReconciles.set(sessionId, timer);
@@ -2216,6 +2240,14 @@ export async function startHost(initialSource, settings = DEFAULT_HOST_SETTINGS,
     },
     /** How many controllers are watching one session's live stream. */
     watchersFor,
+    /**
+     * Whether a turn is live for one session, from DSH's own boundaries.
+     *
+     * Public because it is the fact the history view's `isStreaming` marker is built on: "the
+     * phone drew no live card" and "the running card was not pinned last" both reduce to this
+     * answering false during a live turn.
+     */
+    isSessionRunning: (sessionId) => isSessionRunningNow(sessionId),
     /** The questions still open, in the controller's shape. */
     listPendingInteractions: (sessionId) => approvals.list(sessionId),
     resolveInteraction,
