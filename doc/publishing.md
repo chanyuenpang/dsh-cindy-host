@@ -147,6 +147,19 @@ dsh plugin --profile <profile> add dsh-cindy-host-demo@<version>
 "compose 通过 + 插件不再出现在失败栈里"作为这一层的证据。这是 DSH 侧的问题，值得单独上报；不要
 把它误判成自己插件的安装缺陷（我们最初就这么怀疑过，是版本与解析路径的证据把它排除掉的）。
 
+### 5.5 0.1.1 的实际发布方式：GitHub Release（不走 registry，2026-09-17）
+
+按上面第 6 步的"仅发 tarball"分支执行：
+
+- **发 GitHub Release `v0.1.1`，把 `npm pack` 出来的 `dsh-cindy-host-demo-0.1.1.tgz` 作为附件**；
+  同时打 tag `v0.1.1` 推远端，便于追溯与回滚。
+- **不 `npm publish`**，因此 `package.json` 保持 `private: true` 与 `license: UNLICENSED`——
+  `private: true` 在这里是**防误发布的开关**，不是"还没准备好发布"的标记，别顺手改成 `false`。
+- 代价与理由：真机验收里"干净 profile 冷启动"这一层仍被 DSH 自身缺陷挡住（§5.4），而
+  `UNLICENSED` 的包公开进 registry 等于以"未授权"状态分发。tarball 渠道足够分发，且撤回成本最低。
+- **以后要转 registry**：先把 `private` 改 `false`、给一个正式许可证（如 MIT）、
+  再按第 5 步的完整清单走一遍——尤其第 5 步的干净 profile 验证，不能省。
+
 ## 6. 回滚与撤版
 
 - **未发 registry（tarball 分发）**：装回上一个 tarball 即可，最干净。
