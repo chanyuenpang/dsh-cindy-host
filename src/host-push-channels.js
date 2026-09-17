@@ -18,6 +18,13 @@
 export const HOST_PUSH_CHANNELS = new Map([
   ['maker:event', 'host.js announceTurnRunning/announceTurnIdle (turn boundaries)'],
   ['local-db:messages:created', 'host.js pushSessionMessage (live fold)'],
+  // The history view's own invalidation. The controller handles this channel *before* any
+  // store logic (`DeviceLinkContext`: `historyView?.invalidate(); return;`), and it is what
+  // refreshes a session the controller is already inside — without it a new message only
+  // appeared after re-entering the session (报：重新进入会话之后对话就出来了). The audit
+  // used to record this channel as deliberately unsent because the view it invalidates was
+  // the one this Host refused; the Host serves the view now, so the reason expired with it.
+  ['maker:history-view-changed', 'host.js pushSessionMessage (the view a session is showing)'],
   ['maker:input:projection', 'host.js pushInputProjection (queue changes)'],
   ['maker:goal:status-changed', 'host.js pushGoalStatus + applyControlFrame (goal projection)'],
   ['maker:interaction-request', 'host.js askApproval/askUserQuestion'],

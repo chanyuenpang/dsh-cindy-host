@@ -1,0 +1,50 @@
+{
+  "title": "Host 侧修复：插话可见性与输入通道可观测性",
+  "templateId": "default",
+  "status": "end.completed",
+  "goal": {
+    "text": "在 Host 侧（不动客户端代码）修复手机端「发送后转圈然后消失」：让刚被接受的插话在 DSH 落盘之前也出现在 steeringQueueClientIds 里并立即推送投影；同时给 input/send 通道加上可归属的诊断（sessionId/文本长度/clientId/附件形态）。"
+  },
+  "requirements": {
+    "summary": "",
+    "openQuestions": [],
+    "acceptanceCriteria": [
+      "test/cindy-channels.test.js：新插话（非提升）被接受后登记该 clientId 为 steering，并推送 maker:input:projection（新增用例）",
+      "test/host-input-queue.test.js：markSteering 幂等且不影响已有队列；durable 行到达时 retire 会清掉它（新增用例）",
+      "host.js 的 askOf 对 maker:send / input:enqueue / input:steer 记录 sessionId + 文本长度 + clientId（+ 附件形态）",
+      "npm test 全绿（409/409）；已提交（75878e1）",
+      "重启后：运行中会话从手机发消息，气泡应停在「插话中」直到真实行到达，不再转圈后消失；/status 的 recentInvokes 能直接看出该次发送落到哪个会话"
+    ]
+  },
+  "tasks": [
+    {
+      "id": 1,
+      "title": "Complete planning with claw-kit:planning",
+      "detail": "1. Determine whether the user's wording is an instruction to act or an open-ended discussion. 2. Use claw-kit:planning to clarify the requirements and prepare the task list. 3. Before adopting the solution, ensure the user has seen its decision-relevant content; if it introduces a meaningful choice, wait for the user's response.",
+      "status": "done"
+    },
+    {
+      "detail": "host-input-queue 新增 markSteering（按 controller id upsert 一条 placement='steering' 的条目，保留其它队列项；mirror 只能改已在 fold 中的条目，新插话无处可见）；host.js 在 queueMirror 暴露它；cindy-channels 在接受新 steer 后登记并立即 pushInputProjection，在把队列条目提升为插话时也推送。背景：手机在运行中的会话发消息 → DSH 落到 next-step（尚未 durable）→ 投影对此一言不发 → 客户端把自己的气泡 retire 掉，用户看到「转圈转圈然后就消失了」（会话日志证据：08:44:01 enqueue → 08:44:04 提升为 steer → 08:44:31 才成为 durable user/message）。客户端代码不改。",
+      "title": "Host 侧：接受插话后立即在投影里可见（markSteering + push）",
+      "status": "done",
+      "id": 2
+    },
+    {
+      "detail": "host.js 的 askOf 原本只对带附件的 send 记录一行，且不含会话；现在 maker:send / maker:input:enqueue / maker:input:steer 全部记录 sessionId、文本长度、clientId（含附件时补形态）。这次排查「我发了两条消息，你收到了吗」需要解开拼接 zstd 帧的会话日志才能回答，有了这些字段就直接可查。",
+      "title": "输入/发送通道的可归属诊断（sessionId/文本长度/clientId）",
+      "status": "done",
+      "id": 3
+    }
+  ],
+  "references": [],
+  "rules": [],
+  "keyDecisions": [
+    "客户端不改：任何「手机上看到一个东西」的需求都要先在 Host 侧找到客户端已经在读的字段（此处是 InputProjection.steeringQueueClientIds），把语义补进去，而不是让客户端改变判定。",
+    "「已接受但尚未落盘」的中间态必须被 Host 说出来：DSH 的 splice 在 prompt() 返回之后才发生，这段时间的投影宁可多一条真实存在的 steering 条目（落盘后被 retire），也不能对刚发出去的消息一言不发。"
+  ],
+  "retrospective": {
+    "summary": "问题：手机在运行中的会话里发消息，气泡「转圈转圈然后就消失了」，用户不确定桌面是否收到。\n\n诊断（会话日志为证）：08:44:01 enqueue（投影答出待入队行）→ 08:44:04 提升为 steer → 08:44:31 才成为 durable user/message。中间 27 秒里，DSH 把消息放在 inbox 的 next-step（尚未 durable），而我们的投影对此一言不发，客户端就把自己的乐观气泡 retire 掉了。消息本身没有丢（三条都在 08:44:31 落盘，agent 也真的看到了）。\n\n修复（全部在 Host 侧）：host-input-queue 新增 markSteering（upsert 一条 placement='steering' 的条目，保留既有队列），host.js 在 queueMirror 暴露，cindy-channels 在接受新 steer 后登记并立即推送 maker:input:projection（提升为插话时也推送），durable 行到达时 retireQueuedItem 清掉再推一次。另：askOf 为 input/send 通道记录 sessionId/文本长度/clientId/附件形态。\n\n验证：npm test 409/409（新增：新插话登记为 steering 并推送投影；markSteering 幂等且不动既有队列，durable 到达后 retire 生效）；已提交 75878e1。\n\n未完成：重启后的真机确认（气泡应停在「插话中」直到真实行到达，不再转圈后消失）。"
+  },
+  "updatedAt": "2026-09-17T08:51:46.687Z",
+  "completedAt": "2026-09-17T08:51:46.550Z"
+}

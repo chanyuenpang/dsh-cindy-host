@@ -890,7 +890,21 @@ export function createChannelRouter({
           }
           const failure = commitQueueActionAndReconcile(capabilities, sessionId, dshId, { kind: 'steer' });
           if (failure !== null) return invokeError(request, failure.code, failure.message);
-          capabilities.queueMirror?.mirror(sessionId, namedId, { kind: 'steer' });
+          // `mirror` only re-places an item the fold already holds, and this one may not be
+          // there: the authoritative read that follows an enqueue can race DSH's splice and
+          // come back empty. That is exactly how a promoted 插话 left the projection saying
+          // nothing — measured as a 42-second gap (08:54:40 promoted → 08:55:22 durable)
+          // with the phone's bubble abandoned in between. The upsert makes the steering id
+          // true from this moment; the durable row's `retireQueuedItem` clears it again.
+          if (typeof capabilities.queueMirror?.markSteering === 'function') {
+            capabilities.queueMirror.markSteering(sessionId, {
+              id: namedId,
+              rpcId: namedId,
+              message: { id: namedId, content: [] },
+            });
+          } else {
+            capabilities.queueMirror?.mirror(sessionId, namedId, { kind: 'steer' });
+          }
           // The promotion moved the row from "queued" to "steering": tell the controller
           // that, or the row it is showing disappears in the hand-off.
           capabilities.pushInputProjection?.(sessionId);
@@ -985,6 +999,16 @@ export function createChannelRouter({
           const pending = !held && namedId !== null && capabilities.isSessionRunning?.(sessionId) === true
             ? (capabilities.queuedRow?.({ clientId: namedId, text, sessionId }) ?? null)
             : null;
+          // A synthesised row has to exist in the fold too, not just in this answer: the
+          // controller will keep showing it, and the next thing that happens to it (插话 →
+          // promotion, 编辑, 删除) resolves against the fold by that id.
+          if (pending !== null && typeof capabilities.queueMirror?.markQueued === 'function') {
+            capabilities.queueMirror.markQueued(sessionId, {
+              id: namedId,
+              rpcId: namedId,
+              message: { id: namedId, content: text === null || text === '' ? [] : [{ type: 'text', text }] },
+            });
+          }
           return invokeResult(request, capabilities.projectionFromItems(sessionId, items, pending));
         }
       }

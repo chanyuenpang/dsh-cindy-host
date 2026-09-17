@@ -745,6 +745,12 @@ export async function startHost(initialSource, settings = DEFAULT_HOST_SETTINGS,
    */
   function pushSessionMessage(sessionId, message) {
     pushSessionUpdate(sessionId, 'local-db:messages:created', { sessionId, message });
+    // …and tell the history view to re-read. The two are not the same message: the row
+    // above feeds the controller's message store, while this one is the *only* signal the
+    // work-grouped view acts on (`DeviceLinkContext` invalidates on it and returns), so a
+    // session the user is already inside did not update until it was reopened — 报
+    // 「重新进入会话之后对话就出来了」.
+    pushSessionUpdate(sessionId, 'maker:history-view-changed', { sessionId });
   }
 
   /**
@@ -845,6 +851,10 @@ export async function startHost(initialSource, settings = DEFAULT_HOST_SETTINGS,
         // `steeringQueueClientIds`, or its bubble has nothing to hold on to until the
         // durable row lands (the model driver retires it in between).
         markSteering: (sessionId, item) => inputQueue.markSteering(sessionId, item),
+        // And a prompt accepted as *queued*: the authoritative read can race DSH's splice,
+        // so the row the controller is showing has to exist in the fold for a later
+        // promotion, edit or removal to resolve.
+        markQueued: (sessionId, item) => inputQueue.markQueued(sessionId, item),
         itemIds: (sessionId) => inputQueue.itemIds(sessionId),
       },
       /** Project a queue DSH actually reported, rather than the folded one. */

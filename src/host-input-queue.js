@@ -213,26 +213,47 @@ export function createInputQueueTracker() {
   }
 
   /**
-   * Record a prompt this Host has just accepted as a **steering** item.
+   * Upsert one prompt into the fold with a placement, preserving everything else.
    *
-   * `mirror(..., { kind: 'steer' })` can only re-place an item the fold already holds, and
-   * a *new* steering prompt is in neither `next-turn` nor (yet) `next-step`: DSH splices it
-   * into the running turn's next step a moment after `prompt()` returns. Without this the
-   * projection said nothing about the message the user had just sent, so the controller
-   * retired its own bubble and nothing replaced it — reported as
-   * 「在我的手机端它直接转圈转圈然后就消失了」. The entry is stored under the controller's
-   * own id and is removed by `retireQueuedItem` the moment the durable row lands.
+   * `mirror` can only re-place an item the fold already holds, and a *fresh* prompt is in
+   * no frame we have seen yet: DSH splices it into the inbox a moment after `prompt()`
+   * returns, so an authoritative read taken right then can legitimately come back empty —
+   * measured, that is exactly how a promoted 插话 left the projection saying nothing about
+   * the message the user was looking at ("we still lost it": 08:54:29 enqueued, 08:54:40
+   * promoted, 08:55:22 durable, with `steeringQueueClientIds` empty the whole time).
+   * Anything the controller is showing therefore has to be insertable by id.
    *
-   * @param sessionId - the session the prompt went to.
-   * @param item - `{ id, rpcId, message }` for the accepted prompt.
+   * @param sessionId - the session.
+   * @param item - `{ id, rpcId?, message? }` for the prompt.
+   * @param placement - `'queued'` or `'steering'`.
    */
-  function markSteering(sessionId, item) {
+  function markItem(sessionId, item, placement) {
     if (typeof sessionId !== 'string' || sessionId === '') return;
     const id = item?.id === undefined || item?.id === null ? null : String(item.id);
     if (id === null) return;
     const items = queues.get(sessionId) ?? [];
     const others = items.filter((entry) => String(entry?.id) !== id);
-    queues.set(sessionId, [...others, { ...item, id, placement: 'steering' }]);
+    queues.set(sessionId, [...others, { ...item, id, placement }]);
+  }
+
+  /**
+   * Record a prompt this Host has just accepted as a **steering** item.
+   *
+   * Without this the projection says nothing about the message the user just sent, so the
+   * controller retires its own bubble and nothing replaces it — reported as
+   * 「在我的手机端它直接转圈转圈然后就消失了」. The entry is stored under the controller's own
+   * id and is removed by `retireQueuedItem` the moment the durable row lands.
+   *
+   * @param sessionId - the session the prompt went to.
+   * @param item - `{ id, rpcId, message }` for the accepted prompt.
+   */
+  function markSteering(sessionId, item) {
+    markItem(sessionId, item, 'steering');
+  }
+
+  /** Record a prompt this Host has just accepted as **queued** (a running turn holds it). */
+  function markQueued(sessionId, item) {
+    markItem(sessionId, item, 'queued');
   }
 
   /** Reorder one queued item, as `maker:input:move` asks. */
@@ -399,6 +420,8 @@ export function createInputQueueTracker() {
     adopt: (sessionId, items) => { setItems(sessionId, items); },
     /** Record one just-accepted steering prompt, preserving the rest of the queue. */
     markSteering: (sessionId, item) => { markSteering(sessionId, item); },
+    /** Record one just-accepted queued prompt, preserving the rest of the queue. */
+    markQueued: (sessionId, item) => { markQueued(sessionId, item); },
     /** Every queued item id, newest fold first — used to clear a queue honestly. */
     itemIds: (sessionId) => (queues.get(sessionId) ?? []).map((item) => String(item?.id)),
   };

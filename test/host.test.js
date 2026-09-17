@@ -309,8 +309,20 @@ test('pushes a live message only to the controllers watching that session', asyn
 
     runtime.pushSessionMessage('s1', { id: 'm1', role: 'assistant', content: { text: 'hi' } });
     const pushes = socket.sent.filter((frame) => frame.kind === 'push');
-    assert.equal(pushes.length, 3);
-    const messagePush = pushes[pushes.length - 1];
+    // Two frames, because they do two different jobs: the row feeds the controller's
+    // message store, and `maker:history-view-changed` is the only signal the work-grouped
+    // view acts on (`DeviceLinkContext` invalidates on it and returns). Without the second
+    // one a message only showed up after re-entering the session —
+    // 报「重新进入会话之后对话就出来了」.
+    assert.equal(pushes.length, 4);
+    assert.deepEqual(
+      pushes.slice(-2).map((frame) => frame.payload.channel),
+      ['local-db:messages:created', 'maker:history-view-changed'],
+    );
+    const viewPush = pushes[pushes.length - 1];
+    assert.equal(viewPush.dst, 'phone-2', 'the view invalidation is addressed to the same watcher');
+    assert.equal(viewPush.payload.payload.sessionId, 's1');
+    const messagePush = pushes[pushes.length - 2];
     assert.equal(messagePush.dst, 'phone-2', 'a session push is addressed to its watcher');
     // Exactly what the controller's `local-db:messages:created` handler reads.
     assert.equal(messagePush.payload.channel, 'local-db:messages:created');
@@ -319,7 +331,7 @@ test('pushes a live message only to the controllers watching that session', asyn
 
     // A session nobody watches must not leak into another session's stream.
     runtime.pushSessionMessage('s2', { id: 'm2' });
-    assert.equal(socket.sent.filter((frame) => frame.kind === 'push').length, 3);
+    assert.equal(socket.sent.filter((frame) => frame.kind === 'push').length, 4);
 
     // Unsubscribing, or the socket going away, stops the stream.
     socket.frame({ v: 1, kind: 'invoke', id: 'unsub-1', src: 'phone-2', payload: { channel: 'device-link:unsubscribe', args: [{ topics: ['session:s1'] }] } });
