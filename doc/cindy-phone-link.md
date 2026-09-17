@@ -2114,6 +2114,9 @@ holding both topics gets one `maker:event` plus one row patch, not two row patch
 
 ## A subscription the relay cannot reach is not a subscription
 
+> **这条策略后来被推翻了**——见「presence 会说谎，订阅表是我们自己的账本」。这里保留当时的推理与
+> 实测，因为推翻它的证据正是它自己造成的故障：**当前实现不删任何订阅**。
+
 The other half of the same report — 「我在这边一直盯着这个屏幕，但是他还是一直在转圈思考中…
 我必须要返回上一页退出会话重新进才能看到你的回答」 — was measured with the frame log on
 both sides of the relay, and the Host was the one at fault:
@@ -2128,9 +2131,11 @@ both sides of the relay, and the Host was the one at fault:
 The Host held a subscription set it had no way to check, and `online:false` was the only
 moment the relay ever said so. Three changes follow from that one fact:
 
-- **`presence-changed{online:false}` drops the device's subscriptions** — the `sessions`
-  topic and every `session:*` topic it held. Pushing into a route the relay has already
-  disowned is not delivery, and treating it as delivery is what kept the spinner alive.
+- ~~**`presence-changed{online:false}` drops the device's subscriptions**~~ — 这是当时的做法（`sessions`
+  主题和它的每一个 `session:*` 主题），前提是「推给中继已经不认的路由不算送达」。这个前提在 09:48:04
+  反噬了（见下），所以**现在只把设备记进 `offlineDevices`，订阅一个都不删**（`markDeviceUnreachable`）：
+  `pushSessionUpdate` 仍然发给每一个 watcher，可达性只决定这次推送**算不算已送达**（`reachable`
+  只进计数与去重账）。
 - **The sessions it was inside are remembered** (`watchedSessionsByDevice`), so its next
   `link-open` can be answered with the turn state instead of silence. The announcement is
   sent only when the cached row positively says the turn is over: a cold row is never read
@@ -2166,14 +2171,16 @@ it links again after the window; a re-link inside the window repeats nothing.
 
 这三分钟里手机既转圈又「没有收到你的这些操作记录」——和这条策略要修的那个症状一模一样。结论：
 **presence 是中继的意见，设备发来的帧是事实**。所以现在任何一帧（`invoke` 或 `link-open`）来自
-被标记离线的设备，就当场撤销判定：
+被标记离线的设备，就当场撤销判定（`markDeviceReachable`）：
 
-- 它的 `sessions` 主题与会话主题全部恢复（列表主题需要单独记，`watchedListDevices`——会话主题
-  本来就有 `watchedSessionsByDevice`，而 `sessions` 没有 session id 可挂）；
-- 它可能错过的回合状态重新播报（复用 `announceWatchedTurnState`，与 `link-open` 同一条去重窗口）；
-- 它正在看的视图被失效，于是它重读而不是停在旧内容。
+- 它不再被计入「已送达」（从 `offlineDevices` 删掉），而它可能错过的回合状态重新播报
+  （复用 `announceWatchedTurnState`，与 `link-open` 同一条去重窗口）；
+- 它正在看的视图被失效，于是它重读而不是停在旧内容；
+- **订阅从来没有被删过，所以没有东西需要「恢复」**。撤销是不可逆的，可达性是可逆的——这就是后来
+  把「离线就撤销订阅」整条推翻的地方。
 
-presence 改口说 `online: true` 时做同样的事，所以回来的设备不必手动重订阅。
+presence 改口说 `online: true` 时做同样的事。它只是加速器而不是生命线：推送本来就与可达性无关，
+所以一台再也不开口的设备，仍然会收到中继能路由到它的一切。
 
 ### 一次列表读超时不该变成空列表
 
@@ -2555,7 +2562,162 @@ claw 工作流的任务清单**一直在同步进 DSH**：适配器每次结算 
 实测（`tools/probe-todo-rows.mjs`）：本会话 159 条快照 → 156 行手机可见的 `TodoWrite` 行
 （3 条空快照被跳过），行内就是 `[completed] …` / `[in_progress] …` / `[pending] …` 的真实状态。
 
-### 本轮真机复测清单
+## 待发项的位置是预测，而预测要用“用户敲下的时刻”
+
+两条真机报告，看起来是两件事，实际是同一个判断：
+
+> 插入之后顺序会变，它会插入到我前面说的两行话前面。
+>
+> 你一直在我的对话之上在工作⋯最好是我发完对话之后无论如何你都把正在工作这个信息调到最后。
+
+先把责任分清楚：**“插入跑到前面”有一半是真实的投递顺序**。实测那一轮，用户的两条消息在
+10:45:11 / 10:45:24 排队等下一个 turn，第三条是一次**插话**（steer，它跳过队列），10:46:11
+就变成 durable——转录里它本来就在前两条之前。Host 加剧了这个现象：待发项被整体追加到页尾，
+于是用户**更早**敲的两行被排到了**更晚**敲的那行底下。
+
+处置是给三种形状各一个时刻，再按它插入（`src/cindy-channels.js`）：
+
+```js
+occurredAtMs(entry)   // work 段按 summary.endedAtMs；messages 项按最后一条；裸行按 createdAt
+mergePendingByTime(items, pending, { newestFirst })
+```
+
+`local-db:messages:list` 是新到旧（`newestFirst: true`），`messages:view` 是旧到新——同一个函数
+两个方向，因为两个页面用的是同一份“用户敲下的顺序”。
+
+**这是一个预测，而且它不总是对。** 排队项要到下一个 turn 边界才投递，所以它仍可能落到那条
+超过它的插话之后；行会移动一次，移动的时机是它变成 durable 的那一刻。投递顺序是转录的，
+而在什么都还没投递之前，用户看的就是**敲下的顺序**。
+
+正在工作的卡片单独处理：页面最后一项是 `isStreaming === true` 的 `work` 段时，排序在它之后的
+（包括刚接受、还没落盘的提示）统统挪到它上面——运行中的卡片永远是最后一行。理由是「正在工作」
+是现在时，它属于用户说过的所有话**之下**，否则刚发出去的那句话会被顶到自己对话的中间。
+
+`test/pending-order.test.js` 钉住五条，包括「the running work card is always last, under what the
+user just said」和「an entry with no readable time is treated as oldest, never dropped」——没有可读
+时间的行按最旧处理，宁可顺序不完美也不能把用户的话弄丢。
+
+## 被 DSH 拒绝的插话是竞态，重试一次，而不是让用户的话买单
+
+手机上报的是 `current turn no longer accepts steering`。这是**两级**处理，缺一不可：
+
+1. **模式跟随会话。** `wantsSteer = channel === 'maker:input:steer' && capabilities.isSessionRunning?.(sessionId) === true`
+   ——turn 已经结束的插话本来就该是一条普通提示，而不是一次注定被拒的插话
+   （`test/queue-commands.test.js:153`「an insert that arrives after the turn ended is a normal
+   prompt, not a refusal」）。
+2. **仍然被拒时重试一次。** 只有拒绝文本与插话相关（`/steer/i`）才重试，且重试走 `queue`，
+   并记住这**不是**一条 steering 行，免得投影谎称有一条。其它任何失败原样传给控制器
+   （`:203`「a failure that is not about steering still travels」）。
+
+理由是第 1 步先天不够：我们检查会话状态、和 DSH 做决定之间有 gap，这是竞态。它不能由用户的话
+来承担后果。修复前的代价是：插话在手机上变成一个错误字符串，而用户正看着的那条消息从对话里
+消失，直到他再发一次。
+
+### 同一类问题：没人重试的帧，在订阅时补上
+
+实测 App 从后台回来会做一次 unsubscribe → resubscribe 的抖动（一个会话里 26 次 subscribe /
+13 次 unsubscribe），而一次发送正好落在抖动里：承载「已接受」和「视图已变」的两帧被中继丢掉，
+且无人重试——气泡一直转、转录一直陈旧，直到重启 App。
+
+订阅是客户端**一定在听**的唯一时刻，所以 Host 在那里补它没能送到的东西：权威的 input
+projection（让转圈的气泡退场）+ 一次视图失效（让它重新读）。两帧都幂等、各一帧代价，
+并且只在真的重订阅时发生（`src/cindy-channels.js` 的 `device-link:subscribe` 分支）。
+
+## presence 会说谎，订阅表是我们自己的账本
+
+`markDeviceUnreachable` 只往 `offlineDevices` 加一个 id，**不删订阅**。第一版删了，理由是
+「中继到不了的订阅不算订阅」，实测两次都证明这个理由反过来：
+
+- presence 是**只发 delta 的意见**，它没有义务纠正自己：一个陈旧的 `online:false` 之后不会
+  跟着一条 `online:true`，除非设备真的重连。09:48:04 它把用户正看着的手机报成离线，订阅被删，
+  接下来三分钟就是转圈——正是删订阅想修的那个现象。
+- 修复路径本身是死代码：`markDeviceReachable` 靠入站帧触发，而客户端一旦认为对端不可用就会
+  **停止发帧**（它撤掉自己的对端恢复，并把该设备从计划里过滤掉）。等于 Host 销毁了自己关于
+  「谁要求被推送」的唯一记录，然后等一台它刚宣布沉默的设备开口。
+
+所以订阅表是这个进程自己关于**谁要求被推送**的记录，可达性是**另一个事实**，它只决定一次推送
+算不算「已送达」，从不决定记录是否存在。`push` 是没有 ack 的 routed fire-and-forget：给不可达
+设备推一帧，代价是中继丢掉一帧；删掉记录，代价是整个会话。
+
+这次推翻留下一处残骸：`watchedListDevices` 现在**只有写没有读**（它当年是为「把 `sessions`
+主题还回去」而记的，而现在已经没有东西会把它拿走）。
+
+### 于是补一个脉冲，触发点是“设备自己开口”
+
+控制器从后台回来**不会**重新订阅（实测：连续 20 次 invoke 里没有一次 `device-link:subscribe`），
+但它会一直问（`messages:view` / `view-intent` / `input:enqueue`，每秒级）。所以「这台设备提到了
+这个会话」是唯一一定会到的恢复触发点：
+
+```js
+pulseRepair(sessionId)   // REPAIR_PULSE_MS = 30_000，每会话最多一次
+                         // 补的正是丢掉的 push 会带的两帧：input projection + 视图失效
+```
+
+没人看这个会话时它什么都不做；收到任何一条 `args[0]` 指向被监视会话的入站帧也会撤销该设备的
+不可达判定，并把该会话的 turn 状态与视图失效补给它。
+
+### 边界：Host 收到了、手机却没更新（这一条不是我们的）
+
+鸿蒙上跑安卓版 Cindy 客户端，App 从后台回到前台后，这条 device-link 连接的**读方向**会失效，
+而写方向仍然正常：客户端发出的请求能到达 Host，Host 的答复与所有推送都到不了客户端。表现是
+发送后一直转圈、看不到工作进度、顶部没有重连提示、设备仍显示「已连接」，**退出会话再进或重启
+App 后一切恢复**。
+
+归属是操作系统的应用恢复行为，所以 Host 不再为它投入：
+
+- **官方客户端同样复现**（用户实测），排除某个客户端版本的分支问题；
+- **主机侧一切正常**：手机入站 `input:enqueue ok=True`（并按 `turn/start` 落盘）、`watchers` 里
+  有这台手机、两帧也都按 30 s 规则补推了；
+- **协议没有投递确认**：push 是 routed fire-and-forget，Host 对「客户端是否收到」零观测，所以
+  这个方向在 Host 侧既看不见也无法补救——任何「我们发出去了」都不能当成「它收到了」。
+
+Host 侧唯一能看到的签名是**客户端在反复重发同一个读**：
+
+```
+12:18:03 / :04 / :08 / :09   messages:view + view-intent
+12:20:20 / :21 / :28         同上
+12:29:09 / :10 / :18         同上
+```
+
+如果它收到了答复，就不会一秒问两次；这也解释了它为什么自认健康——它只按「发送是否成功」判断。
+
+现场处理：**等约 1 分钟**（入站有时会自行恢复，durable 行随后送达）；仍不出现就**退出会话再进**，
+强制重建连接。复发时先做三件事，省掉重新取证的时间：
+
+1. `/status` 的 `subscriptions.sessions` 里手机还在不在（在 → 不是订阅问题）；
+2. `recentInvokes` 里它是不是在**重复发同一个读**（是 → 答复没到它，方向性问题）；
+3. `recentPushes[].watchers` 是否 > 0（> 0 → Host 有目标可推，问题在通道而不在 Host）。
+
+## harness 的后台任务通知不是用户说的话
+
+DSH 的后台任务通知（`background job … finished` 这类）在手机上渲染成了用户自己发的消息。
+
+根因和之前两次一样：这些行是**带 `source` 的消息**，而转录折叠只按 role 判断
+（`role === 'user' ? 'user' : 'assistant'`），于是生产者的上下文被当成了人的话。同一根因先前
+已经以两种面貌出现过——系统提示被渲染成 assistant 回复、`Current runtime context…` 快照每轮
+渲染成一条用户气泡。当时的修法是丢弃 `source.kind === 'plugin'`，但那是否决名单，下一种注入
+就绕过去了：skills 目录用的是 `skill-catalog`。
+
+判据因此反转成**允许名单**：
+
+```js
+const RENDERABLE_SOURCE_KINDS = new Set(['user', 'model', 'tool']);
+if (sourceKind !== null && !RENDERABLE_SOURCE_KINDS.has(sourceKind)) return rows;
+```
+
+不在名单里的（`plugin`、`skill-catalog`，以及将来任何一种）默认是生产者提供的上下文，不渲染；
+完全没有 `source` 的仍然渲染——DSH 要求每条消息都带 source，缺失说明这是一个本 Host 认不出的
+形状，而藏起用户自己的话是更坏的失败。
+
+被藏掉的行必须在**某处**可观测，否则「Host 悄悄丢了一条消息」和「本来就没有可显示的」从桌面端
+看是同一个样子。所以判断单独导出（`isHarnessNotice(event)`，`src/dsh-message-fold.js`），计数进
+`diagnostics.suppressedNotices`。`test/dsh-message-fold.test.js:308` 钉住两侧：
+「a harness notice is not conversation, and a person still is」。
+
+**一条约束值得单独写下来：隐藏只发生在投影/渲染层。** 工具本身、通知的产生方式、以及 agent 是否
+使用后台任务都不受影响——通知是给 agent 和桌面端看的，只是不该冒充用户说过的话。
+
+## 真机复测清单（累计）
 
 重启 `dsh web` 之后（新通道与新能力都只在重启后生效）：
 
@@ -2566,6 +2728,18 @@ claw 工作流的任务清单**一直在同步进 DSH**：适配器每次结算 
 3. 发一张照片，或让 agent 画一张图并打开——应显示图片（内联缩图路径），不再出现「取图失败」。
 4. 「加载更早」应当即时返回（transcript 缓存 + 50 ms 级翻页）。
 5. **转圈不再需要手动重进**：让 agent 答完一句话，然后息屏／切走让中继把手机标成离线，
-   再回到会话——答案应当直接出现，思考中应当自己结束。可在 Host 日志里对照
-   `presence-changed … online:false` 之后不再有指向该设备的 push。
+   再回到会话——答案应当直接出现，思考中应当自己结束。可在 `/status` 对照：
+   `presence-changed … online:false` 之后 `subscriptions.sessions` 里**仍然有这台手机**，
+   且 `recentPushes[].watchers` 仍 > 0——推送照发，presence 只影响「算不算已送达」。
+6. **插话**（agent 正在回答时发一句）：应当作为插话进入当前 turn；如果 DSH 已经过了可插话的
+   点，它应当变成下一条普通消息，而不是报 `current turn no longer accepts steering`，更不应
+   从对话里消失。
+7. **顺序**：agent 忙时连发两条，再插一句——三句应当按你敲下的顺序显示；正在工作的卡片应当
+   始终在所有用户消息**之下**（最后一行）。
+8. **后台任务通知**：让 agent 起一个后台任务并等它结束——通知不应当出现在对话里；
+   `/status` 的 `diagnostics.suppressedNotices` 应当随之增加（不是静默消失）。
+9. **息屏／切走再回来仍收不到**（答案不出现、进度不动、没有重连提示）时，先按上一节的三步
+   取证：`subscriptions.sessions` 有没有这台手机、`recentInvokes` 里它是否在重复发同一个读、
+   `recentPushes[].watchers` 是否 > 0。三步都指向「通道」而不是「Host」时，这就是那条 OS 侧
+   限制——等约 1 分钟，或退出会话再进。
 
