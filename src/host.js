@@ -611,6 +611,14 @@ export async function startHost(initialSource, settings = DEFAULT_HOST_SETTINGS,
    * delivered. Cleared the moment the device links again, which is itself proof of a route.
    */
   const offlineDevices = new Set();
+  /**
+   * Devices that subscribed to the `sessions` topic at least once.
+   *
+   * Their session topics are remembered in {@link watchedSessionsByDevice}; the list topic has
+   * no session id to hang off, so it is remembered here — otherwise a device dropped for being
+   * unreachable would silently stop receiving row patches even after it started talking again.
+   */
+  const watchedListDevices = new Set();
 
   /** De-duplication key for "this device was told this session's turn is over". */
   function terminalAnnounceKey(deviceId, sessionId) {
@@ -654,6 +662,61 @@ export async function startHost(initialSource, settings = DEFAULT_HOST_SETTINGS,
       if (devices.size === 0) sessionSubscribers.delete(sessionId);
     }
     return watched === undefined ? [] : [...watched];
+  }
+
+  /**
+   * Give a device back everything it was dropped from, because it has just talked to us.
+   *
+   * Presence is the relay's opinion, and it can be wrong in the direction that hurts: measured,
+   * the relay reported the handset `online:false` at 09:48:04 while the user was watching it,
+   * the subscriptions went, and it stayed silent until the phone re-subscribed **by itself** at
+   * 09:51:13 — three minutes of a spinner and 没有收到你的这些操作记录, which is the same symptom
+   * the drop was meant to fix. An inbound frame is stronger evidence than a presence snapshot:
+   * the device is reachable *right now*, over the very link that was declared dead. So the
+   * verdict is revoked on the spot, the topics come back, and the session state it may have
+   * missed is pushed again.
+   *
+   * @returns the sessions it is watching again.
+   */
+  function restoreDeviceSubscriptions(deviceId) {
+    if (!offlineDevices.delete(deviceId)) return [];
+    const sessions = [...(watchedSessionsByDevice.get(deviceId) ?? [])];
+    if (watchedListDevices.has(deviceId)) subscribers.add(deviceId);
+    for (const sessionId of sessions) {
+      const devices = sessionSubscribers.get(sessionId) ?? new Set();
+      devices.add(deviceId);
+      sessionSubscribers.set(sessionId, devices);
+    }
+    // What it missed while it was gone: the turn state (so a spinner ends) and a view
+    // invalidation (so the transcript it is looking at is re-read instead of staying stale).
+    for (const sessionId of sessions) {
+      announceWatchedTurnState(deviceId, sessionId);
+      pushHistoryViewChanged(sessionId);
+    }
+    return sessions;
+  }
+
+  /**
+   * Tell one device the turn state of one session it is (or was) watching.
+   *
+   * Only when the cache positively says the turn is over: a cold row must never be read as
+   * idle, or this would clear a spinner on a turn that is still running. And only once per
+   * turn — a `done` is not idempotent for the controller (it finalizes streaming rows), so
+   * the same `device × session` pair is de-duplicated through the window every other terminal
+   * announcement uses, because this is racing them by construction.
+   * @param deviceId - the device to tell.
+   * @param sessionId - the session whose turn state to report.
+   */
+  function announceWatchedTurnState(deviceId, sessionId) {
+    const cached = sessionRowFor(sessionId);
+    if (cached === undefined || cached.running === true) return;
+    const key = terminalAnnounceKey(deviceId, sessionId);
+    const at = now().getTime();
+    if ((lastTerminalAnnounce.get(key) ?? 0) + TERMINAL_ANNOUNCE_WINDOW_MS > at) return;
+    lastTerminalAnnounce.set(key, at);
+    const payload = { sessionId, event: { type: 'done' } };
+    recordPush(sessionId, 'maker:event', 1, payload);
+    send({ v: PROTOCOL_VERSION, kind: 'push', dst: deviceId, payload: { channel: 'maker:event', payload } });
   }
 
   /** Accept a device as a controller of this Host and reflect it in the status. */
@@ -715,8 +778,12 @@ export async function startHost(initialSource, settings = DEFAULT_HOST_SETTINGS,
    */
   function subscribeTopics(deviceId, topics) {
     for (const topic of topics) {
-      if (topic === 'sessions') subscribers.add(deviceId);
-      else if (topic.startsWith('session:')) {
+      if (topic === 'sessions') {
+        subscribers.add(deviceId);
+        // Remembered for the same reason a session topic is: a device that is dropped for
+        // being unreachable has to be given its topics back the moment it proves it is not.
+        watchedListDevices.add(deviceId);
+      } else if (topic.startsWith('session:')) {
         const sessionId = topic.slice('session:'.length);
         const devices = sessionSubscribers.get(sessionId) ?? new Set();
         devices.add(deviceId);
@@ -1636,7 +1703,9 @@ export async function startHost(initialSource, settings = DEFAULT_HOST_SETTINGS,
           if (typeof snapshot.deviceId === 'string' && snapshot.deviceId !== '') offlineDevices.add(snapshot.deviceId);
           dropOfflineSubscriptions(snapshot.deviceId);
         } else if (typeof snapshot.deviceId === 'string') {
-          offlineDevices.delete(snapshot.deviceId);
+          // Reachable again by the relay's own account: same restoration as an inbound frame,
+          // so a device that comes back does not have to re-subscribe by hand to be pushed to.
+          restoreDeviceSubscriptions(snapshot.deviceId);
         }
         return;
       }
@@ -1644,7 +1713,7 @@ export async function startHost(initialSource, settings = DEFAULT_HOST_SETTINGS,
         if (typeof frame.id !== 'string' || typeof frame.src !== 'string') return;
         if (!policy.canAccept(frame.src)) return;
         // A link-open is itself proof the relay has a route to this device.
-        offlineDevices.delete(frame.src);
+        restoreDeviceSubscriptions(frame.src);
         linkController(frame.src);
         send(acceptLink(frame, acceptedControllers));
         // A controller that has just re-linked knows nothing about this Host's live state.
@@ -1663,21 +1732,7 @@ export async function startHost(initialSource, settings = DEFAULT_HOST_SETTINGS,
         // handset would keep spinning until the user re-entered the session by hand — the
         // reported 「我必须要返回上一页退出会话重新进才能看到你的回答」.
         for (const sessionId of watchedSessionsByDevice.get(frame.src) ?? []) {
-          // Only when the cache positively says the turn is over: a cold row must never be
-          // read as idle, or this would clear a spinner on a turn that is still running.
-          const cached = sessionRowFor(sessionId);
-          if (cached === undefined || cached.running === true) continue;
-          // A `done` is not idempotent for the controller — it finalizes streaming rows —
-          // and a re-link can race the ordinary terminal announcement for the same turn
-          // (most often the subscribe that just announced it), so the pair is
-          // de-duplicated through the same window every other terminal announcement uses.
-          const key = terminalAnnounceKey(frame.src, sessionId);
-          const at = now().getTime();
-          if ((lastTerminalAnnounce.get(key) ?? 0) + TERMINAL_ANNOUNCE_WINDOW_MS > at) continue;
-          lastTerminalAnnounce.set(key, at);
-          const payload = { sessionId, event: { type: 'done' } };
-          recordPush(sessionId, 'maker:event', 1, payload);
-          send({ v: PROTOCOL_VERSION, kind: 'push', dst: frame.src, payload: { channel: 'maker:event', payload } });
+          announceWatchedTurnState(frame.src, sessionId);
         }
         return;
       }
@@ -1690,6 +1745,11 @@ export async function startHost(initialSource, settings = DEFAULT_HOST_SETTINGS,
       }
       case 'invoke': {
         if (typeof frame.id !== 'string' || typeof frame.src !== 'string') return;
+        // Before anything else: a frame from a device the relay declared unreachable revokes
+        // that verdict, and everything it was dropped from comes back. See
+        // `restoreDeviceSubscriptions` — presence can be stale in the direction that leaves a
+        // live handset with no pushes at all.
+        restoreDeviceSubscriptions(frame.src);
         if (!policy.canAccept(frame.src)) {
           send({
             v: PROTOCOL_VERSION,

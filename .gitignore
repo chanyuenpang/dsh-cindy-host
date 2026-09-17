@@ -25,6 +25,9 @@ node_modules/
 kitten.png
 generated-*.png
 
+# acceptance output, kept on disk so a run that kills the process still leaves its log
+acceptance-run.log
+
 # editor / OS noise
 .DS_Store
 Thumbs.db

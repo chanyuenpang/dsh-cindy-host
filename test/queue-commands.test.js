@@ -141,6 +141,70 @@ test('clear-session removes every queued item one by one', async () => {
   assert.deepEqual(result.payload.result.pendingQueue, []);
 });
 
+test('clear-session keeps going past an item DSH has already admitted', async () => {
+  // The acceptance suite's only two failures once refusals stopped being swallowed: it emptied
+  // a queue holding two items and got `session/queue-item-not-found: queued item is no longer
+  // pending` for one of them. That code is the *outcome this channel asks for* — the item is
+  // gone — but returning it as an error also aborted the loop, so the items behind it stayed
+  // queued while the controller was told the clear had failed.
+  const gone = Object.assign(new Error('queued item is no longer pending'), { code: 'session/queue-item-not-found' });
+  const attempts = [];
+  const tracker = createInputQueueTracker();
+  tracker.apply({ type: 'queue', sessionId: 's1', items: [item('m1', 'c1', 'first'), item('m2', 'c2', 'second'), item('m3', 'c3', 'third')] });
+  const router = createChannelRouter({
+    listSessions: async () => ROWS,
+    resolveCapabilities: () => ({
+      queueControl: {
+        // The first item was already admitted: DSH refuses it, and the other two must still be
+        // attempted. Awaited on purpose — the real seam method is async.
+        update: async (payload) => {
+          attempts.push(payload.itemId);
+          if (payload.itemId === 'm1') throw gone;
+        },
+        cancel: () => {},
+      },
+      queueMirror: {
+        dshItemId: (sessionId, controllerId) => tracker.dshItemId(sessionId, controllerId),
+        mirror: (sessionId, itemId, action) => tracker.mirror(sessionId, itemId, action),
+        clearSession: (sessionId) => tracker.clearSession(sessionId),
+        itemIds: (sessionId) => tracker.itemIds(sessionId),
+      },
+      inputProjection: (sessionId) => tracker.projectionFor(sessionId, SESSION),
+    }),
+    subscribers: new Set(),
+  });
+
+  const result = await router(request('maker:input:clear-session', ['s1']));
+  assert.deepEqual(attempts, ['m1', 'm2', 'm3'], 'an admitted item does not abandon the rest');
+  assert.equal(result.payload.ok, true, 'a queue that is now empty is not a failure');
+  assert.deepEqual(result.payload.result.pendingQueue, []);
+});
+
+test('a clear-session that really fails says so, and does not claim the queue is empty', async () => {
+  // The counterpart: a refusal that is not "already gone" is still an error, and the fold is
+  // left alone so the rows DSH still holds do not vanish on a false promise.
+  const refusal = Object.assign(new Error('no live agent'), { code: 'session/not-found' });
+  const tracker = createInputQueueTracker();
+  tracker.apply({ type: 'queue', sessionId: 's1', items: [item('m1', 'c1', 'first')] });
+  const router = createChannelRouter({
+    listSessions: async () => ROWS,
+    resolveCapabilities: () => ({
+      queueControl: { update: async () => { throw refusal; }, cancel: () => {} },
+      queueMirror: {
+        itemIds: (sessionId) => tracker.itemIds(sessionId),
+        clearSession: (sessionId) => tracker.clearSession(sessionId),
+      },
+      inputProjection: (sessionId) => tracker.projectionFor(sessionId, SESSION),
+    }),
+    subscribers: new Set(),
+  });
+
+  const result = await router(request('maker:input:clear-session', ['s1']));
+  assert.equal(result.payload.ok, false);
+  assert.equal(result.payload.error.code, 'session/not-found');
+  assert.equal(tracker.hasItem('s1', 'c1'), true, 'the row it could not remove is still shown');
+});
+
 test('the enqueue answer reports the queue DSH holds, not an optimistic guess', async () => {
   // A prompt sent to an idle session is admitted immediately and never enters
   // the inbox. Synthesising a pending row for it left the phone showing 队列中

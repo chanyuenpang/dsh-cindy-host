@@ -533,6 +533,80 @@ test('an error on the invoke path answers the controller and is recorded, never 
   }
 });
 
+test('a device the relay wrongly calls offline recovers the moment it talks to us', async () => {
+  // The live failure this pins, measured at 09:48–09:51: the relay reported the handset
+  // `online:false` at 09:48:04 while the user was watching it, so its subscriptions went and
+  // nothing was pushed to it — 「手机客户端没有变化还是在转圈，没有收到你的这些操作记录」. It only
+  // recovered because the phone happened to re-subscribe by itself three minutes later.
+  // Presence is the relay's opinion; an inbound frame is a fact about right now, and it must
+  // revoke the verdict on the spot.
+  let clock = Date.parse('2026-01-01T00:00:00.000Z');
+  const timers = [];
+  const socket = new FakeSocket();
+  const runtime = await startHost(new FixtureDshSource(), ON, {
+    resolveSession: async () => ({ ok: true, session: { deviceId: 'host-handle', kind: 'phone', identifier: '13800000000' } }),
+    openSocket: () => socket,
+    heartbeatMs: 0,
+    now: () => new Date(clock),
+    setTimeout: (fn, ms) => {
+      const timer = { fn, ms, cleared: false };
+      timers.push(timer);
+      return timer;
+    },
+    clearTimeout: (timer) => {
+      if (timer !== null && typeof timer === 'object') timer.cleared = true;
+    },
+  });
+  const settle = () => new Promise((resolve) => setImmediate(resolve));
+  const doneFrames = () => socket.sent.filter((frame) => frame.kind === 'push'
+    && frame.payload.channel === 'maker:event'
+    && frame.payload.payload.sessionId === 'remote-research'
+    && frame.payload.payload.event?.type === 'done');
+  const viewPushes = () => socket.sent.filter((frame) => frame.kind === 'push'
+    && frame.payload.channel === 'maker:history-view-changed'
+    && frame.payload.payload.sessionId === 'remote-research');
+  try {
+    socket.emit('open');
+    socket.frame({ v: 1, kind: 'hello-ack', payload: { serverProtocolVersion: 1, deviceId: 'dev-host', userId: 'user-1' } });
+    socket.frame({ v: 1, kind: 'invoke', id: 'list-1', src: 'phone-2', payload: { channel: 'local-db:sessions:list', args: [] } });
+    socket.frame({ v: 1, kind: 'invoke', id: 'sub-1', src: 'phone-2', payload: { channel: 'device-link:subscribe', args: [{ topics: ['sessions', 'session:remote-research'] }] } });
+    await settle();
+    assert.equal(runtime.watchersFor('remote-research'), 1);
+
+    // The relay's verdict, applied: nothing reaches the phone any more.
+    socket.frame({ v: 1, kind: 'presence-changed', payload: { deviceId: 'phone-2', online: false, lastSeenAt: clock } });
+    await settle();
+    assert.equal(runtime.watchersFor('remote-research'), 0);
+    const before = socket.sent.length;
+    runtime.pushSessionMessage('remote-research', { id: 'm1' });
+    assert.equal(socket.sent.length, before, 'an unreachable device is not pushed to');
+
+    // …and then the device itself invokes, which is proof the relay is routing to it after all.
+    clock += 60_000;
+    socket.frame({ v: 1, kind: 'invoke', id: 'list-2', src: 'phone-2', payload: { channel: 'local-db:sessions:list', args: [] } });
+    await settle();
+
+    assert.equal(runtime.watchersFor('remote-research'), 1, 'its session topic is back');
+    assert.ok(runtime.getSubscriptions().devices.includes('phone-2'), 'and so is the list topic');
+    // The turn state it may have missed, and a re-read of the view it is looking at — both
+    // addressed to the device that just proved it is alive.
+    assert.equal(doneFrames().length, 2, 'the terminal state is announced again');
+    assert.equal(doneFrames()[1].dst, 'phone-2');
+    assert.equal(viewPushes().length, 0, 'the invalidation rides the coalescing window');
+    const pending = timers.filter((timer) => timer.cleared !== true && timer.ms === 1000);
+    await pending[0].fn();
+    assert.equal(viewPushes().length, 1, 'the view it is looking at is invalidated, so it re-reads');
+
+    // And it is a first-class subscriber again, not just a device we answered once.
+    const reachable = socket.sent.length;
+    runtime.pushSessionMessage('remote-research', { id: 'm2' });
+    assert.equal(socket.sent.length, reachable + 1, 'the next row reaches it');
+    assert.equal(socket.sent[socket.sent.length - 1].dst, 'phone-2');
+  } finally {
+    await runtime.stop();
+  }
+});
+
 test('a finished turn patches the row for a controller that is only holding the list', async () => {
   // The reported bug, in the shape the phone actually has it: the session list
   // spin. A controller holding only `sessions` never receives the session-scoped

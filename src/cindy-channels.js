@@ -1090,12 +1090,27 @@ export function createChannelRouter({
       if (channel === 'maker:input:clear-session') {
         // Emptying the queue means removing DSH's items one by one: the inbox is
         // the only owner, and `updateQueue` is the only supported mutation.
+        //
+        // An item DSH has already admitted is **not a failure here**, and two measured
+        // behaviours depended on saying so. `updateQueue` answers such an item with
+        // `session/queue-item-not-found` ("queued item is no longer pending"), which is the
+        // outcome this channel exists to produce — the queue is what it should be. Returning
+        // it as an error also aborted the loop, so everything after the first already-admitted
+        // item stayed queued while the controller was told the clear had failed. Both showed
+        // up as the acceptance suite's only two failures once refusals stopped being swallowed.
+        // A genuine refusal is still reported, after the rest has been attempted.
         const ids = mirror?.itemIds(sessionId) ?? [];
+        let failure = null;
         for (const itemId of ids) {
           const outcome = await commitQueueActionAndReconcile(capabilities, sessionId, itemId, { kind: 'remove' });
-          if (outcome !== null) return invokeError(request, outcome.code, outcome.message);
+          if (outcome === null) continue;
+          if (outcome.code === 'session/queue-item-not-found') continue;
+          if (failure === null) failure = outcome;
         }
-        mirror?.clearSession(sessionId);
+        // Only claim the queue is empty when it is: a real failure leaves the fold alone, so
+        // the rows DSH still holds stay visible instead of vanishing on a false promise.
+        if (failure === null) mirror?.clearSession(sessionId);
+        if (failure !== null) return invokeError(request, failure.code, failure.message);
         return answerQueueCommand(request, capabilities, sessionId);
       }
 
