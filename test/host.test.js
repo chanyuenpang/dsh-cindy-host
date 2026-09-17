@@ -1339,3 +1339,44 @@ test('does not re-read the directory for a controller it already named', async (
     await runtime.stop();
   }
 });
+
+test('a controller speaking about a session repairs it, at most once per window', async () => {
+  // The trigger that survives a background/foreground transition: measured, the returning client
+  // does **not** re-subscribe (twenty invokes, no `device-link:subscribe`), but it keeps asking
+  // about the session it is showing. So the repair rides on that, rate-limited per session.
+  let clock = Date.parse('2026-01-01T00:00:00.000Z');
+  const { runtime, socket } = await runtimeWithSocket({ now: () => new Date(clock) });
+  const settle = () => new Promise((resolve) => setImmediate(resolve));
+  const repairFrames = () => socket.sent.filter((frame) => frame.kind === 'push'
+    && (frame.payload.channel === 'maker:input:projection' || frame.payload.channel === 'maker:history-view-changed'));
+  try {
+    socket.emit('open');
+    socket.frame({ v: 1, kind: 'hello-ack', payload: { serverProtocolVersion: 1, deviceId: 'dev-host', userId: 'user-1' } });
+    socket.frame({ v: 1, kind: 'invoke', id: 'sub-1', src: 'phone-2', payload: { channel: 'device-link:subscribe', args: [{ topics: ['session:remote-research'] }] } });
+    await settle();
+    const afterSubscribe = repairFrames().length;
+
+    // The client asks about the session twice in a row: one repair, not two.
+    socket.frame({ v: 1, kind: 'invoke', id: 'v-1', src: 'phone-2', payload: { channel: 'local-db:messages:view', args: ['remote-research', {}] } });
+    await settle();
+    const afterFirst = repairFrames().length;
+    assert.ok(afterFirst > afterSubscribe, 'speaking about a session repairs it');
+    socket.frame({ v: 1, kind: 'invoke', id: 'v-2', src: 'phone-2', payload: { channel: 'local-db:messages:view', args: ['remote-research', {}] } });
+    await settle();
+    assert.equal(repairFrames().length, afterFirst, 'the window holds the second one back');
+
+    // Past the window it repairs again — this is what lets a phone recover without a restart.
+    clock += 60_000;
+    socket.frame({ v: 1, kind: 'invoke', id: 'v-3', src: 'phone-2', payload: { channel: 'local-db:messages:view', args: ['remote-research', {}] } });
+    await settle();
+    assert.ok(repairFrames().length > afterFirst, 'and it is willing to try again later');
+
+    // A session nobody watches is not repaired at all.
+    const before = repairFrames().length;
+    socket.frame({ v: 1, kind: 'invoke', id: 'v-4', src: 'phone-2', payload: { channel: 'local-db:messages:view', args: ['nobody-here', {}] } });
+    await settle();
+    assert.equal(repairFrames().length, before, 'nothing to repair when nobody is watching');
+  } finally {
+    await runtime.stop();
+  }
+});

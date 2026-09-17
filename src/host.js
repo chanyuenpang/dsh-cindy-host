@@ -838,6 +838,38 @@ export async function startHost(initialSource, settings = DEFAULT_HOST_SETTINGS,
   }
 
   /**
+   * How often one session may be repaired because a controller spoke about it.
+   *
+   * A controller that returns from the background does **not** re-subscribe — measured: twenty
+   * consecutive invokes with no `device-link:subscribe` among them — but it does keep asking
+   * (`messages:view`, `view-intent`, `input:enqueue` every few seconds). So "this device said
+   * something about this session" is the one recovery trigger certain to arrive, and this is the
+   * rate limit that keeps ordinary polling from becoming a flood.
+   */
+  const REPAIR_PULSE_MS = 30_000;
+  /** `sessionId` -> when it was last repaired this way. */
+  const lastRepairPulse = new Map();
+
+  /**
+   * Repair one session for its watchers because a controller just spoke about it.
+   *
+   * The two frames are exactly what a dropped push would have carried: the authoritative input
+   * projection (which retires a bubble left spinning) and a view invalidation (which makes the
+   * transcript re-read). Idempotent, bounded to one per {@link REPAIR_PULSE_MS} per session, and
+   * it does nothing at all when nobody is watching.
+   * @param sessionId - the session a controller just asked about.
+   */
+  function pulseRepair(sessionId) {
+    const devices = sessionSubscribers.get(sessionId);
+    if (devices === undefined || devices.size === 0) return;
+    const at = now().getTime();
+    if ((lastRepairPulse.get(sessionId) ?? 0) + REPAIR_PULSE_MS > at) return;
+    lastRepairPulse.set(sessionId, at);
+    pushSessionUpdate(sessionId, 'maker:input:projection', inputQueue.projectionFor(sessionId, sessionRowFor(sessionId)));
+    pushHistoryViewChanged(sessionId);
+  }
+
+  /**
    * Whether this Host should answer one session's approval or question itself.
    *
    * Claimed when a controller is watching **now**, or when one has watched this
@@ -1799,6 +1831,13 @@ export async function startHost(initialSource, settings = DEFAULT_HOST_SETTINGS,
         // `markDeviceReachable` — presence can be stale in the direction that leaves a
         // live handset with no pushes at all.
         markDeviceReachable(frame.src);
+        // …and, when this frame names a session somebody is watching, repair it for them. This is
+        // the trigger that survives a background/foreground transition: the client does not
+        // re-subscribe on resume, but it always talks to us about the session it is showing.
+        {
+          const candidate = typeof frame?.payload?.args?.[0] === 'string' ? frame.payload.args[0] : null;
+          if (candidate !== null && sessionSubscribers.has(candidate)) pulseRepair(candidate);
+        }
         if (!policy.canAccept(frame.src)) {
           send({
             v: PROTOCOL_VERSION,
@@ -1981,6 +2020,7 @@ export async function startHost(initialSource, settings = DEFAULT_HOST_SETTINGS,
     subscribers.clear();
     sessionSubscribers.clear();
     liveTurnState.clear();
+    lastRepairPulse.clear();
     directoryAsked.clear();
     // A question asked over a link that is going away can never be answered;
     // settling them cancelled is what releases DSH's awaiting turn.
