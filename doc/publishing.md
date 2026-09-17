@@ -121,6 +121,26 @@ dsh plugin --profile <profile> add dsh-cindy-host-demo@<version>
 旧代码）。要么先删掉 `profiles/<p>/node_modules/dsh-cindy-host-demo` 再装，要么——更贴近真实发布
 流程——**每次测试都升版本号**。
 
+### 5.4 新建的 profile 会回落到 DSH 嵌套依赖，可能因此起不来（DSH 侧问题，2026-09-17）
+
+在全新 `DSH_HOME` 里 `--from-default-profile web` 建出来的 profile，`dsh web` 会在 `file-upload`
+这一行启动失败：
+
+```
+@deepseek-ai/dsh-client-file-upload
+  ctx.commands.registerFileReceiptResolver is not a function
+```
+
+证据：失败帧来自 **DSH 自己的嵌套树**（`…/dsh/node_modules/@deepseek-ai/dsh-client-file-upload`，
+版本 `0.1.5-rc.2`），而新建 profile 与在用的 `web` profile **编出来的配置完全相同**
+（`file-upload` 行数都是 2）。区别只在解析路径：新建 profile 没有自己完整的依赖树，于是回落到 DSH
+嵌套的那份，而那份与同一安装里的 `dsh-commands` 内部不一致；长期在用的 profile 有自己的 `.pnpm`
+树，所以不受影响。
+
+**对本仓库的影响**：干净安装的验收要在**从一个能跑的 profile 派生出来的**环境里做，或者接受
+"compose 通过 + 插件不再出现在失败栈里"作为这一层的证据。这是 DSH 侧的问题，值得单独上报；不要
+把它误判成自己插件的安装缺陷（我们最初就这么怀疑过，是版本与解析路径的证据把它排除掉的）。
+
 ## 6. 回滚与撤版
 
 - **未发 registry（tarball 分发）**：装回上一个 tarball 即可，最干净。
