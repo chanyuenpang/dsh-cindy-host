@@ -148,8 +148,8 @@ async function start() {
   const diagnostics = up.diagnostics ?? {};
   console.log(`sandbox up on ${base} (pid ${out.pid})`);
   console.log(`  state=${up.status?.state ?? '?'}  dataSource=${diagnostics.dataSource ?? '?'}  projectedSessions=${diagnostics.projectedSessions ?? '?'}`);
-  console.log(`  diagnostics: handlerErrors=${diagnostics.handlerErrors?.length ?? 'n/a'}  listing=${JSON.stringify(diagnostics.listing ?? null)}`);
-  console.log('  transport is off by design: this home has no Cindy login of its own, so it cannot claim the phone link');
+  console.log(`  diagnostics: handlerErrors=${diagnostics.handlerErrors?.length ?? 'n/a'}  ${JSON.stringify(diagnostics.boundaries ?? null)}`);
+  console.log('  its own credential (session-v1@<digest>) gives it its own relay device, so it coexists with the real instance');
 }
 
 const command = process.argv[2] ?? 'status';
