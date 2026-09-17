@@ -2112,6 +2112,47 @@ the existing frame-count assertion caught it immediately (`3 !== 1` on attach).
 exactly one frame for a finished turn (the case that was broken), and a controller
 holding both topics gets one `maker:event` plus one row patch, not two row patches.
 
+## A subscription the relay cannot reach is not a subscription
+
+The other half of the same report — 「我在这边一直盯着这个屏幕，但是他还是一直在转圈思考中…
+我必须要返回上一页退出会话重新进才能看到你的回答」 — was measured with the frame log on
+both sides of the relay, and the Host was the one at fault:
+
+```
+09:17:38  presence-changed  { deviceId: <phone>, online: false, lastSeenAt: 09:17:42 }
+09:18:29  last request from the phone
+09:18–09:2x  Host pushes: local-db:messages:created …, maker:event {type:'done'}, row patches
+          → every frame dropped by a relay with no route to that device
+```
+
+The Host held a subscription set it had no way to check, and `online:false` was the only
+moment the relay ever said so. Three changes follow from that one fact:
+
+- **`presence-changed{online:false}` drops the device's subscriptions** — the `sessions`
+  topic and every `session:*` topic it held. Pushing into a route the relay has already
+  disowned is not delivery, and treating it as delivery is what kept the spinner alive.
+- **The sessions it was inside are remembered** (`watchedSessionsByDevice`), so its next
+  `link-open` can be answered with the turn state instead of silence. The announcement is
+  sent only when the cached row positively says the turn is over: a cold row is never read
+  as idle, so a live turn is never cleared by this path.
+- **The unwatched fallback in `announceTurnIdle` skips unreachable devices.** It exists to
+  repair a controller whose subscription died with the process, so it fans out to
+  controllers with no watchers for the session; a device the relay has declared offline is
+  not told and, crucially, **not counted as told** — the de-duplication entry that keeps one
+  turn boundary to one `done` is a claim that the frame arrived, and the re-link repair
+  depends on that claim being true.
+
+The de-duplication itself is a `device × session` timestamp with a 30 s window, recorded by
+every terminal announcement (the session watchers, the unwatched fallback) and consulted by
+the `link-open` repair. It is needed because the two paths genuinely race: the
+`device-link:subscribe` that attaches a controller announces the terminal state it finds,
+and the re-link that follows immediately reaches the same device for the same turn — one
+`done` too many makes the controller finalize its streaming rows again.
+
+`test/host.test.js` pins both directions with an injected clock: a device declared offline
+receives nothing (including a turn that ends while it is away) and is told the truth when
+it links again after the window; a re-link inside the window repeats nothing.
+
 ## 删除 / 归档 / 置顶: one channel, and only one of its fields had a counterpart
 
 The controller's session menu is four actions and **one** write. Desktop
@@ -2388,4 +2429,7 @@ claw 工作流的任务清单**一直在同步进 DSH**：适配器每次结算 
    `local-db:messages:view` 出现过）。
 3. 发一张照片，或让 agent 画一张图并打开——应显示图片（内联缩图路径），不再出现「取图失败」。
 4. 「加载更早」应当即时返回（transcript 缓存 + 50 ms 级翻页）。
+5. **转圈不再需要手动重进**：让 agent 答完一句话，然后息屏／切走让中继把手机标成离线，
+   再回到会话——答案应当直接出现，思考中应当自己结束。可在 Host 日志里对照
+   `presence-changed … online:false` 之后不再有指向该设备的 push。
 
