@@ -89,7 +89,8 @@ Do not enable Cindy transport in production yet. A separate compatibility slice 
 
 ## 发布指南
 
-见 [doc/releasing.md](doc/releasing.md)：门禁 → claw 留证 → 脱敏 → 部署（重启才是生效点） → 回滚。
+- [doc/publishing.md](doc/publishing.md) —— **插件发布**：把本插件做成别人/别的 profile 能装上的 npm 包（bundle 三要素、三种消费方式、包内容白名单、干净 profile 验证、撤版）。
+- [doc/releasing.md](doc/releasing.md) —— **改动上线**：门禁 → claw 留证 → 脱敏 → 部署（重启才是生效点） → 回滚。
 
 ## 仓库治理
 
