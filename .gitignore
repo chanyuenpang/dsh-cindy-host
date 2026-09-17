@@ -40,3 +40,4 @@ Thumbs.db
 
 # npm pack 产物（构建物，不入库）
 *.tgz
+.gitnexus
