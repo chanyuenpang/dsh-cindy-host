@@ -280,16 +280,36 @@ if (!isMain) {
     console.log('\ndry run: nothing was touched. Re-run with --apply to kill and relaunch the target.');
     console.log('note: a fresh dsh web prints a NEW token URL — read it from the log above after the restart.');
   } else {
-    // Detached and unref'd: this process is a child of the very pid that is about to die.
-    const helper = spawn(process.execPath, [fileURLToPath(import.meta.url), '--supervise', '--port', String(options.port), '--grace', String(options.graceSeconds), '--retries', String(options.retries), ...(options.dshHome === null ? [] : ['--dsh-home', options.dshHome])], {
-      cwd: repoRoot,
-      env: process.env,
-      stdio: 'ignore',
-      detached: true,
-    });
-    helper.unref();
-    log(`requested: port ${options.port}, target pid ${pid ?? 'none'}, grace ${options.graceSeconds}s, helper pid ${helper.pid}`);
-    console.log(`\nAPPLY: supervisor pid ${helper.pid} will restart port ${options.port} in ${options.graceSeconds}s.`);
+    const superviseArgs = [fileURLToPath(import.meta.url), '--supervise', '--port', String(options.port), '--grace', String(options.graceSeconds), '--retries', String(options.retries), ...(options.dshHome === null ? [] : ['--dsh-home', options.dshHome])];
+    const commandLine = [process.execPath, ...superviseArgs].map((part) => `"${part}"`).join(' ');
+    // Started by **WMI**, not by this process.
+    //
+    // Measured: a `spawn(detached: true)` supervisor is usually reaped anyway — the harness runs
+    // each command inside its own Windows job object, and a detached child does not escape a job
+    // without `CREATE_BREAKAWAY_FROM_JOB`. Two of three live restarts worked and the third was
+    // silently killed during its grace period, leaving the instance untouched. A process created
+    // through `Win32_Process.Create` is a child of the WMI service instead, so no job of mine owns
+    // it. Kept as a fallback: the plain detached spawn, for a machine where WMI is unavailable.
+    let startedBy = 'wmi';
+    let helperPid = null;
+    try {
+      const created = execFileSync('powershell', [
+        '-NoProfile',
+        '-Command',
+        `Invoke-CimMethod -ClassName Win32_Process -MethodName Create -Arguments @{ CommandLine = '${commandLine.replace(/'/g, "''")}' } | Select-Object -ExpandProperty ProcessId`,
+      ], { encoding: 'utf8' }).trim();
+      helperPid = Number(created) || null;
+      if (helperPid === null) startedBy = 'spawn';
+    } catch {
+      startedBy = 'spawn';
+    }
+    if (startedBy === 'spawn') {
+      const helper = spawn(process.execPath, superviseArgs, { cwd: repoRoot, env: process.env, stdio: 'ignore', detached: true });
+      helper.unref();
+      helperPid = helper.pid;
+    }
+    log(`requested: port ${options.port}, target pid ${pid ?? 'none'}, grace ${options.graceSeconds}s, helper ${helperPid ?? '?'} via ${startedBy}`);
+    console.log(`\nAPPLY: supervisor ${helperPid ?? '?'} (via ${startedBy}) will restart port ${options.port} in ${options.graceSeconds}s.`);
     console.log(`outcome and the new token URL go to ${logFile}`);
     console.log('this process (and the conversation it hosts) may be killed in the meantime.');
   }
