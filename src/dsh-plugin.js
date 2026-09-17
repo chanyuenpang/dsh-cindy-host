@@ -947,6 +947,27 @@ export function buildDshSource(ctx, serviceName) {
 }
 
 /**
+ * How long this Host may run with a clean boundary record before that is itself suspicious.
+ *
+ * A boundary that never fires and a boundary that was never installed look identical from the
+ * outside, and the second one is how a whole `dsh web` process dies. So `handlerErrors: []` is
+ * not automatically good news: past this uptime, an empty record means "nothing has exercised
+ * the boundaries yet", which is a fact worth reading rather than a green light.
+ */
+export const BOUNDARY_SILENCE_MS = 10 * 60_000;
+
+/**
+ * The boundary verdict, as one word plus the numbers behind it.
+ * @param options - contained errors, uptime, and the silence threshold.
+ * @returns `{ verdict, contained, uptimeMs }` where verdict is `recovered` | `silent` | `starting`.
+ */
+export function boundaryVerdict({ contained = [], uptimeMs = 0, silenceMs = BOUNDARY_SILENCE_MS } = {}) {
+  const count = Array.isArray(contained) ? contained.length : 0;
+  if (count > 0) return { verdict: 'recovered', contained: count, uptimeMs };
+  return { verdict: uptimeMs >= silenceMs ? 'silent' : 'starting', contained: 0, uptimeMs };
+}
+
+/**
  * The diagnostics block the status route serves.
  *
  * Extracted from `apply` with explicit inputs for one measured reason: the first version read
@@ -961,7 +982,7 @@ export function buildDshSource(ctx, serviceName) {
  * @param options - the runtime, the seam kind, the current source seam, and the listing reader.
  * @returns the diagnostics object, with every key present.
  */
-export function buildDiagnostics({ runtime, sourceKind, seam, listingDiagnostics }) {
+export function buildDiagnostics({ runtime, sourceKind, seam, listingDiagnostics, boundaries }) {
   const field = (read, fallback) => {
     try {
       return read();
@@ -1018,6 +1039,23 @@ export function buildDiagnostics({ runtime, sourceKind, seam, listingDiagnostics
     // exception that would otherwise have left the whole `dsh web` process through DSH's
     // fail-loud unhandled-rejection handler.
     handlerErrors: field(() => (runtime && typeof runtime.getHandlerErrors === 'function' ? runtime.getHandlerErrors() : []), []),
+    /**
+     * The boundary record, with a verdict rather than just a list.
+     *
+     * `recovered` means the plugin caught something that would otherwise have ended the whole
+     * `dsh web` process — good news, and worth reading. `silent` means the process has been up
+     * past {@link BOUNDARY_SILENCE_MS} without a single boundary firing, which is **not**
+     * automatically healthy: a boundary that is never exercised and one that was never
+     * installed are indistinguishable from here, and `installed` is what tells them apart.
+     */
+    boundaries: field(() => {
+      const contained = runtime && typeof runtime.getHandlerErrors === 'function' ? runtime.getHandlerErrors() : [];
+      const uptimeMs = runtime && typeof runtime.getUptimeMs === 'function' ? runtime.getUptimeMs() : 0;
+      return {
+        ...boundaryVerdict({ contained, uptimeMs }),
+        installed: Array.isArray(boundaries?.installed) ? [...boundaries.installed] : [],
+      };
+    }, { verdict: 'unknown', contained: 0, uptimeMs: 0, installed: [] }),
     // How the session listing is doing. `staleServes > 0` means a controller was answered
     // from the previous read because the live one missed its deadline — an absorbed
     // degradation, and the difference between a rendered list and the reported spinner.
@@ -1184,6 +1222,72 @@ export function apply(ctx) {
    */
   let currentSeam = {};
   /**
+   * Every listener this plugin hands to the host, and the entry point that wraps it.
+   *
+   * Cordis's `emit` dispatch has no `try`/`catch`, and its `waterfall` hands a listener's
+   * returned promise straight back to DSH — so one throw or rejection from any of these is not
+   * a degraded plugin, it is a dead `dsh web`: DSH's boot registers an unhandled-rejection
+   * handler that writes `fatal load failure` to stderr and calls `process.exit(1)`. Measured
+   * once already (`RemoteError: queued item is no longer pending` took the whole desktop down).
+   *
+   * So each registration goes through {@link guarded}, which names it and contains whatever it
+   * throws. `test/plugin-boundaries.test.js` scans this file and fails when a `ctx.on(`
+   * registration does not go through it — an unwrapped boundary has to be a test failure rather
+   * than something a reviewer has to notice.
+   */
+  const guardedListeners = [];
+
+  /** Record one contained boundary failure, before or after the runtime exists. */
+  const earlyBoundaryErrors = [];
+  function noteBoundaryError(where, error) {
+    if (runtime !== null && typeof runtime.noteHandlerError === 'function') {
+      runtime.noteHandlerError(where, error);
+      return;
+    }
+    earlyBoundaryErrors.push({
+      at: new Date().toISOString(),
+      where,
+      message: (error instanceof Error ? error.message : String(error)).slice(0, 400),
+    });
+    if (earlyBoundaryErrors.length > 20) earlyBoundaryErrors.shift();
+  }
+
+  /**
+   * Wrap one host-facing listener in the plugin's single guarded entry point.
+   * @param label - what this listener is, for the diagnostics record.
+   * @param listener - the listener as written.
+   * @returns a listener that cannot let its failure escape.
+   */
+  function guarded(label, listener) {
+    guardedListeners.push(label);
+    return (...args) => {
+      try {
+        const result = listener(...args);
+        if (result !== null && typeof result === 'object' && typeof result.then === 'function') {
+          // A waterfall listener's rejection is the dangerous shape: DSH awaits what it
+          // returns, so a rejection here arrives as an unhandled one at the process level.
+          return result.catch((error) => {
+            noteBoundaryError(label, error);
+            return undefined;
+          });
+        }
+        return result;
+      } catch (error) {
+        noteBoundaryError(label, error);
+        return undefined;
+      }
+    };
+  }
+
+  /** The boundary record for diagnostics: what is installed, and what it has contained. */
+  function boundaryState() {
+    const contained = runtime !== null && typeof runtime.getHandlerErrors === 'function'
+      ? runtime.getHandlerErrors()
+      : earlyBoundaryErrors;
+    return { installed: [...guardedListeners], contained: contained.slice() };
+  }
+
+  /**
    * The current source's listing diagnostics, or a null answer.
    *
    * Held here rather than read from `currentSeam`: the first version reached for the
@@ -1285,18 +1389,14 @@ export function apply(ctx) {
   // The live session stream. `session/event` fires for every appended event, so
   // it is the push path's source: fold the event into the controller's message
   // rows and hand them to whoever is watching that session.
-  ctx.effect(() => ctx.on('session/event', (session, event) => {
+  ctx.effect(() => ctx.on('session/event', guarded('session-event', (session, event) => {
     // This handler runs inside Cordis's own dispatch, which has no `try`/`catch`: a throw
     // from here does not fail this plugin, it fails the process — DSH's boot installs an
     // unhandled-rejection handler that writes `fatal load failure` and calls `exit(1)`. The
     // work below reads DSH's session events and folds them, so it is exactly where an
     // unexpected event shape surfaces; it must never be able to take the desktop down.
-    try {
-      handleSessionEvent(session, event);
-    } catch (error) {
-      if (typeof runtime?.noteHandlerError === 'function') runtime.noteHandlerError('session-event', error);
-    }
-  }), 'dsh-cindy-host: live session stream');
+    handleSessionEvent(session, event);
+  })), 'dsh-cindy-host: live session stream');
 
   /** Fold one DSH session event into the push path and the transcript cache. */
   function handleSessionEvent(session, event) {
@@ -1353,7 +1453,7 @@ export function apply(ctx) {
   // controller is watching; in every other case it calls `next()` so the local
   // UI — or the fail-closed default — decides. Swallowing a question the user
   // could have answered at the desk would be worse than not answering at all.
-  ctx.effect(() => ctx.on('approval/request', async (req, next) => {
+  ctx.effect(() => ctx.on('approval/request', guarded('approval-request', async (req, next) => {
     if (!runtime || typeof runtime.askApproval !== 'function') return next();
     const sessionId = req?.agent?.session?.header?.id;
     const outcome = await runtime.askApproval({
@@ -1381,14 +1481,14 @@ export function apply(ctx) {
     // `running`, and the phone showed nothing. Going first means a Cindy controller
     // answers when one is watching; when none is, `next()` hands the question back
     // to the browser path unchanged.
-  }, { prepend: true, global: true }), 'dsh-cindy-host: approval answerer');
+  }), { prepend: true, global: true }), 'dsh-cindy-host: approval answerer');
 
   // The `ask_user` tool blocks on a different waterfall from approvals, and the
   // controller renders it as its own card. Leaving it unanswered does not degrade
   // the conversation — it stops it: the tool call waits for a human who never saw
   // the question. Same rule as approvals: only claim questions for a session a
   // controller is watching, and pass the rest down the chain.
-  ctx.effect(() => ctx.on('user-questions/request', async (request, next) => {
+  ctx.effect(() => ctx.on('user-questions/request', guarded('user-questions-request', async (request, next) => {
     if (!runtime || typeof runtime.askUserQuestion !== 'function') return next();
     const sessionId = request?.agent?.session?.header?.id;
     const answer = await runtime.askUserQuestion({
@@ -1401,14 +1501,14 @@ export function apply(ctx) {
     // Same `prepend` + `global` requirement as the approval answerer above, and the
     // same reason: this waterfall is agent-scoped and the Web bundle's remote
     // forwarding listener parks ahead of a late registration.
-  }, { prepend: true, global: true }), 'dsh-cindy-host: user-question answerer');
+  }), { prepend: true, global: true }), 'dsh-cindy-host: user-question answerer');
 
   // The settings page reaches the Host through this route. `webServer` is absent
   // in headless compositions, so the row is injected optionally: the runtime and
   // its settings still work, only the browser surface is missing.
   const routes = createHostRoutes({
     getRuntime: () => runtime,
-    getDiagnostics: () => buildDiagnostics({ runtime, sourceKind, seam: currentSeam, listingDiagnostics: currentListingDiagnostics }),
+    getDiagnostics: () => buildDiagnostics({ runtime, sourceKind, seam: currentSeam, listingDiagnostics: currentListingDiagnostics, boundaries: boundaryState() }),
     // The Host's own relay identity outlives the credential: a phone links to the
     // *device id*, so it is remembered here and reused when the credential is gone.
     getSettings: () => scope.get(),

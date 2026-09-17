@@ -372,6 +372,8 @@ export async function startHost(initialSource, settings = DEFAULT_HOST_SETTINGS,
    */
   const handlerErrors = [];
   const HANDLER_ERROR_LIMIT = 20;
+  /** When this Host started, for the diagnostics liveness verdict. */
+  const startedAtMs = now().getTime();
 
   /** Record one error caught at a Host boundary (bounded, never throws). */
   function recordHandlerError(where, error) {
@@ -2079,6 +2081,14 @@ export async function startHost(initialSource, settings = DEFAULT_HOST_SETTINGS,
      * this list is the record of an outage that was prevented rather than survived.
      */
     getHandlerErrors: () => handlerErrors.slice(),
+    /**
+     * How long this Host has been up.
+     *
+     * Read by the diagnostics liveness verdict: a clean boundary record is only meaningful next
+     * to the time it has had to fire, because a boundary that never fires and one that is not
+     * installed look identical from the outside.
+     */
+    getUptimeMs: () => now().getTime() - startedAtMs,
     /**
      * Record an error caught in the plugin layer.
      *
