@@ -1,6 +1,6 @@
 import Schema from '@deepseek-ai/schemastery';
 import { settingsNamespace } from '@deepseek-ai/dsh-settings';
-import { InProcessApiClient, toFetchHandler } from '@deepseek-ai/dsh-host-apiproxy';
+import { createRequire } from 'node:module';
 import { DEFAULT_HOST_SETTINGS, SETTINGS_NAMESPACE, validateHostSettings } from './host-settings.js';
 import { DshHostSource } from './dsh-host-source.js';
 import { createSessionControllerSource } from './dsh-session-source.js';
@@ -951,7 +951,25 @@ export function buildDshSource(ctx, serviceName, options = {}) {
   }
 
   const apiProxy = ctx.get('apiProxy');
-  return { kind: 'api-proxy', readMessages: undefined, createSession: undefined, sendMessage: undefined, source: new DshHostSource(new InProcessApiClient(toFetchHandler(apiProxy))) };
+  if (apiProxy === undefined) {
+    return { kind: 'api-proxy', readMessages: undefined, createSession: undefined, sendMessage: undefined, source: undefined };
+  }
+  // The legacy adapter is loaded **lazily, and its absence is not fatal**.
+  //
+  // Measured on a clean install (a tarball into a fresh DSH_HOME): a static import here dragged
+  // `@deepseek-ai/dsh-host-apiproxy` in as a hard requirement, its transitive
+  // `@deepseek-ai/dsh-agent-presets` resolved to a copy that does not export `InvalidPresetIdError`,
+  // and **the plugin failed to load at all** — the whole profile would not boot, on a dependency
+  // the current DSH never even uses (it mounts `sessionController`, not `apiProxy`). An optional
+  // capability must not be able to break mounting, so it is required at the moment it is needed
+  // and a failure degrades to "this seam serves nothing" instead of "the tree does not load".
+  try {
+    const require = createRequire(import.meta.url);
+    const { InProcessApiClient, toFetchHandler } = require('@deepseek-ai/dsh-host-apiproxy');
+    return { kind: 'api-proxy', readMessages: undefined, createSession: undefined, sendMessage: undefined, source: new DshHostSource(new InProcessApiClient(toFetchHandler(apiProxy))) };
+  } catch {
+    return { kind: 'api-proxy', readMessages: undefined, createSession: undefined, sendMessage: undefined, source: undefined };
+  }
 }
 
 /**
