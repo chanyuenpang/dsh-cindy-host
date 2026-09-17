@@ -1,0 +1,263 @@
+/**
+ * `local-db:messages:view` — the work-grouped window whose whole point is that the phone
+ * can trust it across re-entries.
+ *
+ * The client's rules that decide these assertions (`@cindy/maker-shared/message-window`
+ * and `apps/mobile/src/session/historyViewController.ts`):
+ *  - a page's `items` are **chronological**, and `nextCursor` is the **oldest** id in it;
+ *  - `hasMore` is what lights "load older", so an empty or dishonest value loses history;
+ *  - an error the client recognises as "unavailable" (`UNSUPPORTED_CAPABILITY` here) sends
+ *    it back to the raw 20-row window, which is the correct degradation;
+ *  - **prose is not collapsible**: user prompts and assistant answers are top-level
+ *    `messages` items, and only the activity between them folds into `work` items.
+ */
+import test from 'node:test';
+import assert from 'node:assert/strict';
+import {
+  HISTORY_PAGE_ITEMS,
+  WORK_ITEM_MAX_ROWS,
+  createHistoryViewController,
+  firstIdOf,
+  groupHistoryItems,
+} from '../src/host-history-view.js';
+
+/** One row in the shape this Host serves (newest first is the reader's order). */
+function row(id, role, seconds, extra = {}) {
+  return {
+    id: `s1:${id}:0`,
+    clientId: `s1:${id}:0`,
+    sessionId: 's1',
+    role,
+    toolUseId: null,
+    agentMeta: null,
+    // Real rows carry a real time; a fixture that invented `T00:00:240Z` would make every
+    // ordering assertion compare NaN.
+    createdAt: new Date(Date.UTC(2026, 0, 1) + seconds * 1000).toISOString(),
+    content: { text: id },
+    ...extra,
+  };
+}
+
+/** One turn: prompt, three activity rows, answer. */
+function turnRows(turn, clock) {
+  return [
+    row(`u${turn}`, 'user', clock),
+    row(`t${turn}`, 'thinking', clock + 1),
+    row(`c${turn}`, 'tool_use', clock + 2, { toolUseId: `call-${turn}` }),
+    row(`r${turn}`, 'tool_result', clock + 3, { toolUseId: `call-${turn}` }),
+    row(`a${turn}`, 'assistant', clock + 4),
+  ];
+}
+
+/** A whole transcript of `turns` turns, in the reader's order (newest first). */
+function transcript(turns, startAt = 0) {
+  const rows = [];
+  let clock = startAt;
+  for (let turn = 0; turn < turns; turn += 1) {
+    rows.push(...turnRows(turn, clock));
+    clock += 10;
+  }
+  return rows.reverse();
+}
+
+function controller(rows, options = {}) {
+  return createHistoryViewController({ rows: async () => rows, ...options });
+}
+
+test('prose stays readable and only the activity in between collapses', () => {
+  // The reported failure of the first version: grouping a whole turn as one item produced a
+  // page of twenty collapsed items and **no** visible rows — 只显示一号折叠的会话.
+  const items = groupHistoryItems(transcript(1), { running: false });
+  assert.deepEqual(items.map((item) => item.type), ['messages', 'work', 'messages'], 'prompt, activity, answer');
+  assert.equal(items[0].messages[0].role, 'user');
+  assert.equal(items[2].messages[0].role, 'assistant');
+
+  const work = items[1];
+  assert.equal(work.summary.messageCount, 3, 'thinking + tool call + tool result');
+  assert.equal(work.summary.toolCount, 1);
+  assert.equal(work.summary.firstMessageId, 's1:t0:0');
+  assert.equal(work.summary.lastMessageId, 's1:r0:0');
+  assert.equal(work.summary.isStreaming, false);
+  assert.match(work.summary.revision, /^s1:r0:0:3:\d+$/);
+
+  // A row older than the conversation (a system card) is readable on its own too.
+  const withSystem = [row('sys', 'system', 0), ...transcript(1, 10)].sort((a, b) => b.createdAt.localeCompare(a.createdAt));
+  assert.deepEqual(
+    groupHistoryItems(withSystem, { running: false }).map((item) => item.type),
+    ['messages', 'messages', 'work', 'messages'],
+  );
+});
+
+test('a long activity run is split, so expanding one item is one page', () => {
+  // A monster turn (this session had one with 329 rows and 138 tools) must not become one
+  // collapsed item you wait minutes for: the run is chopped every WORK_ITEM_MAX_ROWS rows.
+  const rows = [row('u0', 'user', 0)];
+  for (let index = 0; index < 100; index += 1) {
+    rows.push(row(`c${index}`, index % 4 === 3 ? 'tool_result' : 'thinking', index + 1));
+  }
+  rows.push(row('a0', 'assistant', 200));
+  const items = groupHistoryItems(rows.reverse(), { running: false });
+  assert.equal(items[0].type, 'messages', 'the prompt is visible');
+  assert.equal(items[items.length - 1].type, 'messages', 'and so is the answer');
+  const work = items.filter((item) => item.type === 'work');
+  assert.equal(work.length, Math.ceil(100 / WORK_ITEM_MAX_ROWS));
+  for (const item of work) assert.ok(item.summary.messageCount <= WORK_ITEM_MAX_ROWS, `item carried ${item.summary.messageCount}`);
+  assert.equal(work.reduce((sum, item) => sum + item.summary.messageCount, 0), 100, 'every row is still reachable');
+});
+
+test('only the live activity run is streaming', () => {
+  const answered = transcript(2);
+  assert.equal(
+    groupHistoryItems(answered, { running: false }).some((item) => item.type === 'work' && item.summary.isStreaming),
+    false,
+    'a transcript that ends in an answer has nothing live',
+  );
+  // A session reported as running whose transcript still ends in an answer is between
+  // turns: the rows of the new turn have not arrived, so no item claims to be live.
+  assert.equal(
+    groupHistoryItems(answered, { running: true }).some((item) => item.type === 'work' && item.summary.isStreaming),
+    false,
+  );
+
+  // With nothing to say about the session, the transcript answers for itself: an open turn
+  // ends in activity, not in an answer.
+  const openTurn = [...transcript(1, 20), row('t9', 'thinking', 12), row('c9', 'tool_use', 13)].reverse();
+  const derived = groupHistoryItems(openTurn);
+  assert.equal(derived[derived.length - 1].type, 'work');
+  assert.equal(derived[derived.length - 1].summary.isStreaming, true);
+  // And a session that says it is running marks that same trailing run.
+  const told = groupHistoryItems(openTurn, { running: true });
+  assert.equal(told.filter((item) => item.type === 'work' && item.summary.isStreaming).length, 1);
+});
+
+test('a plan card is a top-level item, never buried in an activity run', () => {
+  // With the view as the phone's primary window, a `TodoWrite` row that arrived inside a
+  // collapsed work item was unreachable: 「我没有看到你刚刚这个小任务的 to do」. The client
+  // lifts those rows into their own item, so the view must hand them over at the top level.
+  const rows = [
+    row('u0', 'user', 0),
+    row('t0', 'thinking', 1),
+    row('todo0', 'tool_use', 2, { content: { toolName: 'TodoWrite', input: { todos: [{ content: '修分组', status: 'in_progress' }] } } }),
+    row('c0', 'tool_use', 3, { content: { toolName: 'Bash', input: { command: 'ls' } } }),
+    row('a0', 'assistant', 4),
+  ];
+  const items = groupHistoryItems(rows.reverse(), { running: false });
+  assert.deepEqual(items.map((item) => item.type), ['messages', 'work', 'messages', 'work', 'messages']);
+  const card = items[2];
+  assert.equal(card.messages[0].content.toolName, 'TodoWrite');
+  assert.deepEqual(card.messages[0].content.input.todos, [{ content: '修分组', status: 'in_progress' }]);
+  // And it sits between the two activity runs rather than inside one.
+  const work = items.filter((item) => item.type === 'work');
+  assert.deepEqual(work.map((item) => item.summary.firstMessageId), ['s1:t0:0', 's1:c0:0']);
+});
+
+test('a page is chronological, capped, and its cursor walks back without repeats', async () => {
+  const rows = transcript(25); // 75 items, one page holds 20
+  const view = controller(rows);
+  const first = await view.page('s1');
+  assert.equal(first.ok, true);
+  assert.equal(first.result.version, 1);
+  assert.equal(first.result.items.length, HISTORY_PAGE_ITEMS);
+  assert.equal(first.result.hasMore, true);
+  assert.equal(first.result.nextCursor, firstIdOf(first.result.items[0]), 'the cursor is the page’s oldest id');
+  assert.equal(first.result.items.at(-1).type, 'messages', 'the newest page ends at the newest answer');
+  assert.equal(first.result.items.at(-1).messages[0].role, 'assistant');
+
+  // The second page is strictly older: no item key repeats, and it stops right before the
+  // first page begins.
+  const second = await view.page('s1', first.result.nextCursor);
+  assert.equal(second.ok, true);
+  const firstKeys = new Set(first.result.items.map((item) => item.key));
+  assert.deepEqual(second.result.items.filter((item) => firstKeys.has(item.key)), [], 'no repeats');
+  const firstPageOldest = Date.parse(first.result.items[0].summary
+    ? new Date(first.result.items[0].summary.startedAtMs).toISOString()
+    : first.result.items[0].messages[0].createdAt);
+  const secondPageNewest = Math.max(...second.result.items.map((item) => item.summary
+    ? item.summary.endedAtMs
+    : Date.parse(item.messages[0].createdAt)));
+  assert.ok(secondPageNewest <= firstPageOldest, 'the next page stops right before the first page');
+
+  // Walking to the start terminates: the last page reports hasMore=false and no cursor.
+  let cursor = second.result.nextCursor;
+  let guard = 0;
+  let last = second;
+  while (last.result.hasMore && guard < 10) {
+    const next = await view.page('s1', cursor);
+    assert.equal(next.ok, true);
+    cursor = next.result.nextCursor;
+    last = next;
+    guard += 1;
+  }
+  assert.equal(last.result.hasMore, false);
+  assert.equal(last.result.nextCursor, null);
+});
+
+test('a short conversation arrives whole, which is the point of the channel', async () => {
+  const view = controller(transcript(4));
+  const page = await view.page('s1');
+  assert.equal(page.result.items.length, 12, 'four turns: prompt, activity, answer each');
+  assert.equal(page.result.hasMore, false, 'nothing older is left');
+  assert.equal(page.result.nextCursor, null);
+  assert.ok(page.result.items.some((item) => item.type === 'messages'), 'and something is readable without expanding');
+});
+
+test('details walk one work range forward, page by page', async () => {
+  const rows = transcript(1);
+  const view = controller(rows);
+  const page = await view.page('s1');
+  const summary = page.result.items.find((item) => item.type === 'work').summary;
+
+  const first = await view.details('s1', summary);
+  assert.equal(first.ok, true);
+  assert.deepEqual(first.result.messages.map((entry) => entry.role), ['thinking', 'tool_use', 'tool_result']);
+  assert.equal(first.result.hasMore, false);
+  assert.equal(first.result.nextCursor, null);
+
+  // A tight byte budget splits the same range into pages whose cursor advances.
+  const small = controller(rows, { detailBytes: 250 });
+  const one = await small.details('s1', summary);
+  assert.equal(one.result.hasMore, true);
+  assert.ok(one.result.messages.length < 3);
+  const two = await small.details('s1', summary, one.result.nextCursor);
+  assert.deepEqual(
+    two.result.messages.map((entry) => entry.id).filter((id) => one.result.messages.some((entry) => entry.id === id)),
+    [],
+  );
+
+  // A cursor outside the range is refused rather than silently restarting the range.
+  const outside = await small.details('s1', summary, 's1:nowhere:0');
+  assert.equal(outside.ok, false);
+  assert.equal(outside.code, 'BAD_REQUEST');
+  // A range that is not in the transcript any more is a NOT_FOUND the controller can read.
+  const gone = await view.details('s1', { firstMessageId: 's1:gone:0', lastMessageId: 's1:also-gone:0' });
+  assert.equal(gone.ok, false);
+  assert.equal(gone.code, 'NOT_FOUND');
+});
+
+test('an unprojectable transcript is declined the way the controller understands', async () => {
+  // The controller treats this code as "this Host has no view for me" and reads the raw
+  // window instead — the honest answer for a session past the scan budget.
+  const view = controller(transcript(2), { scanMaxRows: 3 });
+  const page = await view.page('s1');
+  assert.equal(page.ok, false);
+  assert.equal(page.code, 'UNSUPPORTED_CAPABILITY');
+  assert.match(page.message, /scan budget/);
+
+  // No transcript accessor at all (a profile without the session API) says NOT_AVAILABLE,
+  // which is a different thing from "this session is too big".
+  const absent = createHistoryViewController({ rows: undefined });
+  assert.equal((await absent.page('s1')).code, 'NOT_AVAILABLE');
+  assert.equal((await absent.page('')).code, 'BAD_REQUEST');
+});
+
+test('expand intent replaces the set wholesale and refuses a shapeless request', async () => {
+  const view = controller(transcript(2));
+  assert.deepEqual(view.expandedFor('s1'), []);
+  assert.deepEqual(await view.intent('s1', [{ key: 'work-a' }, { key: 'preview-work-b' }]), { ok: true, result: true });
+  assert.deepEqual(view.expandedFor('s1').sort(), ['work-a', 'work-b'], 'a preview key names the same group');
+  await view.intent('s1', []);
+  assert.deepEqual(view.expandedFor('s1'), [], 'an empty intent releases everything');
+  assert.equal((await view.intent('s1', [{ key: '' }])).code, 'BAD_REQUEST');
+  assert.equal((await view.intent('s1', 'nope')).code, 'BAD_REQUEST');
+  assert.equal((await view.intent('s1', new Array(101).fill({ key: 'work-a' }))).code, 'BAD_REQUEST');
+});

@@ -1,0 +1,40 @@
+{
+  "schemaVersion": 1,
+  "finalizeId": "9586ce5f6f2db059b4ed61db48b0dd73d0b53b858eb37d9d7bc25c1ace5b073f",
+  "sessionId": "session-5020c98a-45ea-46dc-b454-455c07faf6ab",
+  "projectRoot": "G:\\Projects\\DSH-cindy-host",
+  "taskName": "历史视图下计划卡可见：TodoWrite-行升为顶层项",
+  "writer": {
+    "externalSkills": [],
+    "model": null,
+    "reasoningEffort": "medium",
+    "datedSectionsToKeep": 6,
+    "executionPolicy": "subagent"
+  },
+  "host": "dsh",
+  "planPath": "G:\\Projects\\DSH-cindy-host\\.claw\\tasks\\2026-09-17\\历史视图下计划卡可见：TodoWrite-行升为顶层项\\plan.json",
+  "reportPath": "G:\\Projects\\DSH-cindy-host\\.claw\\tasks\\2026-09-17\\历史视图下计划卡可见：TodoWrite-行升为顶层项\\plan.report",
+  "reportCapture": {
+    "mode": "claim",
+    "status": "captured",
+    "startedAt": "2026-09-17T08:35:22.297Z",
+    "capturedAt": "2026-09-17T08:35:53.843Z",
+    "receipt": {
+      "contractVersion": 1,
+      "captureId": "05119913-ed97-46f5-91e0-cd3ee60f6f3a",
+      "host": "dsh",
+      "sessionId": "session-5020c98a-45ea-46dc-b454-455c07faf6ab",
+      "payloadBytes": 827,
+      "payloadSha256": "651b31e21f6d9e8e482b715972f6a4fe3e95f32e027a9a1d4c0f0d2c95c61715",
+      "collectorVersion": "0.2.39.2",
+      "completedAt": "2026-09-17T08:35:53.843Z"
+    }
+  },
+  "status": "running",
+  "attempts": 1,
+  "queuedAt": "2026-09-17T08:35:37.308Z",
+  "expiresAt": "2026-09-17T10:35:37.308Z",
+  "startedAt": "2026-09-17T08:35:53.717Z",
+  "claimedAt": "2026-09-17T08:35:53.717Z",
+  "claimToken": "0b2eaa87-ce86-422f-a9ac-a3206f5e1370"
+}

@@ -1,0 +1,26 @@
+{
+  "schemaVersion": 1,
+  "finalizeId": "19e942f935af3d040952650350716eaa9901cddd3cd1aba308faab0f01156cae",
+  "sessionId": "session-5020c98a-45ea-46dc-b454-455c07faf6ab",
+  "projectRoot": "G:\\Projects\\DSH-cindy-host",
+  "taskName": "手机端可见-claw-计划：todo-write-→-TodoWrite-行",
+  "writer": {
+    "externalSkills": [],
+    "model": null,
+    "reasoningEffort": "medium",
+    "datedSectionsToKeep": 6,
+    "executionPolicy": "subagent"
+  },
+  "host": "dsh",
+  "planPath": "G:\\Projects\\DSH-cindy-host\\.claw\\tasks\\2026-09-17\\手机端可见-claw-计划：todo-write-→-TodoWrite-行\\plan.json",
+  "reportPath": "G:\\Projects\\DSH-cindy-host\\.claw\\tasks\\2026-09-17\\手机端可见-claw-计划：todo-write-→-TodoWrite-行\\plan.report",
+  "reportCapture": {
+    "mode": "claim",
+    "status": "pending",
+    "startedAt": "2026-09-17T08:18:42.017Z"
+  },
+  "status": "queued",
+  "attempts": 0,
+  "queuedAt": "2026-09-17T08:18:56.350Z",
+  "expiresAt": "2026-09-17T10:18:56.350Z"
+}

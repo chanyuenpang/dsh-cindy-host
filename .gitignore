@@ -1,0 +1,31 @@
+# dependencies
+node_modules/
+
+# the sandbox DSH home: it carries its own credentials and session storage
+.sandbox/
+
+# claw runtime state. The durable project memory under .claw/{tasks,adr,truth}
+# and .claw/project.json IS committed; the daemon's logs, runtime dir and its
+# sqlite memory are not (binary, churning, machine-local).
+.claw/runtime/
+.claw/logs/
+.claw/memory.sqlite
+.claw/memory.sqlite-shm
+.claw/memory.sqlite-wal
+
+# crash reports and one-off probe leftovers at the repository root
+.claw-crash-report/
+.claw-*.txt
+.claw-*.log
+.claw-*.report
+.claw-*.mjs
+.claw-*.cjs
+
+# media produced by agent sessions (acceptance prefers kitten.png but falls back)
+kitten.png
+generated-*.png
+
+# editor / OS noise
+.DS_Store
+Thumbs.db
+*.tmp

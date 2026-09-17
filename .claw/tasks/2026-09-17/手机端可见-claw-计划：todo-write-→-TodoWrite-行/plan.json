@@ -1,0 +1,43 @@
+{
+  "title": "手机端可见 claw 计划：todo/write → TodoWrite 行",
+  "templateId": "default",
+  "status": "end.completed",
+  "goal": {
+    "text": "让 claw 工作流的计划在手机上可见：把 DSH 的 todo/write 快照翻译成客户端渲染计划卡所需的 TodoWrite 工具行（持久读与实时路径都生效，空快照跳过）。"
+  },
+  "requirements": {
+    "summary": "",
+    "openQuestions": [],
+    "acceptanceCriteria": [
+      "npm test 全绿（新增：非空快照→TodoWrite 行且 input.todos 保留、空快照不产生行、持久读与实时路径产生相同行）",
+      "tools/probe-todo-rows.mjs 对本会话真实日志跑出手机可见行：159 条 todo/write 快照 → 156 行 TodoWrite，行内含 [completed]/[in_progress]/[pending] 计划条目",
+      "重启 dsh web 后，local-db:messages:list 对该会话的最新页包含 content.toolName==='TodoWrite' 的行；手机转录出现计划卡，且随计划推进更新",
+      "不引入空卡：末次空快照不产生行（桌面 dock 的清空语义与手机「无卡」一致）"
+    ]
+  },
+  "tasks": [
+    {
+      "id": 1,
+      "title": "Complete planning with claw-kit:planning",
+      "detail": "1. Determine whether the user's wording is an instruction to act or an open-ended discussion. 2. Use claw-kit:planning to clarify the requirements and prepare the task list. 3. Before adopting the solution, ensure the user has seen its decision-relevant content; if it introduces a meaningful choice, wait for the user's response.",
+      "status": "done"
+    },
+    {
+      "detail": "dsh-message-fold.js 新增 entryForTodoWrite：把 todo/write 快照翻译为 todo_write 工具调用行（id=todo-<seq>、时间取快照 time、todos 仅保留 content/status），空快照与形状不合法者返回 null；entriesFor 与 noteEvent（实时）两处都走同一翻译，保证持久读与推送得到同一行；cindy-message-row 既有的 todo_write→TodoWrite 名称映射负责选中手机的计划卡。诊断依据：@veewo/dsh-claw-kit 的 index.js 用 session.append('todo/write',{todos}) 驱动 DSH 原生 todo dock（fail-open），而 DSH 把该事件声明为 log-only，转录折叠按定义丢弃它，手机只能从 TodoWrite 工具行渲染计划卡。",
+      "title": "把 DSH 的 todo/write 快照翻译成手机可见的 TodoWrite 行",
+      "status": "done",
+      "id": 2
+    }
+  ],
+  "references": [],
+  "rules": [],
+  "keyDecisions": [
+    "todo/write 是 DSH 的 log-only UI state，不能进「派生历史」；本 Host 只把它翻译成客户端唯一认得的那一种形状（TodoWrite 工具行），不发明状态、不接管投影。",
+    "空快照不产生行：适配器用空列表清空 dock，手机侧「无卡」才是同一语义，渲染成空卡是错的。"
+  ],
+  "retrospective": {
+    "summary": "问题：claw 流程的 ToDo 在手机上看不到。诊断（有实测）：claw 适配器每次结算都 session.append('todo/write',{todos}) 驱动 DSH 原生 todo dock（本会话日志 159 条快照，含真实计划条目），而 DSH 把该事件声明为 log-only UI state，桌面从 todos 投影渲染、手机没有投影通道（只从 TodoWrite 工具行渲染计划卡，extractTodosFromMessage），转录折叠又按定义丢弃非 surface 事件——所以桌面有 dock、手机空白。\n\n修复：src/dsh-message-fold.js 新增 entryForTodoWrite，把每条非空 todo/write 快照翻译为一行 todo_write 工具调用（id=todo-<seq>、createdAt 取快照 time、todos 仅取 content/status），并同时接入持久读（entriesFor 与 createMessageReader 的日志折叠）与实时路径（noteEvent），保证推送与重读得到同一行；空快照与形状不合法者返回 null。既有的 todo_write→TodoWrite 名称映射负责选中手机计划卡。\n\n验证：npm test 405/405（新增 2 个用例：翻译形状与空快照；持久读与实时路径产出相同行）；tools/probe-todo-rows.mjs 对真实日志跑出 159 快照 → 156 行手机可见行，行内是 [completed]/[in_progress]/[pending] 计划条目；诊断脚本 tools/probe-todo-logs.mjs/probe-log-frames.mjs 顺便解决了「会话日志是拼接 zstd 帧、一次性解压只能拿到 195 字节头」的坑（234 条日志中 100 条带 todo/write）。文档：doc/cindy-phone-link.md 增「claw 的计划为什么在手机上变成一张 ToDo 卡」一节。\n\n未完成：活体验证（重启 dsh web 后 local-db:messages:list 的最新页应出现 toolName==='TodoWrite' 行，手机应出现计划卡且随推进更新）。"
+  },
+  "updatedAt": "2026-09-17T08:18:56.345Z",
+  "completedAt": "2026-09-17T08:18:56.283Z"
+}

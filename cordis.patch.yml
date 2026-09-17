@@ -1,0 +1,6 @@
+# Host-plane bundle. The legacy apiProxy adapter is optional: current DSH Web
+# profiles expose Typert remotes instead, so this row must mount without it.
+- insert:
+    - id: dsh-cindy-host
+      name: dsh-cindy-host-demo
+      inject: [settings]

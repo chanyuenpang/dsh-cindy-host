@@ -1,0 +1,43 @@
+{
+  "title": "历史视图下计划卡可见：TodoWrite 行升为顶层项",
+  "templateId": "default",
+  "status": "end.completed",
+  "goal": {
+    "text": "让手机在历史视图为主的窗口下依然能看到 claw 计划卡：把 TodoWrite 行在 view 分组中升为顶层 messages 项（不让它落进折叠的活动段）。"
+  },
+  "requirements": {
+    "summary": "",
+    "openQuestions": [],
+    "acceptanceCriteria": [
+      "test/host-history-view.test.js：TodoWrite 行成为顶层 messages 项，且不落在任何 work 段的区间内（新增用例）",
+      "npm test 全绿（407/407）",
+      "对真实行跑分组：顶层计划卡存在且最新一张就是最近一个小任务（实测 965 行 → 122 项，其中 16 张顶层计划卡，最新一张是「重写历史视图分组…」）",
+      "重启后手机在会话里（不展开任何活动段）就能看到当前 claw 计划的 ToDo 卡"
+    ]
+  },
+  "tasks": [
+    {
+      "id": 1,
+      "title": "Complete planning with claw-kit:planning",
+      "detail": "1. Determine whether the user's wording is an instruction to act or an open-ended discussion. 2. Use claw-kit:planning to clarify the requirements and prepare the task list. 3. Before adopting the solution, ensure the user has seen its decision-relevant content; if it introduces a meaningful choice, wait for the user's response.",
+      "status": "done"
+    },
+    {
+      "detail": "host-history-view.js 新增 isTodoRow（role==='tool_use' && content.toolName==='TodoWrite'）并在 isActivityRow 中排除它：计划卡因此在分组时走「prose」通道，flush 活动段后作为顶层 messages 项输出，与桌面投影的双层语义一致（其自身测试预期 ['message','work_group','todo','message']）。背景：手机切到 history view 为主窗口后，消息卡只能从 view 的顶层项构建；todo 行落入折叠活动段时永远不可达，用户报告「我没有看到你刚刚这个小任务的 to do」（上一版能看到，是因为当时原始窗口还在向 store 供行）。",
+      "title": "view 分组中把 TodoWrite 行升为顶层项",
+      "status": "done",
+      "id": 2
+    }
+  ],
+  "references": [],
+  "rules": [],
+  "keyDecisions": [
+    "view 的顶层项决定手机能看到什么：卡片类行（TodoWrite）必须升为顶层项，只有真正的步骤（thinking/tool 调用与结果）才折叠；这与桌面投影的双层语义一致。",
+    "手机切到 history view 为主窗口后，原始 messages:list 不再供行，任何只靠原始窗口才能渲染的东西（计划卡）都会消失——视图必须自己把卡片交出来。"
+  ],
+  "retrospective": {
+    "summary": "问题：历史视图成为主窗口后，用户看不到最近那个小任务的 ToDo 卡（「上一个版本是有的」）。\n\n诊断：计划卡的渲染依赖 transcript 里的 TodoWrite 行；先前能看到是因为原始 messages:list 还在向手机 store 供行，而视图接管后只提供 view 的顶层项，TodoWrite 行按「活动」被折进 work 段，永远不可达（活体核对：view 页的 10 个 messages 项全是 user/assistant，顶层没有 TodoWrite）。\n\n修复：host-history-view.js 新增 isTodoRow 并在 isActivityRow 中排除它——计划卡走 prose 通道，作为顶层 messages 项输出（与桌面投影预期 ['message','work_group','todo','message'] 一致）。\n\n验证：npm test 407/407（新增用例：TodoWrite 行是顶层项且不落在任何 work 区间）；对真实行（965 行）跑分组：122 项含 16 张顶层计划卡，最新一张正是最近的小任务。\n\n未完成：重启后的真机确认（不展开任何活动段就能看到当前 claw 计划的 ToDo 卡）。"
+  },
+  "updatedAt": "2026-09-17T08:35:37.297Z",
+  "completedAt": "2026-09-17T08:35:37.122Z"
+}

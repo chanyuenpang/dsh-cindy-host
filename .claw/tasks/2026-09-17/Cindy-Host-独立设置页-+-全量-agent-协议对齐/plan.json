@@ -1,0 +1,594 @@
+{
+  "title": "Cindy Host 独立设置页 + 全量 agent 协议对齐",
+  "templateId": "default",
+  "status": "end.completed",
+  "goal": {
+    "text": "让 Cindy 手机客户端能驱动 DSH：独立设置页 + 真实 DSH 数据源 + 只实现 file-browser、基础 agent 信息流、审批、todo、goal 五块，其余 channel 一律 fail-closed。"
+  },
+  "requirements": {
+    "summary": "Cindy 手机客户端要能完整驱动 DSH：独立设置页；真实数据源；全量 invoke/push channel 对齐。",
+    "openQuestions": [],
+    "acceptanceCriteria": [
+      "设置侧栏出现独立的「Cindy 手机连接」页（settings.section, id=dsh-cindy-host），插件页不再有重复卡片",
+      "Host 能从当前 DSH Web 架构（Typert/api-remotes/session-controller）读到真实会话列表与消息，不再恒为空",
+      "手机端能对 DSH Host 完成：选 agent → 新建会话 → 发消息 → 看到流式回复 → 审批交互",
+      "CORE+EXTENDED invoke channel（约 183）与 PUSH_FORWARD_ALLOWLIST（39）逐组对齐，未知 channel 仍 fail-closed 返回 CHANNEL_NOT_ALLOWED",
+      "npm test 全绿；不改 DSH Web shell 与主 profile"
+    ]
+  },
+  "tasks": [
+    {
+      "id": 1,
+      "title": "Complete planning with claw-kit:planning",
+      "detail": "1. Determine whether the user's wording is an instruction to act or an open-ended discussion. 2. Use claw-kit:planning to clarify the requirements and prepare the task list. 3. Before adopting the solution, ensure the user has seen its decision-relevant content; if it introduces a meaningful choice, wait for the user's response.",
+      "status": "done"
+    },
+    {
+      "detail": "客户端半注册 settings.section（name/id/order/label），移除 settings.plugin.item 卡片；页面承载开关、状态、登录、设备列表。同样用 ctx.slots.inject 等声明",
+      "title": "独立设置页（settings.section）",
+      "status": "done",
+      "id": 2
+    },
+    {
+      "detail": "当前 Web profile 无 apiProxy（只有 typert/typert-gateway/api-remotes/session-controller），source 恒为 undefined。需找到 host 侧可消费的真实会话/消息/agent 服务并替换该接缝",
+      "title": "DSH 数据源：替换失效的 apiProxy 接缝",
+      "status": "done",
+      "id": 3
+    },
+    {
+      "detail": "maker:create-session/send/input:enqueue|steer|stop|resume|remove|clear-session + device-link:subscribe(topic) + push(maker:event / status-changed / input:projection / local-db:sessions:created|patched|activity / messages:created)",
+      "title": "基础 agent 信息流（新建/发送/中断/流式）",
+      "status": "done",
+      "id": 4
+    },
+    {
+      "detail": "maker:get-pending-interactions / resolve-interaction + push(maker:interaction-request / interaction-dismissed)",
+      "title": "交互审批链路",
+      "status": "done",
+      "id": 5
+    },
+    {
+      "detail": "local-db:sessions:get / messages:list|view|around|around-client-id|work-details|view-intent / recent-workdirs:list / sessions:patch-meta / conversations:search。其余 CORE 读侧出局。",
+      "title": "会话读模型（信息流读取）",
+      "status": "done",
+      "id": 6
+    },
+    {
+      "detail": "maker:list-available-agents / get-capabilities / provider:list / get-new-maker-defaults + push maker:agents:changed。session tree / set-model / effort / rewind / fork / compact 等出局。",
+      "title": "agent roster 与能力协商",
+      "status": "done",
+      "id": 7
+    },
+    {
+      "detail": "todo 列表信息流。【2026-09-17 复验修正】此前标记 done 是错的：只验证了消息行的 content.input.todos 形状（tools/probe-todo.ts 直接调 extractTodosFromSourceMessage，绕过了名字门），而手机是按工具名选卡的——只对 TodoWrite/update_plan 返回 todos。DSH 工具名是 todo_write，所以计划从未真正渲染。已修复（cindy-message-row.js 映射 todo_write→TodoWrite）并复验：真机会话该行 toolName=TodoWrite todos=3；probe 改为经过 extractPlanTodos 名字门，现在能失败。教训：探针必须走控制器自己的选择分支，不能只测数据形状。",
+      "title": "todo 列表信息流",
+      "status": "done",
+      "id": 8
+    },
+    {
+      "detail": "fs:resolve-path|list-dir|stat-path + text-file:read-preview，映射 DSH ctx.fs 的 FsTarget 语义到控制端的绝对路径语义。file-browser:remote-op 聚合通道视手机实际需求再定。",
+      "title": "file-browser 与文件系统",
+      "status": "done",
+      "id": 9
+    },
+    {
+      "detail": "maker:goal:get-status：从 session projection 流（key=goal）折叠，**零副作用**——不调用会 resume 会话的 resolveAgent。手机每次开会话都问它。",
+      "title": "goal 状态读取（projection 流）",
+      "status": "done",
+      "id": 10
+    },
+    {
+      "detail": "fail-closed 守卫与「已服务 channel」覆盖**均已实测通过**：2026-09-17 用户重启 dsh web 后，对本机活体 3080 跑 `node tools/acceptance.mjs --base http://127.0.0.1:3080 --with-prompts` → **97/97 checks passed**、**49/49 已服务 channel 全部实跑**、**9/9 push 通道全部实发**；未实现 channel 与完全未知 channel 两条均得到 CHANNEL_NOT_ALLOWED（fail-closed 成立）。同一轮 /status 显示 state=connected、登录态保留（deviceId <host-device>）、diagnostics.frameBudget 存在且 refusals=0/degradations=0。新增交付的活体验证：file-browser:remote-op 的 exportFileStart→exportFileStatus 对 kitten.png(2454031B) 上传完成并返回 OSS key；device-link:media:fetch 对同一文件返回 ossKey/mimeType/size(801ms)；列表分页最新页 80 行/36–53ms。\n\n**仍待用户真机确认的只有手机侧观感**：打开「画一只小猫」应一次显示整段短对话（不再只有最后一个回复）、「加载更早」应即时返回、agent 画的图应能打开、审批/todo/goal 卡与 plan/permission/effort 控件仍正常。手机（<phone> / <phone-device>）连上后即可复测；Host 侧工作已完成，任务保持 pending 只为等这一次真机确认。",
+      "title": "范围外 fail-closed 守卫与端到端验收",
+      "status": "done",
+      "id": 11
+    },
+    {
+      "title": "goal 写命令（set/pause/resume/clear）",
+      "detail": "maker:goal:set|pause|resume|clear|update 需要 sessionController.resolveAgent(sessionId)，它会 resume 会话。对「用户主动设 goal」这是合理副作用（用户就是在操作该会话），但对状态查询不合理——所以读侧走 projection，写侧单独实现。需先确认手机何时调用这些写命令。",
+      "status": "done",
+      "id": 12
+    },
+    {
+      "title": "缺陷1：enqueue ack 丢失刚发送的条目（workingDir/cwd 字段错配）",
+      "detail": "host-input-queue.js 的 toQueuedRemoteMessage/queuedRowFromController 只读 session.workingDir，而 sessionRowCache 存的是 source 行（字段名 cwd）→ 永远返回 null → maker:input:enqueue 的 ack pendingQueue 永远为空。手机 composer 因此永不结算：草稿不清空、转圈不停，下一次操作（插话/steer）重发同一段文字 → 用户报告的「指令被重复发两次」。证据：19:32 实测 ack pendingQueue=0（缓存已 warm，workingDir 可见）；修复后 selftest 实测 ack pendingQueue clientIds=selftest-push-1。同一 bug 还让 maker:input:get-projection 丢弃所有真实排队项。",
+      "status": "done",
+      "id": 13
+    },
+    {
+      "title": "缺陷2：todo 卡不渲染（todo_write 未映射为手机识别的 TodoWrite）",
+      "detail": "手机按名字选卡：extractPlanTodos 只对 TodoWrite/update_plan 返回 todos，而 DSH 工具名是 todo_write（输入形状 {todos:[{content,status}]} 完全一致）→ 计划永远不显示。证据：真机会话 18:21:12 确有 todo_write 3 条，手机无卡。修复后 local-db:messages:list 实测该行 toolName=TodoWrite todos=3；tools/probe-todo.ts 改为经过 extractPlanTodos 名字门（旧版直接调 extractTodosFromSourceMessage，绕过名字门，所以一直是假通过）。",
+      "status": "done",
+      "id": 14
+    },
+    {
+      "title": "缺陷3：session:<id> 订阅缺失 → 手机收不到任何实时推送",
+      "detail": "订阅是推送的唯一入口：诊断 subscriptions.sessions 为空时，pushSessionUpdate 静默返回。证据：19:30 重启后 sessions=[]，设备里只有两台桌面端，手机 <phone-device> 不在。已用 selftest 验证整条链路本身是好的：订阅 selftest 后 enqueue → recentPushes 记录 local-db:messages:created watchers=1 两条（用户消息 + 助手回复）→ 说明订阅一旦建立，回复会实时送达。待手机端复验：确认打开会话时是否发出 device-link:subscribe 的 session:<id>。新增 recentPushes/subscriptions 诊断用于定位。",
+      "status": "done",
+      "id": 15
+    },
+    {
+      "title": "推送与订阅可观测性（recentPushes / subscriptions）",
+      "detail": "新增 host.js pushLog（channel/sessionId/watchers）与 getSubscriptions()，并在 /api/dsh-cindy-host/status 的 diagnostics 暴露。动机：pushSessionUpdate 在无人订阅时静默返回，「手机没更新」的两个成因（没人订阅 / 发了但被丢弃）从外部完全无法区分。",
+      "status": "done",
+      "id": 16
+    },
+    {
+      "title": "缺陷4：turn 事件从不推送 → 手机永远「思考中」",
+      "detail": "手机把「思考中」清掉的唯一信号是会话级 maker:event 的终止事件（type:'done'）；maker:status-changed 只处理 closed，local-db:sessions:activity 属于 sessions topic——而看单个会话的手机只持有 session:<id>，根本收不到。我们此前只推 local-db:messages:created，所以回复到了、手机永远转圈。已修：session-publisher.js 新增 turnEventFor()，host.js 的 projection sink 按 session:<id> 推送（running/waiting→status isRunning:true；其余含 idle→done）。已用 selftest 验证 recentPushes 出现 maker:event watchers=1。单测覆盖。",
+      "status": "done",
+      "id": 17
+    },
+    {
+      "title": "缺陷5：队列控制通道全缺 → 用户被卡死，无法发送也无法删除",
+      "detail": "手机队列面板的 插话/取消/编辑/停止 全部是 invoke，我们一个都没实现，所以手机显示「电脑版本不支持这个远端能力」，队列卡住后既发不出也删不掉，用户完全被阻塞。DSH 的真实 API：sessionController.updateQueue({sessionId, itemId, action:{kind:'edit'|'remove'|'steer'}}) 与 cancel({sessionId})。已实现 10 个通道：maker:input:update-text / update-content / remove / move / stop / resume / set-expanded / set-edit-lock / set-interaction-lock / clear-session；steer 现在区分「推进已排队项」（updateQueue kind:steer）与「发送新消息」。已真机 selftest 验证 stop 可用。",
+      "status": "done",
+      "id": 18
+    },
+    {
+      "title": "缺陷6：clientId 未作为 prompt 身份传给 DSH → 草稿不清空，两次输入被合并成一条",
+      "detail": "DSH 把 prompt 的 requestId 持久化为队列项的 rpcId，而 rpcId 正是手机收回本地提交回执（retire echo）的依据。我们传的是中继 envelope id，手机认不出自己那条 → 回执永不收回 → 草稿不清空 → 用户下一次输入被拼到旧文字后面。证据：真机转录 18:35:55 一条 user 消息内容为「也可能叫 progress哈喽」（两条输入合并）。已修：enqueue/steer 传手机自己的 clientId 作 prompt identity；toQueuedRemoteMessage 用 rpcId 作 clientId。附带收益：DSH 会按 requestId 去重，重试不再变成重复消息。",
+      "status": "done",
+      "id": 19
+    },
+    {
+      "title": "缺陷7：queueControl 构建了但没转发 → 队列按钮全部 NOT_AVAILABLE",
+      "detail": "buildDshSource 已构造 queueControl，但插件 resolveCapabilities 是显式字段列表，漏了转发 → 所有队列按钮返回 NOT_AVAILABLE（实现就在那儿却够不着）。已修：新增 capabilityProvider() 统一转发，并在 dsh-plugin.test.js 加不变量测试「seam 产出的每个 capability 都必须到达 channel 层」；已反向验证该测试在漏转发时会失败。",
+      "status": "done",
+      "id": 20
+    },
+    {
+      "title": "缺陷8：队列 itemId 未翻译（controller clientId ≠ DSH MessageId）",
+      "detail": "手机用自己铸造的 clientId 寻址队列行（即 DSH 的 rpcId），而 updateQueue 以持久化的 MessageId 为键，两者是不同值。直接把 clientId 传给服务会查不到项，DSH 回「queued item is no longer pending」——看起来像竞态，其实是 id 传错。已修：tracker 增加 dshItemId(sessionId, controllerId) 做翻译，remove/update-text/update-content/steer 均在提交前翻译。单测用 rpcId≠id 的假数据锁定。",
+      "status": "done",
+      "id": 21
+    },
+    {
+      "title": "缺陷9（未修）：goal 状态读取永远是 null → 手机 goal 卡永远不显示",
+      "detail": "真机验证：set 2 轮上限的 goal 后，maker:goal:get-status 连续 20 秒返回 null，而 goal 确实存在（写命令返回 status active、maxTurns 2）。说明 goal projection 帧从未到达我们的 control 流折叠，读路径实际上是坏的——此前任务 #10 标记 done 时从未用真实 goal 验证过。待查：projection 是否只对「被观察」的会话计算、是否需要显式订阅 projection key，或改走 sessionQuery.observeSession(sessionId,{projectionMode}) 读取。",
+      "status": "done",
+      "id": 22
+    },
+    {
+      "title": "测试污染清理与交代（我的探测写进过用户会话 / 我的 goal 会话在空转）",
+      "detail": "已完成的加固（本轮）：(1) src/auth-session.js 的 restoreSession 现在**任何情况下都不自动删除凭据** —— 服务不可达时保留并用旧 token 尝试连接（refreshDeferred）；服务明确拒绝时只**报告** expired（卡片依据 resolved.ok 而非凭据是否存在来显示登录表单，所以仍能看到登录框）。删除凭据现在只剩显式登出（host-routes 登出路由 + logout.js → forgetSession）。(2) 新增 test/auth-session.test.js（5 个用例，凭据库打桩）钉死该规则：拒绝不删、不可达保留并连接、成功则回写轮换后的 token、无凭据只是 missing、只有显式登出才 clear；为此 auth-session 的三个函数接受可注入凭据端口（默认行为不变）。(3) npm run acceptance 新增两条防回退检查：分页第二页必须是与第一页**不同的行**（旧的「时间戳更早」断言在重复返回最新页时也会通过），以及真实转录中不得出现系统提示/运行时快照。实测：34/35（唯一失败项就是 relay 未连接），`no prompt injection reaches the transcript — 155 rows scanned, 0 injected`，`_count.messages=155`。仍需用户操作：在设置页重新登录（凭据已不在凭据管理器中，本机无法自动恢复）；登录后我验证 deviceId 是否仍为 <host-device>… 并跑 35/35。",
+      "status": "done",
+      "id": 23
+    },
+    {
+      "title": "推送对齐原则：按 topic 分类，不能只发 sessions",
+      "detail": "严格来自 Cindy 源码的推送扇出规则：sessions topic = 列表读模型（sessions:created/patched、sessions:activity、账号级 channel）；session:<id> = 单会话流（maker:event / status / input:projection / interaction-request / messages:created）。要点：手机看单个会话时只持有 session:<id>，所有列表级推送都到不了它——这就是缺陷4 的根因，也是后续实现 push 对齐时必须先分类的依据。",
+      "status": "done",
+      "id": 24
+    },
+    {
+      "title": "缺陷10（未修）：手机下拉加载更早消息失败（分页通道 / 游标语义）",
+      "detail": "现象（用户报告）：手机端下拉加载更早的消息时更新不成功。待查方向：分页通道到底走哪一个——我们的 SUPPORTED_CHANNELS 只有 local-db:messages:list，而手机还有 local-db:history:messages / local-db:messages:view / local-db:messages:around 等分页通道（当前全部 CHANNEL_NOT_ALLOWED）。另外要确认 local-db:messages:list 的游标语义：控制器分页契约是 ORDER BY createdAt DESC 且游标是时间戳，我们目前的 limit 实现未接游标。需先用 selftest 拿真机会话复现：带游标的 messages:list 请求长什么样、回复是否被控制器接受。",
+      "status": "done",
+      "id": 25
+    },
+    {
+      "title": "缺陷11（未修）：刚入队的行立刻编辑/取消会 NOT_FOUND（DSH queue 帧尚未到达）",
+      "detail": "真机 selftest 复现：enqueue probe-a 后立即 update-text/remove probe-a → NOT_FOUND「No queued item」。原因：enqueue 的 ack 里那条行是我们按 queuedRowFromController 临时合成的，而 DSH 自己的 queue 帧稍后才到，此刻 tracker 的折叠里还没有该项，也就拿不到持久化 MessageId；稍后（step 3）同一项能被 steer 到，证明帧确实到了。即「用户刚发完立刻点取消/编辑」会失败。拟修：把 clientId→MessageId 的解析改成有界等待（轮询折叠，~1.5s 上限），而不是立刻 NOT_FOUND。",
+      "status": "done",
+      "id": 26
+    },
+    {
+      "title": "需求：向手机暴露真实模型目录并支持对话内切换模型",
+      "detail": "需求（用户提出）：手机端在对话里无法选择/切换模型，需要把模型信息提交给手机端。现状：DSH_AGENT_CAPABILITIES 只报了固定 model='pi'，会话行的 model 也写死 'pi'，maker:provider:list 返回空目录，且 maker:set-model / maker:set-effort / maker:set-fast-mode / maker:set-permission-mode 全部未实现（CHANNEL_NOT_ALLOWED）。待办：(1) 用 sessionController.modelCatalog() 填 availableModels/effortLevels/permissionModes 与 provider 目录；(2) 会话行的 model 改用真实选择（sessionController.selectModel 或会话投影里的 modelSelection）；(3) 实现 maker:set-model（SessionSelectModelRequest）及 effort/permission；(4) 模型切换成功后要推 maker:event / 刷新会话行。先要从 Cindy 源码确认 MobileModelOption 的完整字段与手机选模型的调用序列。",
+      "status": "done",
+      "id": 27
+    },
+    {
+      "title": "缺陷12：第二句发送失败「host failed to serve this channel」（channel 层不可重现，已加取证）",
+      "detail": "调研结论（2026-09-17，Host 已登录且 connected）：**无法在 channel 层重现**。\n\n实测一：新建会话 `session-selftest-secondsend-1789616612954`，连续两次 `maker:send`：\n- send #1 `ok=true` **15ms**\n- send #2 `ok=true` **4ms**\n两者都远低于手机默认 invoke 超时 15s。\n\n实测二：该会话转录确实是两个独立 turn —— `user:first / assistant:first / user:second / assistant:second`（4 行），第二句没有被合并或丢失。\n\n实测三：`recentRefusals` 里 **没有任何 maker:send**；唯一被拒的是手机例行探测的范围外 channel（CHANNEL_NOT_ALLOWED：remote-resources:manifest / schedule:* / provider:list / sidebar-settings / usage:model-pricing / api-key:present / notification:clear-session-attention）以及其它 agentKind 的 get-capabilities（NOT_AVAILABLE）——均属预期 fail-closed。\n\n实测四（取证）：用户实际会话 a15dacf0 里，用户的**第二句**「你能看出来这个是什么吗？」正常得到回答，没有断流。\n\n最可能的真相：这个报告发生在「手机看不到 host」的同一时间窗（登录态丢失 → host 未连 relay），那时任何 invoke 都无法被服务，而错误文案看上去像被控端拒绝。该根因已由 #57（刷新失败不再删登录态）+ 用户重新登录修掉。\n\n本轮的改动使这一点以后可判定而非靠猜：invoke 日志现在记录 ask（参数）、items（返回条数）、preview（受限回包）与 recentRefusals（失败永久保留），所以真再发生一次就能直接看到是哪个 channel、什么 code。\n\n状态：保持 pending，等用户在手机上再发一次第二句（不能仅凭无法重现就宣告修好）。",
+      "status": "done",
+      "id": 28
+    },
+    {
+      "title": "权威投影读取（readSessionState + queueItemsFromInbox）：不再依赖推送帧",
+      "detail": "本轮的根因：我们一直把推送的 projection 帧当作可靠来源，但它们不保证到达，而「没变化」与「没听到」从折叠里看一模一样。已改：插件新增 readSessionState(sessionId)，用 sessionQuery.observeSession(sessionId,{projectionMode:'all'}) 按需计算已注册投影（租约总是释放）；maker:input:get-projection 优先用它 + queueItemsFromInbox（从 dsh-api-session-controller 移植的 inbox→队列映射）回答；maker:goal:get-status 优先用它读 values.goal。验证：同一个 maker:goal:get-status 以前 20 秒持续返回 null，现在正确返回 {status:'paused',maxTurns:1,objective:...}。单测覆盖两条分支（活读优先、失败回退折叠）。",
+      "status": "done",
+      "id": 29
+    },
+    {
+      "title": "失败通道永久保留（recentRefusals）",
+      "detail": "新增 refusalLog（环形 60，与 successes 分开）+ getRefusalLog()，并在 /api/dsh-cindy-host/status 的 diagnostics.recentRefusals 暴露。动机：手机每次轮询 local-db:messages:list 就会在几秒内把 40 条环形日志冲光，而那条被拒的 channel 正是唯一能解释「host failed to serve this channel」的证据——本次排查已经因此丢过一次现场。",
+      "status": "done",
+      "id": 30
+    },
+    {
+      "title": "缺陷13：maker:send 未携带 clientId 作为 prompt 身份（第二句转圈后消失）",
+      "detail": "maker:send 是另一条发送路径，而它把中继 envelope id 当作 requestId，没传手机自己的 clientId——与缺陷6 同类：DSH 因此存的 rpcId 不是手机的 id，手机永远收不回本地提交回执，消息就一直「发送中」，下一次拉转录时又被删掉（正是用户看到的「第二句转圈、过一会消失」）。已修：maker:send 从 args[1].clientId 或 args[2].clientId 取身份，否则回退 envelope id；两个单测锁定（带 clientId / 不带）。",
+      "status": "done",
+      "id": 31
+    },
+    {
+      "title": "分页边界不切断同一消息（pageRows 组补齐）",
+      "detail": "同一消息的多个行（thinking / tool_use / assistant）共用一个 createdAt，而控制器的游标就是这个时间戳。按 limit 硬切会把一组拆到两页，下一页又用严格 `< cursor` 过滤，于是该组剩余行永远取不到——转写里一个翻不过去的洞。已修：dsh-message-fold.js 新增导出的 pageRows()，切完 limit 后把与边界同一时间戳的行补齐。真机验证：limit=5 的第二页现在返回 6 行（边界组保护确实在真实数据上生效）。测试：pageRows 分组/续页/不重发三个断言。",
+      "status": "done",
+      "id": 32
+    },
+    {
+      "title": "invoke 日志记录请求参数（ask：分页游标）",
+      "detail": "invoke 日志以前只记回复大小与行数，不记「问了什么」——而「0 行」对「游标已到转录开头」是正确答案、对「控制器自己算出的游标」就是 bug，区分它们的正是那个游标。已加 ask 字段：local-db:messages:list 记录 limit/before。真机验证输出：ask=limit=5 before=none / ask=limit=5 before=2026-09-16T18:50:56.623Z。",
+      "status": "done",
+      "id": 33
+    },
+    {
+      "title": "自驱动端到端验收脚本（npm run acceptance）+ 拒绝清单统计",
+      "detail": "为什么需要它：本 Host 的每一个真缺陷都是「装配bug」——字段名错配、能力构建了没转发、channel 实现了但到不了——单元测试结构上看不到。新增 tools/acceptance.mjs：走 phone 用同一条 selftest 路线，对整装的 Host 逐 channel 跑 happy path（会话/消息分页/能力/模型目录/文件/approval 读取/队列通道/goal 全生命周期/订阅与推送/建会话/改名），并抽样验证 fail-closed。可重跑：npm run acceptance（也可直接 node tools/acceptance.mjs --base ...）。默认不跑发送路径（会开真 turn 烧 token），需要时加 --with-prompts。首次跑就抳出两处自己写的真空检查：分页用的是新建空会话，于是«分页前进»成了永远通过的空名题——现已改成从会话列表里找一个真有转写的会话再验，并真实观察到«要 3 行得 5 行»（边界组保护在真数据上生效）。另附加非致命信息：本次统计控制器问过但被拒的 channel 及次数，把「该不该实现某个 channel」从猜测变成数据。当前 32/32。",
+      "status": "done",
+      "id": 34
+    },
+    {
+      "title": "缺陷14：enqueue ack 合成不存在的队列行 → 手机的幽灵「队列中」（已知根因）",
+      "detail": "被验收脚本抓到的真实缺陷（也是用户「第二句是 队列中、过一会又消失」的直接原因）：enqueue 以前总是合成一条 pendingQueue 行。但 DSH 对空闲会话是**直接受理** prompt 的，根本不会入 inbox——于是那行描述了一个不存在的队列项，而且永远不会被清掉（从未入队的项不会产生 queue 帧），手机上就表现为「agent 已回复，但还有一条在队列中」；刷新时权威读显示没这行，于是它又消失了。已修：enqueue 的 ack 改为回答**DSH 真实持有**的队列（readSessionState + queueItemsFromInbox），并 adopt 到折叠里，使随后的取消/编辑能立即解析到持久 id；仅在**会话确实有 turn 在跑**时才补上那一行（因为此时 prompt 确实会进 next-turn，而 DSH 的持久 splice 可能晚于 prompt() 返回）。真机验收：37/37，且 ack 与权威读一致（ack=false read=false）。单测：一个断言已受理的 prompt 不能被报成排队，一个断言确实排队时行存在且折叠获得持久 id。",
+      "status": "done",
+      "id": 35
+    },
+    {
+      "title": "推送对齐：审批关闭（interaction-dismissed）与队列命令后的 projection 广播",
+      "detail": "目标里的「全量对齐 push channel」还差两处，都是同一类：只回答了问的人，没告诉同一会话的其他观察者。 (1) maker:interaction-dismissed：审批卡关闭（被回答、超时、或提问方撤回）时现在会向所有 watcher 推 {sessionId, requestId}（payload 从 remoteSessionStore.ts:4455 核实）。实现方式是给 createApprovalRegistry 加 onDismissed 回调，在唯一的关闭点 finish() 里触发。 (2) maker:input:projection：队列命令以前只回复发起者，第二屏会继续渲染刚被删掉的行；新增 pushInputProjection 能力 + answerQueueCommand() 统一走推送。两处都有单测。注：批量替换时把 helper 自己也替换成了递归调用（无限递归），已发现并修正。",
+      "status": "done",
+      "id": 36
+    },
+    {
+      "title": "单调推送总量（pushTotals）：使「推送是否发生」可被证实",
+      "detail": "问题：推送日志 ring 只暴露 last 20（status 里 slice(-20)），而活跃 turn 期间条目在快速滚动——两次读数之间计数会**变少**（实测 10→9），于是「推送到底发生没有」无法用计数回答。已加 pushTotals：每 channel 自进程启动以来的单调累计，随 diagnostics 暴露。验收脚本改用总量比对。",
+      "status": "done",
+      "id": 37
+    },
+    {
+      "title": "验收脚本：四个会话级推送通道的真实验证（40/40）",
+      "detail": "验收脚本现在用单调总量验证四个会话级推送的真实发生：maker:goal:status-changed 5→6、maker:input:projection 4→5、local-db:messages:created 2→4（用户消息 + 回复）、maker:event 5→8（turn 起止）。其中 maker:event 最初作为独立 2 秒窗口检查时假失败——那段窗口内可能根本没有状态跳转；现在改为在**整个 prompt 阶段**测量（发 prompt → 轮询到 turn 结束），这才是有意义的断言。另修了两个脚本自身的假失败：(1) 每次跑用同一个 clientId，而 DSH 按 rpcId 去重 → 第二次跑根本没发送，却报「没有消息推送」（顺带证明了去重确实生效）；(2) 队列项可能在检查间隙被受理，现在只在权威读确认仍排队时才做编辑，并接受「编辑前已被受理」。",
+      "status": "done",
+      "id": 38
+    },
+    {
+      "title": "对齐核实：maker:list-active 的 {summary:true} 与运行状态权威",
+      "detail": "核实结论（无需改动，但值得记）：手机带 {summary:true} 调 maker:list-active，桌面参考实现只是把行**瘦身**为 {sessionId, isTurnRunning}（dispatch.ts:539），底层依旧只返回活跃会话；且手机自己注明「缺席不算空闲断言，只有显式布尔值才能改变运行状态，终止性 maker/activity 事件才是空闲权威」（remoteSessionStore.ts:4069）。所以我们只返回活跃会话是与参考实现一致的，不应自行补 isTurnRunning:false。手机清「思考中」的正式路径就是我们新增的会话级 maker:event 终止事件。",
+      "status": "done",
+      "id": 39
+    },
+    {
+      "title": "缺陷15：turn 结束后仍宣告 running → 会话列表转圈一分钟",
+      "detail": "用户现象：在 greeting to ai 会话发完消息、会话内已无「思考中」，但退出到会话列表后该会话仍转圈约 1 分钟才恢复。根因：session-publisher.js 的 publishActivity 以 `: 'running'` 作为兵底分支，而 DSH 在 turn 结束时发的 phase 正是 `idle` → 我们把「已结束」宣告成「运行中」。手机 applySessionActivity（remoteSessionStore.ts:4491）对 phase 'running'/'needs-interaction' 写 isRunning:true，只有 completed/error 才收敛为 false——所以名单上的转圈只能等后续事件自我修正。已修：新增 activityPhaseFor()，按 kind + phase 显式映射（idle→completed；session-added/removed/subscribed 不发布任何活动；未知 phase 不发声明而不是兵底成 running）；attention 仍只给 needs-interaction。7 个单测锁定，277 全绿。",
+      "status": "done",
+      "id": 40
+    },
+    {
+      "title": "缺陷16：user 行未携带手机自己的 clientId → 乐观回显认不出自己，显示两条消息",
+      "detail": "用户现象：发送后立刻显示两条消息，过一会那条转圈的才消失。根因：手机 projectOptimisticUserMessages 是**按 clientId 精确匹配**自己的乐观回显（匹配到就 splice 掉），而我们的 user 行 clientId 用的是合成 id（sessionId:messageId:index），永远不等于手机铸造的那个 → 回显认不出自己 → 两条共存，直到某次兜底对账才丢一条。已修：将 prompt 的 rpcId（即手机 clientId）穿到 user 行上：toCindyMessageRows 新增 promptClientId，user 行用它作 clientId（id 仍保持自己稳定的合成值），live 折叠（foldSessionEvent）与持久读取（entriesFor）两条路径都带上。单测：user 行带手机 id、assistant 行不受影响、无 id 时回退。",
+      "status": "done",
+      "id": 41
+    },
+    {
+      "title": "缺陷17：队列变更需要活 agent（agents.get 为空 → “no longer pending”）且 inbox 仅活会话可见",
+      "detail": "DSH 的 updateQueue 先 `ctx.agents.get(sessionId)`，取不到就报「queued item is no longer pending」（消息具有误导性，其实是「会话未附着」）；另外 inbox 属性只存在于活 agent，冷会话的投影快照里根本没有 inbox，所以队列明明是持久的却读成空。已修：插件新增 ensureAgent(sessionId)（走 resolveAgent），所有队列读取与变更之前先附着；queueControl.update 自身也先 resolveAgent 再 updateQueue。真机验证：以前 steer/remove 均报 THREW，现在 remove 成功、队列清空。附带教训：拆开 ensureAgent 后忘了在 capabilityProvider 里转发，被我自己上一轮加的「seam 产出的每个 capability 都必须到达 channel 层」不变量测试当场抓住。",
+      "status": "done",
+      "id": 42
+    },
+    {
+      "title": "分页量化：一行是一个内容块，20 行≈ 13 条消息（与参考实现一致）",
+      "detail": "用户确认下拉加载已可用，但觉得一次加载太少。定量证据：手机 MESSAGE_FETCH_PAGE_SIZE=20 是**行**数（MESSAGE_PAGE_SIZE=80 是缓存窗口；重试阶梯 [20,10,5,1]），而一行 = 一个内容块（RemoteMessageRole 含 tool_use/tool_result/thinking）。实测本 Host 平均 1.5 行/消息 → 20 行 ≈ 13 条消息；用户体感「只有一个对话」出现在工具密集的会话（一条消息可占 3-4 行）。结论：我们的行为与参考实现一致，不是分页缺陷；若要让每次下拉看到更多，需要实现 local-db:messages:view（桌面端的 history view，按渲染项分页）——那是另一个较大的功能，待用户定优先级。",
+      "status": "done",
+      "id": 43
+    },
+    {
+      "title": "缺陷18：maker:provider:list 返回空成功 → 控制器当成权威空目录，模型选择器“暂无可用模型”",
+      "detail": "用户现象：会话里已显示模型名，但点进选择器显示「暂无可用模型」。根因：我们让 maker:provider:list 成功返回 {providers: []}，而控制器把「成功的空目录」读成**权威的空模型目录**。两道判决都在手机源码里：canUseFlatModelFallback 要求 providersUnsupported===true（modelPickerSheetModel.ts:23），而 providersUnsupported 只能由 CHANNEL_NOT_ALLOWED / DEVICE_LINK_CHANNEL_NOT_ALLOWED 置位（deviceProvidersCache.ts:36）；也就是说**只有明确不支持该 channel 的被控端才会回退到 capabilities.availableModels**。修：从 SUPPORTED_CHANNELS 移除 maker:provider:list，让它 fail-closed 为 CHANNEL_NOT_ALLOWED——这同时也是更诚实的回答（本 Host 暴露的是模型目录，不是供应商注册表；空成功等于声称「有目录且为空」）。真机验证：provider:list → CHANNEL_NOT_ALLOWED，get-capabilities → 4 个模型。",
+      "status": "done",
+      "id": 44
+    },
+    {
+      "title": "必修：ask_user_question 交互链（user-questions/request 应答器 + 文本/id 答案翻译）",
+      "detail": "用户报告：agent 调用 ask user questions 时手机上看不到，对话卡死——这是必修项（DSH 的 user-questions/request 瀑布会阻塞工具调用直到有人回答）。已实现：host-approvals.js 新增 QUESTION_KIND 与 questionAnswerOf()，注册表重构为共享的 pending-interaction 注册表（ask / askUser 共用超时、中止、关闭通知），并按**存储的条目类型**而不是决策自带的 kind 分派（决定错误类型的决策一律拒绝而不是误译）；插件新增 user-questions/request 瀑布应答器，规则与审批一致——只有会话有 controller 在看时才接管，否则 next() 让本地 UI 回答；运行时新增 askUserQuestion()。两侧契约从源码核实：控制器按**问题文本**为键回答（answerKey = question.question），多选是 JSON 数组字符串（encodeMultiSelectAnswer），而 DSH 要的是按**问题 id** 的 {id,selected,custom?}——questionAnswerOf 就是这层翻译，未被选项匹配的回复作为 custom 保留而不是丢弃。单测 15 个。待做：真机跑一次 ask_user 调用验收（需要 agent 真的发起提问）。",
+      "status": "done",
+      "id": 45
+    },
+    {
+      "title": "列表级推送也计入 pushTotals（以前完全不可观测）",
+      "detail": "pushTotals/recentPushes 只统计会话级推送（走 pushSessionUpdate→recordPush），而列表级推送（local-db:sessions:activity / sessions:created / sessions:patched）走 session-publisher 的 publish()，完全不计入——而会话列表的转圈徽标恰好依赖列表级推送，于是「我们到底有没有告诉控制器 turn 结束了」这个关键问题当时无法回答。已修：publish/publishActivity/publishLifecycle 接受 record 回调，host.js 在 projection sink 里传入统一记账。",
+      "status": "done",
+      "id": 46
+    },
+    {
+      "title": "需求：plan mode / permission mode / effort / fast mode 手机端选择与修改",
+      "detail": "用户问：手机端选择 plan mode / goal mode / 修改权限是不是没实现——确实没实现（phone 的 / 菜单与 composer 控件会直接报 channel is not available）。两侧契约已核实：手机发 maker:set-plan-mode(sessionId, enabled)（sessionId + 布尔）；maker:set-permission-mode(sessionId, mode)；maker:set-effort(sessionId, effort)；maker:set-fast-mode(sessionId, enabled)。DSH 侧：ctx.planMode.set(agent, active) → 'committed'|'queued'|'cancelled'|'noop'（ctx.planMode = PlanModeController，dsh-plan-mode）；ctx.permissionPresets（PermissionPresetService，dsh-permission-presets）有 names: readonly string[] 与 set(session, name)。关键：capabilities 现在报 planMode.supported=false、permissionModes=[]，所以即使实现了通道，控件也不会出现；实现时需同时：(1) planMode:{supported:true}；(2) permissionModes = permissionPresets.names 映射为 {id, displayName}；(3) 会话行的 permissionMode 改用会话真实值（现在写死 'default'）；(4) maker:set-plan-mode 需 resolveAgent 后调 planMode.set，并把 'queued'（当前 turn 结束后生效）如实回给手机。",
+      "status": "done",
+      "id": 47
+    },
+    {
+      "title": "需求：/ 命令与 skill 面板、@ 资源面板（本轮已实现，契约存档）",
+      "detail": "用户报告 / 里显示 channel is not available on DSH Host，无法调用 DSH 上的 skill——这就是我们拒绝的那三个通道。契约已核实：maker:list-agent-skills(agentKind,{workingDir?,forceReload?,sessionId?}) → {success, skills?: MobileSlashCommand[]}，其中 kind='agent-skill'、{name, description?, source:'user'|'skill', path?, scope?, enabled?}；maker:list-agent-commands(agentKind,opts?) → {success, commands?: MobileSlashCommand[]}，kind='agent-builtin'、{name, description}；maker:list-desktop-commands() → 同理（本 Host 无桌面专属命令，空成功即可）；maker:scan-at-resources(agentKind,{workingDir,cap?,query?}) → {success, items?: [{type:'file'|'dir'|'agent', name, relPath, description?}], truncated?}。DSH 侧源：ctx.skills.list({scope?,cwd?}) → SkillSummary{name,description,whenToUse?,invocation:{modelInvocable,userInvocable},source,provider}，人类可调用目录需按 invocation.userInvocable 过滤；ctx.commands.list(agent) → CommandDescriptor{name,description,input?}；@ 菜单用 ctx.fs 浅列目录。注：已本轮实现（host-palette.js + 四个通道 + 287 测试全绿），留此条目作为契约存档。",
+      "status": "done",
+      "id": 48
+    },
+    {
+      "title": "需求：file-browser（file-browser:remote-op 聚合通道 + fs:mkdir-p）",
+      "detail": "已实现并真机验证 file-browser:remote-op（caps/listDir/readFile/listAllFiles，op 判别 ok，未知 op 回 {ok:false,message}）。路径守卫 resolveInside() 逐段拒绝爬出 workdir 的 `..`（真机验证 ../../../Windows/win.ini 被拒）。两处字段错配已按真实类型修正：FsInfo 无 mtimeMs（如实报 0，即控制器归一化器的默认值）、FsDirEntry 自带 size（不做逐条 stat）。**fs:mkdir-p 未实现且不假装**：ctx.fs 没有创建目录的 API（只有 writeText），所以保持拒绝。",
+      "status": "done",
+      "id": 49
+    },
+    {
+      "title": "需求：attachment（手机发送图片/文件）",
+      "detail": "用户点名要“手机发送图片/文件”。本轮把**可服务的那一半做完并自证**，剩下一半需要用户定范围。\n\n【已实现并真机自证】宿主机路径附件（文件已在被控机 上，例如文件浏览器的 sendToSession）：文件与图片两类都能进 agent，回显也会在用户气泡上重现 chip。证据见 #52 与 doc/cindy-phone-link.md：ask=attachments=1 form=host-paths、user 行 files={\"name\":\"package.json\",\"size\":1050}、user 行 files={\"name\":\"probe-image.png\",\"size\":75,\"mimeType\":\"image/png\"}、assistant 分别回 got it / ok。\n\n【未实现且不假装】手机拍照/相册上传的图片与文件：path 是 cindy-oss-attach:// 不透明引用，字节在 Cindy 服务器的 OSS 中转区（手机 POST /api/device-link/media/presign-put 上传），参考桌面端用自己的 mediaTransfer 下载成本地文件再交给 agent。本 Host 无 OSS 凭据/无该客户端，device-link:media:fetch 按规则属范围外；图像缩略图渲染还需媒体通道。选择：(A) 把 media 管线（presign-get 下载 + 媒体取件）纳入范围，做完整；(B) 维持现状（宿主机文件可用，手机上传引用丢弃并记录 form=oss-refs）；(C) 暂不评估。保持 pending 等用户选。",
+      "status": "done",
+      "id": 50
+    },
+    {
+      "title": "file-browser 实现（聚合通道 + workdir 守卫）已真机验证",
+      "detail": "已实现并真机验证：新增 src/host-file-browser.js（createFileBrowser）+ 通道 file-browser:remote-op。**op 集是照手机真实调用定的**（mobileMakerTransport.ts 只发 9 个）：caps（{ok:true}，不访问 fs）、listDir（裸 entries 数组，正是 normalizeRemoteOpDirEntries 接受的形状）、readFile（OVERSIZE/BINARY_FILE/READ_FAILED，OVERSIZE 带 stat）、listAllFiles（有上限并如实报 truncated）、**searchCollect（本轮补上）**。另：thumbnail → {ok:false,code:'THUMB_UNSUPPORTED'}、exportFileStart/Status → {ok:false,message:'需要 Cindy 媒体管线'}，都是参考实现自己的拒绝形状，而不是 unknown op。**手机不发 createFile/createFolder/writeFile/renameEntry/deleteEntry**（那是桌面被控端的能力；ctx.fs 也没 mkdir/delete/rename），所以不做。两处字段错配已按真实类型修正：FsInfo 无 mtimeMs（如实报 0，即控制器归一化器的默认值）、FsDirEntry 自带 size（不做逐条 stat）。路径守卫 resolveInside() 逐段拒绝爬出 workdir 的 `..`（真机验证 ../../../Windows/win.ini 被拒）。性能：第一版先 listAllFiles（本仓库 6.1s，因为走满 5000 上限且含 node_modules）再逐个 resolve → 搜索 6280ms；改成自己 walk、复用目录项句柄、不进入被跳过目录后 → **379ms**，结果完全相同（16 处匹配 / 117 文件）。",
+      "status": "done",
+      "id": 51
+    },
+    {
+      "title": "attachment 调研结论（未实现）：随发送携带 + 需先 uploadFile 拿 receipt + 回显还需媒体通道",
+      "detail": "调研完成且已落地可落地的那一半（本轮实现并真机自证）。\n\n【已实现】宿主机路径附件（文件浏览器 sendToSession 那类）：新增 src/host-attachments.js —— hostAttachmentsOf 只接受绝对宿主路径（`cindy-oss-attach://` 等带协议或相对路径一律不当作路径）；createAttachmentMaterializer 经 ctx.fs resolve+stat+readByteRange 读全文件（上限 20MB），图片（png/jpeg/webp/gif，声明 mime 不在 DSH 封闭词表时以扩展名定）→ {type:'image',mediaType,data:base64}（宿主自行提升为持久引用），其余 → ctx.fileUploads.upload(agent,{data,name},signal) 拿 receipt → {type:'file',receiptId}。读不到/超大/目录/无 fs/无上传服务一律**逐附件丢弃并给原因**，消息本体照发。\n\n【回显】cindy-message-row.js 把 image/file block 重置到 user 行的 content.files（手机 readFileAttachments 读的就是这里，而它按 clientId 退掉乐观气泡 —— 不重述就会在权威行落地时消失）；图片故意作为 file 条目呈现（手机渲染图片靠 url/base64，本 Host 两者都不提供，file chip 至少让附件的存在与名字可见）；纯附件消息会自己占一行。\n\n【真机自证（不需手机）】\n  ask=attachments=1 form=host-paths\n  [user] files={\"name\":\"package.json\",\"size\":1050}   ← 我们实际读到的字节数，而非手机上报的 757\n  [assistant] got it\n  [user] files={\"name\":\"probe-image.png\",\"size\":75,\"mimeType\":\"image/png\"}\n  [assistant] ok                                        ← 证明 DSH 真的接受了二进制 image part\n新增 10 个测试（host-attachments 6 + 行折叠 3 + 通道 1），全套 327 绿；验收 34/35（唯一失败项仍是 relay 未连接 = 登录态）。\n\n【仍未实现】手机相册/拍照上传的图（path 是 cindy-oss-attach://，字节在 Cindy 服务器 OSS 中转区；参考桌面端用自己的 mediaTransfer 先下载成本地文件）。本 Host 无 OSS 凭据与该客户端，且 device-link:media:fetch 按规则列为范围外。缩略图渲染也需要媒体通道。是否纳入 media 管线需用户决定。",
+      "status": "done",
+      "id": 52
+    },
+    {
+      "title": "缺陷19：agent 已回复完毕，「思考中」仍不消失",
+      "detail": "用户真机报告：agent 已经表达完毕，手机仍在转圈。我们的假设是会话级 maker:event 的终止事件（type:'done'）能清掉它，但从未读过手机端消费 maker:event 的真正分支。必须：读 apps/mobile remoteSessionStore（及 maker-shared event 类型）里 applyMakerEvent / handleMakerEvent 的完整 switch，逐一核对我们发的每个 type/payload 是否落在终止分支；再用真机载荷取证（pushLog 目前只记 channel/watchers，需要能记录载荷或至少有办法看到发了什么）。禁止再靠「我认为形状对」。",
+      "status": "done",
+      "id": 53
+    },
+    {
+      "title": "缺陷20：goal mode 能发出 prompt，但手机 UI 不显示 goal",
+      "detail": "用户真机报告：goal 功能可用（prompt 能发出、agent 在跑），但手机上看不到 goal 卡片。需核实两侧：手机何时调用 maker:goal:get-status、期望的字段名（status/objective/maxTurns/turnsUsed… 或嵌套形状）、以及它是否只靠推送 maker:goal:status-changed 更新卡片。我们目前推 status-changed 时带的载荷形状也未对照过手机消费端。",
+      "status": "done",
+      "id": 54
+    },
+    {
+      "title": "缺陷21：下拉加载更多消息仍不正确工作",
+      "detail": "用户真机报告（第二次）：加载更多消息还是不对。需读手机端 history 分页的真实调用点：走哪个 channel（local-db:messages:list / history:messages / messages:view / messages:around）、游标字段名与方向（before/after/limit）、以及它是按「行」还是按「消息」计数。我们实现了 messages:list + before 时间戳游标 + pageRows 边界组补齐，但从未确认手机真的走这条路。",
+      "status": "done",
+      "id": 55
+    },
+    {
+      "title": "缺陷22：系统 prompt / 注入内容当普通消息显示在手机转录里",
+      "detail": "用户真机报告：系统 prompt / 注入内容被当成普通消息发到手机转录里（点名：启动注入、goal 工具注入）。要求：要么不显示，要么像 DSH 一样用工具/特殊卡片显示。待做：(1) 从真机会话日志取证，列出这些注入消息的 role 与 source.kind（DSH 的 Message.source 区分 user/system/command/goal 等）以及对手机可见的文本；(2) 在折叠层（dsh-message-fold.js / cindy-message-row.js）按 source 过滤或映射成手机认识的卡片（system/tool），对齐 DSH Web 的呈现；(3) 加单测锁住规则。注意：这类消息也会走 local-db:messages:created 实时推送，过滤必须同时覆盖实时折叠与历史读取两条路径。",
+      "status": "done",
+      "id": 56
+    },
+    {
+      "title": "缺陷23：刷新失败即删除登录态 → 网络抖动/双实例竞争把用户登出",
+      "detail": "今天真机登录态（Windows 凭据管理器 'DSH Cindy Host'/'session-v1'）被删除，host 报「本机还没有 Cindy 登录态」、relay 断开。两个成因（都已修）：(1) src/auth-session.js 的 restoreSession 在任何 refresh 失败时直接 clearSession()，而 cindy-login-flow.js 的 refreshStoredSession 把**所有**异常（超时/DNS/5xx）都归为「登录态已过期」——网络抖一次就把可用凭据永久删掉；现在区分『服务明确拒绝』（400/401/403 → 清凭据）与『服务不可达』（网络/5xx/429 → 保留凭据并用旧 token 尝试），cindyRequest 现在携带 status 或 transport:true。(2) 同一份凭据被两个 host 实例同时刷新（我在 3081 反复重启，另有一个非我启动的实例在 3082）——refresh token 轮换会互相作废。运维要求：一份凭据只跑一个实例。待用户操作：需要在 DSH Web 的「Cindy 手机连接」设置页重新登录（手机号/邮箱 + 验证码）；本机无法自动恢复（凭据已不在凭据管理器）。",
+      "status": "done",
+      "id": 57
+    },
+    {
+      "title": "对齐可判定化：channel 审计工具（npm run audit:channels）+ 21 个未分类通道逐条判定",
+      "detail": "本轮追加：`maker:regenerate-title` 从「阻塞在 API」变成**已服务**——那个 API 存在，只是要读 DSH 自己的服务而不是猜：`ctx.sessionTitle.refresh(session, signal?)`（SessionTitleService，“Explicitly retry the registered provider, or materialize the built-in fallback”）。手机契约（从 mobileMakerTransport 注释与类型核实）：`regenerateSessionTitle(sessionId) → { title: string | null }`，**只生成不落库**（持久化仍走 local-db:sessions:patch-meta），失败/无素材即 title=null；参数是 `[{sessionId}]` 对象而不是裸字符串（与其它通道不同，容易接错），且该通道在手机超时表里（30s，注释写预算约 22s）。实现：seam 新增 regenerateTitle（活会话 → refresh；冷会话 → {title:null}，**不 resume**，与 goal/context 读侧同一规则），通道 maker:regenerate-title 已加入 SUPPORTED_CHANNELS（served 41→42、declined 58、未分类仍 0），审计工具里那条候选已删。真机：冷会话 131ms → {title:null}；先让它变 live（set-plan-mode 触发 resolveAgent，不烧 token）后 → 717ms → {title:\"Acceptance probe one-word reply\"}；坏参 → BAD_REQUEST。新增通道测试（有标题/无标题/无服务/provider 抛错/坏参），329→330 全绿。",
+      "status": "done",
+      "id": 58
+    },
+    {
+      "title": "缺陷24：maker:list-agent-skills 恒空成功 —— 读取未带 viewing scope",
+      "detail": "现象：Host 的 skill 根目录有真实 skill，`/` 命令列表有 6 条，但 skill 面板永远空，且 ok=true（不是拒绝）。\n\n根因（dsh-skill 契约）：SkillViewOptions.scope 注释为「Viewing scope (the calling agent); omitted reads the global layer alone」。skill provider 的层由**注册时的 ctx**决定：host/repository 行进 global 层，agent preset 的 standing mount（standard/cordis 的 skill-filesystem + tool-skill）注册进该 preset 自己的层。因此从 Host 自身 ctx 读取只会读 global 层 —— 那里本来就 0 条，答案是「诚实的错」。\n\n第一次尝试（错误）：用 `scopeOf(agent.ctx)` 当 scope，临时探针打印 `live=true scope=false` —— agent 的 ctx 不带 scope tag。\n\n权威依据：DSH 自己的 skill 工具两处都传 `scope: agent`（dsh-tool-skill lib/index.js:143 与 :177/:210），scope key 就是 agent 对象本身。\n\n修复：cindy-channels 把已有的 sessionId 传给 palette.skills（之前被丢掉），dsh-plugin 用 `liveAgentFor(sessionId)`（= ctx.agents.get，**只取活 agent，绝不 resume**）作为 scope 传给 skills.list({scope, cwd})。\n\n实测（production 代码，重启后）：live 会话 → scoped=6 global=0（claw-kit-doc/grilling/hatch-pet/ingame-testing/recheck/veewo-ai-share，来自共享 agents root）；无 sessionId → 0/0；未知/冷会话 → 0 且 ok=true（空成功，不是拒绝，控制器才不会当成 composer 坏了）。临时在 <dshHome>/skills 加一个 SKILL.md 会变成第 7 条，删除后消失（已清理）。\n\n测试：test/cindy-channels.test.js 新增「asks the palette for one session's skills, not for the global layer」钉住 sessionId 转发契约；332 单测全绿；文档 doc/cindy-phone-link.md 新增「Skills are read for the session's scope, and the scope key is the agent」一节。",
+      "status": "done",
+      "id": 59
+    },
+    {
+      "title": "缺陷25：技能目录注入仍作为 user 消息上屏 —— 消息来源黑名单漏了 skill-catalog",
+      "detail": "现象（用户）：修掉 system prompt 之后，「好像少了一条，但是还有 system reminder，还有 available skills」——手机转录里仍有一条 user 气泡，内容是 `<system-reminder> … <available_skills> … </available_skills> …`。\n\n根因（有权威依据，不是猜）：上一版按 `source.kind === 'plugin'` 做**黑名单**，而 DSH 的技能目录是另一种 kind：`@deepseek-ai/dsh-tool-skill`（lib/index.js:255）用 `createUserMessage({ content:[…], source:{ kind:'skill-catalog', form:'catalog', entries } })` 发出，替换目录时再加 `update:true`。所以它是 **user 角色**、**不是 plugin**，黑名单漏掉它。\n\nDSH 自己的文档也早说了这件事：`dsh-session` known-event-types 里 `user/message` 一条能承载三种生产者（人类 prompt、插件通知、goal round 注入），「All three project their `content` verbatim; `source` tells them apart」——角色永远不够，黑名单也不够。\n\n修复：改成**白名单**。`RENDERABLE_SOURCE_KINDS = { user, model, tool }` —— 只渲染参与者自己产生的东西（人类 / 模型 / 工具结果），其余具名 kind 一律是 producer-supplied context，属于模型的请求而不属于对话。source 缺失时仍渲染：DSH 要求每条消息都带 source，缺失说明这是本 Host 不认识的新形状，而「把用户自己的话藏掉」是更坏的失败。\n\n实测验证（用户真实会话 588c7fe7「哈喽问候对话」）：\n- 修复前 `local-db:messages:list` 最新页 = 3 行：assistant 回复 / **user（available_skills 注入）** / user「哈喽」；\n- 修复后同一页 = **2 行**：assistant 回复 / user「哈喽」，注入行消失（扫描 `available_skills|system-reminder|Current runtime context` 无匹配）。\n\n测试：test/cindy-message-row.test.js 新增两条（首目录 catalog 与 `update:true` 的替换目录都必须零行），该文件 20/20、整套 332/332 绿；audit exit 0。\n\n附带：给 `maker:list-agent-skills` / `maker:list-agent-commands` 的 invoke 日志补上 `ask`（agentKind + sessionId + cwd）与 `items`（信封里的条数）并纳入 preview —— 手机 `/` 面板「只有 command 没有 skill」这件事需要先确定它到底有没有带 sessionId 才能判。",
+      "status": "done",
+      "id": 60
+    },
+    {
+      "title": "缺陷26：skill 面板在冷会话与新任务下为空 —— viewing scope 需区分活 agent / 冷会话 / 无会话",
+      "detail": "现象（用户）：手机 `/` 面板「只有 agent command，还没有 skill」。\n\n两个不同的洞，都已修并量化验证：\n\n【洞 1：冷会话】上一版把 scope 限定为「只取活 agent，绝不 resume」。但旁边那个 command 列表走的是 `resolveAgent`（会 resume），于是同一个会话、同一次点开面板，两边答案不一致。实测：\n```\nmaker:list-agent-skills   → 0     (只查活 agent)\nmaker:list-agent-commands → 6     (resolveAgent，正是它把会话变活)\nmaker:list-agent-skills   → 6     (同一会话，已活)\n```\nHost 每次重启都会让所有会话变冷 —— 这不是边缘情况，而是「手机刚打开的会话」的常态。修：scope 走与 command 列表同一条规则（活 agent → resume）。\n\n【洞 2：新任务无 session】`app/sessions/new.tsx:1960` 调 skills 时只传 `workingDir`（没 session），而 `[sessionId].tsx:10061` 传了。对无 session 的请求，诚实的答案是「新会话会得到什么」：`ctx.agentPresets.standingKeyFor()` —— DSH 文档写明这是「给没有 agent 的 host reader 用……确保 mount 会组合插件但不启动 agent、不启动 session、不启动 turn」。具名但无法解析的会话仍答空：给一个本 Host 看不见的会话编造默认 composition 的 skill 是伪造声明。\n\n最终三条路径实测（production 代码，重启后）：\n- 冷会话 → **6**（修前 0）\n- 无 session（新任务）→ **6**（修前 0）\n- 未知会话 → **0 且 ok=true**（空成功，不是拒绝）\n\n测试 332/332 绿；文档 doc/cindy-phone-link.md 新增「The same menu, three different requests」小节。",
+      "status": "done",
+      "id": 61
+    },
+    {
+      "title": "缺陷27：审批/提问卡从未到达手机 —— 两条 answerer waterfall 需要 prepend + global",
+      "detail": "现象（用户 #5 审批链路，属于五大范围内块之一）：手机从未看到任何审批卡或提问卡。Host 一直在监听 `approval/request` 与 `user-questions/request`，但监听器从未被调用。\n\n诊断过程（两个独立原因，都在 Host 自己的诊断里看不见）：\n\n【因 1：dispatch 是 agent 作用域的】DSH 通过 `scopeTarget(agent, agent)` 触发这两条 waterfall，而 Cordis 只在监听器是 global / 未打 tag / tag 是 dispatch key 或其祖先时才准入：`filter((hook) => hook.global || !filter || filter.call(thisArg, hook.ctx))`（cordis EventsService.dispatch）。host 平面的观察者一条都不沾，直接被筛掉。修：`{ global: true }`。\n\n【因 2：Web bundle 先占住了链路】`@deepseek-ai/dsh-api-remotes` 在同一事件上注册了自己的监听器，把请求转发给浏览器客户端，并且持有一个 `Promise.withResolvers()` **不调 next()**（`forwardWaterfall`）。waterfall 是链：注册在它后面的监听器永远拿不到 turn——工具就一直挂着。修：`{ prepend: true }`，让有 Cindy 控制端观看时我们先答，没人看时 `next()` 原封不动交回浏览器链路。\n\n实测（production 代码、全新会话、已订阅的控制端）：\n- 修前：`ask_user_question` → session 永久 running、`maker:get-pending-interactions` 恒 []、无 push。\n- 修后（提问）：3 秒出卡 `{kind:'ask_user_question', requestId:'dsh-question-1', questions:[...]}`；`maker:resolve-interaction {kind:'ask_user_question', answers:{'Which colour?':'blue'}}` → `accepted:true`，pending 0，tool result `{\"answers\":[{\"id\":\"colour\",\"selected\":[\"blue\"]}]}`，agent 继续「You picked **blue**.」。\n- 修后（审批）：3 秒出卡 `{kind:'permission', requestId:'dsh-approval-2', toolName:'write', reason:'escalate sandbox to danger-full-access: …'}`；deny → accepted，pending 0，tool result `isError=True: the user rejected escalating this operation to \"danger-full-access\"`，agent 停止且**未在工作区外写文件**。\n\n防回归：`test/dsh-plugin.test.js` 新增「both answerer waterfalls register prepended and global」，通过插件真实的 `apply` 断言两个监听器都带 `{prepend:true, global:true}`（ctx double 现在记录注册选项）；333 单测全绿。文档 doc/cindy-phone-link.md 新增专节。\n\n注：过程中一度出现「ask_user_question 被 interrupted」的现象，后证实是**我自己反复重启 host** 打断pending 工具调用产生的 DSH 修复占位（`interruptedTurnClosers`），不是产品缺陷；模型因此拒绝了第 5 次重试，于是改用全新会话验证。",
+      "status": "done",
+      "id": 62
+    },
+    {
+      "title": "缺陷28：控制端离开会话后提出的问题永远不可答（且会话卡死）—— “当下在看” ≠ “属于手机”",
+      "detail": "现象（我自己发现的，用户尚未报）：控制端离开一个会话（unsubscribe 该 session topic）后，agent 才提出问题 —— 卡片永远不出现，且会话永久卡住。\n\n根因：answerer 只在「当下有人订阅」时才 claim（`watchersFor(sessionId) > 0`），其余一律 `next()` 交给链路下游——而下游是 Web bundle 的 `dsh-api-remotes` 远程转发器，它持有一个 promise 等浏览器回答（因此不调 next）。于是“离开会话”这个动作把卡片从手机手里拿走了。\n\n实测（修前，真实会话）：attach → unsubscribe → agent 提问：\n- pending while unwatched = 0\n- pending after re-subscribing = 0  ← 卡片对手机永久消失\n- session running = true（永久）\n\n修：区分「当下在被观看」与「属于手机」。新增 `remoteOwnedSessions`（本进程中曾被控制端 attach 过的会话），`claimsInteraction(sessionId)` = 当前有 watcher **或** 曾被 attach。从未被 attach 的会话仍归桌面 UI（不抢桌面能答的问题）。卡片在不被观看时仍可由 `maker:get-pending-interactions` 发现并回答。\n\n实测（修后）：attach → unsubscribe（watchers 空）→ 提问 → **3 秒出卡** `kind=ask_user_question id=dsh-question-1`；`maker:resolve-interaction {kind:'ask_user_question', answers:{'Pick one':'A'}}` → accepted → agent 继续「You picked **A**」。\n\n同时修正卡片预算：registry 默认 **120 秒** 太短——手机上卡片没有倒计时、用户可能暂时不在，而被替代的那条链路（浏览器转发）是无限等待，所以短超时严格差于参考实现。改为 **30 分钟**，`maker:input:stop` 可立即 settle 卡片作为逃生口。\n\n测试：test/host.test.js 新增「a session the controller attached to keeps its cards answerable after it looks away」（涵盖两个半边：从未 attach 的会话仍返回 null；attach 后离开的会话仍能列出并回答）；334 单测全绿；audit exit 0。文档 doc/cindy-phone-link.md 新增「“Watching” is not “belongs to the phone”」专节。\n\n顺带：本轮重启时把之前留下的 3 个探测会话真正删了（列表现在只剩 4 个正常会话）；本轮验证又新建 1 个（已命名为「探测会话（可删）」）。",
+      "status": "done",
+      "id": 63
+    },
+    {
+      "title": "验证：四个会话控件（model / effort / permission / plan）端到端 + 冷会话 resolve 延迟",
+      "detail": "对手机 `/` 与模型/effort/permission 选择器背后的四个 setter 做了一轮端到端实测（走控制器实际调的 channel，每次都回读会话行）：\n\n| channel | 变更 | 回读结果 |\n|---|---|---|\n| `maker:set-model` | deepseek-flash → deepseek-v4-pro | row.model 已更新 |\n| `maker:set-effort` | low / max / off / high | 每次 row.effort 都更新 |\n| `maker:set-permission-mode` | workspace-write → read-only | row.permissionMode 已更新 |\n| `maker:set-plan-mode` | on / off | accepted，且幂等（「Plan mode is already inactive.」）|\n\n四个在 **turn 运行中** 也都被接受（不回退、不报错）。\n\n能力目录（选择器据此绘制）实读：availableModels 4 个（每个带 efforts/effortDisplayNames/defaultEffort）、effortLevels=off/low/high/max、permissionModes=read-only/workspace-write/danger-full-access、planMode.supported=true、hasFastMode=false。\n\n审计把 set-plan-mode / set-permission-mode 归入「无手机侧超时覆盖的慢通道」，但它们之所以可能慢只是因为路径里会 resolve（必要时 resume）agent；在一个自 Host 启动后从未碰过的冷会话上实测：**135ms**（热 29ms），远低于手机 15s 预算 —— 属于形状警告而非真实延迟风险。\n\n附带一条误报的澄清：本轮的第一次扫描曾把四个 setter 全部报成 BAD_REQUEST，排查后确认是我自己的 PowerShell 探针脚本把一个参数命名为 `$args`（PowerShell 自动变量）导致 sessionId 根本没传进去；直接调用时四个全部成功，Host 无缺陷。日志里保留的 BAD_REQUEST 属于该误报。\n\n文档 doc/cindy-phone-link.md 新增「What the session controls cost, measured」小节（含上述数字与“回读需要 2 秒而非 700ms”的观察）。测试 334/334 绿。",
+      "status": "done",
+      "id": 64
+    },
+    {
+      "title": "可观测性与护栏：invokeTotals（单调调用计数）+ acceptance 覆盖报告与 file-browser/控件检查",
+      "detail": "问题：`recentInvokes` 是 40 条环形缓冲，控制器一拉列表几秒内就把它刷掉，于是「手机到底有没有调过这个 channel」无法回答——而这正是区分「功能被验证过」与「只是写了」的唯一问题。\n\n改动：\n1. host.js 新增单调计数 `invokeTotals` / `refusalTotals`（每一道被服务的 channel 都计数，不管成功还是拒绝），经 `getInvokeTotals()` / `getRefusalTotals()` 暴露，/status 的 diagnostics 输出。这与 push 方向已有的 `pushTotals` 是同一条理由。\n2. test/host.test.js 新增「invoke totals are monotonic…」：同一 channel 连发 62 次后计数=62，而 ring 依然小于 62（证明单调与有界是两件事）。\n3. tools/acceptance.mjs：\n   - 新增覆盖报告（在结尾重新取一次 status，否则报的是上一轮的结果）：`channel coverage: 34/47 served channels exercised` + 从未被调用的清单；\n   - 新增一组便宜的检查：`local-db:sessions:patch-meta`（写回原 title，无副作用）、`file-browser:remote-op` 的 caps / listDir / searchCollect / readFile / thumbnail，以及 `maker:list-agent-skills`、`list-agent-commands`、`list-desktop-commands`、`scan-at-resources`、`get-pending-interactions`、`get-context-usage`、`regenerate-title`、`set-permission-mode`/`set-effort`/`set-model`（记录旧值→改→回读行→还原）、`set-plan-mode` on/off。\n\n顺带发现并修正的契约细节：file-browser 的参数名是 **`workdir`**（不是其他 channel 用的 `workingDir`），且 `caps` 也要带 workdir —— 否则整个通道回 `{ok:false,message:'invalid remote-op args'}`。我第一版检查就是用错了字段名，于是每一个 op 都只回 47B；对照手机源码确认：`caps: (workdir) => call('file-browser:remote-op', [{ op: 'caps', workdir }])`，手机总是带 workdir，因此不是产品缺陷，是文档里那句“caps 无需 workdir”的描述不准。\n\n结果：`npm run acceptance` 从 35 项升到 **60/60 全过**，覆盖 **34/47**；file-browser 一个家族（caps/listDir/searchCollect/readFile/thumbnail）从此有永久护栏（listDir 12 条、searchCollect 35 个匹配、thumbnail 明确回 THUMB_UNSUPPORTED）。单测 335/335 绿。\n\n剩下 13 个未被调用的 channel 全是队列变更与需要真实 agent turn 的路径（enqueue/steer/move/remove/update-*/set-*-lock/clear-session/stop/send/resolve-interaction），`--with-prompts` 会跑到其中一部分；报告故意只打印不断言（有些只能由手机点出来，断言会逼着人把报告删掉而不是读它）。",
+      "status": "done",
+      "id": 65
+    },
+    {
+      "title": "全覆盖：acceptance --with-prompts 驱动全部队列变更与交互回路 —— 47/47 已服务 channel 端到端跑过",
+      "detail": "上一轮新增的覆盖报告立刻暴露了一件事：队列变更家族（move / remove / resume / set-edit-lock / set-interaction-lock / steer / update-content / update-text）**几乎从未被自动化跑过**——旧的 prompt 阶段是「先等 turn 结束、再 enqueue」，而空闲 agent 会直接 admit，于是每次都打 `SKIP queue mutations`。而这正是历史上缺陷最密集的一族（取消报 NOT_FOUND、编辑落到错误的行、steer 进一个从未开始的 turn）。\n\n本轮把 prompt 阶段改写成真正造出队列：先发一个慢 turn（让 agent `Start-Sleep -Seconds 12`），在它运行中再 enqueue 两个条目，并断言不变式 `items enqueued during a turn stay pending`（实测证据：`acc-slow…, acc-a…, acc-b…`），然后逐个驱动全部队列变更（late admission 导致的 NOT_FOUND 可接受，静默成功不可接受）。\n\n最后补上完整交互回路：`maker:send` 要求 agent 提一个问题 → 从 `maker:get-pending-interactions` 读到卡 → 用问题**文本**作答（`{kind:'ask_user_question', answers:{'Acceptance colour?':'red'}}`）→ 断言 `accepted:true` 且卡片从 pending 列表消失。模型若本轮没提问则打印响亮的 SKIP（不静默放行——静默正是这条路径当初一直坏着的原因）。\n\n结果（`npm run acceptance -- --with-prompts`，全新 Host 也能达到）：\n```\nchannel coverage: 47/47 served channels exercised\n83/83 checks passed\n```\n即：本 Host 服务的**每一个** channel，都已被一次可重复的运行端到端试过——不是「分类为已实现」，而是**跑过**。（默认不带 prompts 的运行 60/60；带 prompts 会跑真实 agent turn，所以默认关闭。）\n\n同时验证：335 单测全绿；`npm run audit:channels` 为 42 served / 58 declined / **unclassified 0**，exit 0。文档 doc/cindy-phone-link.md 补充了队列阶段与交互回路两段。",
+      "status": "done",
+      "id": 66
+    },
+    {
+      "title": "push 侧覆盖：把「本 Host 会发哪些 push」收为单一权威清单 + acceptance 报 9/9",
+      "detail": "目标里写的是「全量对齐 invoke/**push** channel」——上一轮把 invoke 侧做到 47/47，但 push 侧只有审计的分类（9 个已发送 / 0 未分类），没有「一轮跑下来到底真正发出去了哪些」的证据。\n\n问题：能发哪 9 个 push channel 的清单当时只存在于 `tools/channel-audit.mjs` 自己的常量里，acceptance 拿不到，第二份拷贝又会漂移——而且漂移是静默的：往 Host 里加了 push、忘了改其中一个工具，那个 channel 就不再被审计。\n\n改动：\n1. 新增 `src/host-push-channels.js`，把「本 Host 会发哪些 push + 各自由哪个函数发出」作为唯一权威清单放进 src；audit 改为 import 它（删掉本地副本），acceptance 也 import 它。\n2. acceptance 新增 push 覆盖报告，读 Host 的单调 `pushTotals`（与 invoke 侧同一个理由：环形日志会被刷掉，单调计数不会）。\n\n实测（`npm run acceptance -- --with-prompts`）：\n```\nchannel coverage: 47/47 served channels exercised\npush coverage: 9/9 push channels sent\n83/83 checks passed\n```\n默认（不带 prompts）也是 47/47 + 9/9 + 60/60。\n\n即：这个 Host **能服务的每一个 channel、能发出的每一个 push**，都已被一次可重复的运行端到端跑过。push 侧 9 个：maker:event / local-db:messages:created / maker:input:projection / maker:goal:status-changed / maker:interaction-request / maker:interaction-dismissed / local-db:sessions:created / local-db:sessions:patched / local-db:sessions:activity。\n\n同样复核：335 单测全绿；audit 仍为 42 served / 58 declined / unclassified 0、exit 0（改成 import 后分类结果不变，“this Host sends: 9”）。文档补充 push 覆盖与「清单为何只留一份」。",
+      "status": "done",
+      "id": 67
+    },
+    {
+      "title": "冷启动验证：零计数下重跑全量覆盖（47/47 + 9/9 + 83/83）",
+      "detail": "之前所有验证都是在「已经跑了很久、计数器已有累积、会话已热」的 Host 上做的（coverage 是从不归零的单调总数读的），因此有一个真实的盲区：**冷启动**。上一轮的 skills 缺陷恰恰就藏在冷会话路径里，所以这一轮做了真正的冷启动验证。\n\n做法：停掉 Host → 删除残留探测会话 → 重开（计数器归零、所有会话为冷）→ 跑 `npm run acceptance -- --with-prompts`。\n\n结果（全新进程、零计数）：\n```\nchannel coverage: 47/47 served channels exercised\npush coverage:    9/9  push channels sent\n83/83 checks passed\n```\n无 FAIL、无 SKIP（即交互回路本轮真的跑到了：maker:send → 卡片出现 → 按问题文本作答 → accepted → 卡片从 pending 消失）。\n\n附带复核（跑完之后）：relay `connected` / host `online` / `authenticated`，`deviceId=<host-device>` 保持不变（**手机无需重新配对**）；pushTotals 从零开始集齐全部 9 个 push；手机看到的会话列表干净（4 个正常会话，我造的探测会话已删）。\n\n这一轮的意义：把「能服务的每个 channel、能发出的每个 push」的证据从「长期运行实例上的累积」升级为「冷启动即成立」，排除了状态依赖。",
+      "status": "done",
+      "id": 68
+    },
+    {
+      "title": "交接收尾：acceptance 双跑无状态泄漏 + 新增 `npm run verify` 单一验证入口",
+      "detail": "本轮做了两件收尾性质、但在交接前必须确认的事。\n\n【1】验收套件的状态脆性检查：现在所有「已验证」的结论都建立在 acceptance 上，如果它第二次跑就失败，那些证据就不成立。连续跑两次（同一 Host、不重启）：两次都是 `coverage=47/47 push=9/9 60/60 checks passed FAILs=0` —— 无状态泄漏。\n\n【2】新增单一交接入口 `npm run verify`（=`npm test && npm run audit:channels && npm run acceptance`），实跑 exit=0，输出：\n```\nℹ tests 335 / pass 335\n  unclassified: 0\nchannel coverage: 47/47 served channels exercised\npush coverage:    9/9  push channels sent\n60/60 checks passed / acceptance passed\n```\n文档「The assembled Host, not the unit tests」一节改写为「每个命令回答什么问题」的表（单测=隔离下的形状与守卫；audit=手机点名的每个 channel 要么已服务要么**有记录的理由**拒绝；acceptance=组装后的 Host 真的在手机用的那条路由上服务它们，且声明会发的每个 push 真的发出），并说明 `--with-prompts` 为什么默认关闭（会跑真实模型调用，但它是 34/47 → 47/47 的关键），以及交接前应看 /status 的哪几项（state/host.online/login.authenticated/**deviceId**，最后一个决定手机要不要重新配对）。\n\n两轮测试、audit、acceptance 均绿；计划 65/68，剩下三项均需你（#11 真机、#12 第二句重现、#50 attachment 范围）。",
+      "status": "done",
+      "id": 69
+    },
+    {
+      "title": "核实：/reconnect 路由、status.message 语义澄清、文档数字一致性",
+      "detail": "【1】设置页 API 路由覆盖：`POST /api/dsh-cindy-host/reconnect` 此前从未被跑过（怕它有副作用所以一直没碰）。实测安全且幂等：返回 200 `{ok:true,status:{...}}`，state 保持 `connected`，`deviceId=<host-device>…` 不变，三个已链设备均保留。仍未跑的是 `/logout`（会删凭据、需你重新登录），故意不测。\n\n【2】一个看似异常的字段被查清：/reconnect 的回包里 `state=connected`（已连接）但 `message=\"target device offline\"`。追到 `host.js:979`：收到 relay-error 且非 VERSION_MISMATCH 时，Host 保留当前 state、只把 relay 的原文挂为 message（`host.test.js:191` 就是钉这件事的测试）。含义是「本 Host 连着，但某个 push 目标离线」—— 当时确实如此（你的手机 <phone> 自 03:53 离线，所以发给它的 push 没有活连接）。属于有意设计，不是缺陷。\n\n【3】顺手发现了一个事实：现在轮询的活跃控制端是两个 Win32 客户端（`YOP` / `<desktop-b>`，均 online），而手机 <phone> 是 offline —— 所以你最近测的应该是桌面控制端，不是手机。（两者走同一套 channel，验证结论不变。）\n\n【4】文档一致性审查（文档本身也是交付物）：对照今天的 audit 实跑修正了过时数字（`served: 40 / declined: 60` → **42 / 58**，并注明 served 会随新增 channel 变动、唯一不能变的是 unclassified=0），并给某处未标注的示例输出加上“before the queue phase existed”前缀，避免被读成当前状态。其余数字（47/47、9/9、21 channels、two minutes 作为「已纠正的错误」引用）均已核对无误。\n\n未发现产品缺陷；本轮全是核实与文档准确性。",
+      "status": "done",
+      "id": 70
+    },
+    {
+      "title": "全量对齐（桌面侧）：audit 改读 device-link 共享白名单，192 个可命名 channel 全部有判定；并实现看门狗通道 maker:session-in-turn",
+      "detail": "发现一个真实盲区：audit 一直只读**手机**的 `call()` 字面量，但真正决定一个帧能不能过线的，是 device-link 自己的共享白名单 `packages/device-link/src/allowlist.ts`（`REMOTE_INVOKE_ALLOWLIST`）—— 而且你实际在用的控制端是**桌面客户端**。只读手机源码让好几个家族（`maker:worker:*`、`maker:team:*`、`git-context:*`、`maker:agent:*`、`maker:memory:*` …）完全不在视野里。\n\n【改法】audit 新增读取共享白名单（只取 CORE/EXTENDED 两个数组 + `DL_*_CHANNEL` 常量 + 显式项；故意不读 `PUSH_FORWARD_ALLOWLIST`，那是 push 侧、由 push 分类负责），与手机带名并集后逐条分类。\n\n【结果】口径从「手机点名的 ~100 个」扩到「**任何控制端可命名的 192 个**」，暴露出 **67 个没人定过的 channel**。逐条判定后：\n```\nchannels a controller may name: 192\n  served:      48\n  declined:    144\n  unclassified: 0        （exit 0）\n```\n拒绝理由里值得点名的几条：`maker:steer`/`maker:abort-session` = 我们已服务的 `maker:input:steer`/`maker:input:stop` 的同义名（无人调用）；`maker:generate-title` = 新草稿标题路径（会话标题走我们已服务的 `maker:regenerate-title`）；`maker:agent:*` = 被控桌面的 CLI agent 运行时（DSH 是进程内 agent）。\n\n【其中一个值得**实现**而非拒绝】`maker:session-in-turn`：桌面把它当 **stall 看门狗**用（`isSessionTurnRunningFor`）：「Generating 看着卡住且久未收到 push 时，核实被控端是不是还在跑；**只有 false 才可以安全收尾**，绝不误杀真的在跑的慢 turn」。它回一个 boolean，且必须读**源**而不是我们的缓存 —— 丢了 push 正是它要探测的情况，而缓存就是由那些 push 喂的。实现后实测：turn 运行中 `true`，turn 结束后转 `false`（会话行的 running 同时翻转），未知会话回 `false` 而非错误帧，缺 id 回 BAD_REQUEST。\n\n随之：SUPPORTED_CHANNELS 48；新增单测（源优先于缓存、未知会话回 boolean、缺 id BAD_REQUEST）；acceptance 新增 `maker:session-in-turn` 检查。\n\n【全部复核】`npm run verify` exit 0：336 单测、audit 192/48/144/0、acceptance 62/62；`--with-prompts` 为 **48/48 + 9/9 + 85/85**。文档更新了 audit 口径、新增「stall 看门狗」一段与五个「为何不服务」的实例表。",
+      "status": "done",
+      "id": 71
+    },
+    {
+      "title": "把「被拒但有人调」变成扫描：桌面调用点入 audit，输出排序短名单（未发现新缺口，修正一条理由）",
+      "detail": "上一轮的看门狗通道（`maker:session-in-turn`）是**手动**发现的：我逐个去查「这个被拒的 channel 到底有没有人调」。本轮把这件事变成系统性扫描。\n\n【做法】audit 新增：\n1. 除了读手机的 `call('…')`，还扫**桌面 renderer** 的调用点（`t('<channel>')` 表 + `invokeRemote(deviceId, '<channel>'`，共 190 个调用点）；\n2. 新增一段排名报告：「declined, but a controller calls it」——按调用点数量排序。\n\n【为何需要】两种失败的代价不对称：没人碰的拒绝不花成本；**活着的控制端会碰的拒绝就是看得见的坏功能**。排名把「凭直觉找」变成「扫一眼」。\n\n【扫描结果】前几名都是已有合理理由的越界家族：`local-db:messages:around-client-id`(3x，新 history view，拒绝它使控制端改用我们已服务的分页转录)、`maker:message:delete`(3x，日志 append-only)、`local-db:conversations:search`(2x)、`maker:compact-session`(2x，卡在手机侧 15s 预算)、rewind/fork/session-tree/bots/learn 各家族。**没有新发现的范围内缺口**。\n\n【但抓到一个理由写错的】`local-db:sessions:ack-interrupted` / `interrupted-pending` 原来被归入「其他 session 读未实现」—— 实际前者是**写**（用户点掉「本会话被中断」提示），两者共同点是「本 Host 不跟踪这个 attention 标志」（DSH 在 resume 时会自己修复中断的 turn：写入 turn/end 与合成 tool result，二者已可在转录里看到，因此没有可确认的东西）。已拆出专门规则并更正描述（2x 两个 channel）。\n\n【复核】`npm run verify` exit 0：336 单测、audit **192 可命名 / 48 已服务 / 144 已拒且带理由 / unclassified 0**、acceptance 62/62、coverage 48/48 + push 9/9。文档新增「The shortlist that decides what to serve next」小节（含排名示例与「为何两边代价不对称」）。",
+      "status": "done",
+      "id": 72
+    },
+    {
+      "title": "验证拒绝的「另一半」：三条主要拒绝均有客户端已设计的回退路径（写入理由引证）",
+      "detail": "上一轮把「被拒但有人调」变成扫描后，排名第一的家族是 history view（`local-db:messages:view` / `around*` / `history:*`，共 5+ 调用点）。我们的拒绝理由里写的是「拒绝它使得控制端改用本 Host 已服务的分页转录」—— 但这是一个**假设**：客户端真的会因为拒绝而降级吗？本轮去客户端源码里核。\n\n结果：三条主要拒绝都有客户端**已设计的回退路径**，不是我们一厢情愿：\n\n1. history view 家族 → `isHistoryViewUnavailable(error)`（mak er-shared/historyView.ts）**精确匹配** `CHANNEL_NOT_ALLOWED | UNSUPPORTED_CAPABILITY | not registered | No handler`，而我们的拒绝码正是 CHANNEL_NOT_ALLOWED → 分页转录接管 ✓\n2. `maker:provider:list` → `useDeviceProviders`：“仅结构化确认旧端没有 provider:list 时允许 capabilities-only 回退” —— 这也反向解释了缺陷18为何必须**拒绝**而不是回空成功：空目录与「没有模型」不可区分，回空成功等于把客户端本来就有的回退路径抢走。\n3. `sidebar-settings:get-project-order` → `SyncedProjectOrderSnapshot.available === false` 的文档注释：“被控端没有这个接口，控制端应回退到自己的混排”，并且专门发了 `UNAVAILABLE_PROJECT_ORDER_SNAPSHOT`。\n\n改动：把这三条证据写进 audit 的拒绝理由（从「我们相信」升级为「客户端哪行代码处理它」），并在文档新增「A refusal is only as good as the client's handling of it」一节（含三行引证表）。\n\n复核：`npm run verify` exit 0 —— 336 单测、audit 192 可命名 / 48 已服务 / 144 已拒（带理由）/ unclassified 0、acceptance 62/62、coverage 48/48 + push 9/9。无代码行为变更。",
+      "status": "done",
+      "id": 73
+    },
+    {
+      "title": "失败 turn 的交互：查清契约（需尾部 role='error' 行，本 Host 不产出）+ 量化 turn/end reason；并修复 audit candidate 列表恒空",
+      "detail": "把上一轮的方法用到**在范围内**的一类通道上：`maker:input:retry-last-error` / `maker:input:clear-error` / `local-db:messages:dismiss-error` —— 失败 turn 的「重试/忽略」按钮。原来的拒绝理由是句玄学（“retry 在 provider 层，没有可转发的客户端动作”），本轮去客户端源码把它变成事实。\n\n【读出来的真实契约】`CCAgentSessionView.tsx`：「error-tail-banner: 会话尾部停在未忽略的 `role='error'` 行 → 输入框上方显示…」—— 也就是说这个交互**只在转录尾部存在一条未忽略的 `role='error'` 行时才会出现**，而本 Host 的 fold **从不产出这种行** → 按钮根本不会出现。这才是拒绝无害的真正原因。（同时解释了为何不能“先不管”：它不是“按钮坏了”，而是“根本没这个按钮”。）\n\n【量化证据】扫全部会话日志（879 个 zstd frame）统计 `turn/end` 的 reason：`completed` 60 / `aborted` 33 / `interrupted` 6 / `blocked` 1 —— **至今没有任何失败 reason 被产生过**，所以今天也没有可翻译的失败状态。\n\n【记为 candidate 而不是含糊拒绝】要真正实现它需要两半：把失败的 turn 映射成尾部 `role:'error'` 行；retry 则实现为重新发送最后一条 user prompt（若失败 turn 已有输出，则发共享的 continue 指令）。\n\n【顺带修了一个工具 bug】audit 的「decided for now, but serveable — pick one up next」列表**一直是空的**：DECLINED 规则里写的 `candidate:` 字段没有拷进行对象。修复后现在会列出三个候选（`maker:compact-session`、以及这个 retry 对）。\n\n复核：`npm run verify` exit 0 —— 336 单测、audit 192/48/144/0、acceptance 62/62、coverage 48/48 + push 9/9。文档新增「The failed-turn affordance, characterised instead of hand-waved」一节。",
+      "status": "done",
+      "id": 74
+    },
+    {
+      "title": "收尾卫生：acceptance 复位 set-expanded（两种模式），冷启动复核 48/48 + 9/9 + 86/86，探测会话跑完即还原",
+      "detail": "收尾卫生轮。\n\n【1】源码无遗留标记：src/lib/tools 里没有 TODO/FIXME/XXX/HACK（匹配到的都是注释里的“attempt / todo 卡”等普通词）。\n\n【2】发现并修复了一个真残留：acceptance 会恢复它**捕获过**的 model/effort/permission，但 `maker:input:set-expanded` 只置 true、从不复位 —— 于是每跑一次都把探测会话的队列面板永久留在展开态；实测探测会话当时确实是 `permission=read-only, expanded=True`（read-only 是更早一次运行留下的）。修：两种模式（默认与 prompt）都在结束后 `set-expanded(false)`，并写明理由：这是控制端自己的 UI 状态，留成展开会让下一轮的基线就是错的。\n\n【3】验证“跑完即还原”真的成立：冷启动 + `--with-prompts` 跑完后回读探测会话 —— `model=deepseek-flash effort=high permission=workspace-write pending=0 expanded=False running=False`（与基线一致）。\n\n【4】冷启动全量复核：`channel coverage: 48/48` · `push coverage: 9/9` · **86/86 checks**；`npm run verify` **exit 0**（336 单测 · audit 192/48/144/0 · acceptance 63/63）；默认模式连跑两次均 63/63、0 FAIL（无状态脆性）。\n\n无产品行为变更；本轮只改了验收脚本的清理逻辑与文档未涉部分。",
+      "status": "done",
+      "id": 75
+    },
+    {
+      "title": "会话 删除/归档/置顶 的 Host 侧元数据（patch-meta 全字段）",
+      "detail": "实测：三个动作都走同一个 channel `local-db:sessions:patch-meta`（desktop 的 sessionService.patchMeta/setStatus 与手机 useSessionListActions 都是它）。我们的 handler 只应用 title 并返回当前行，status/pinnedAt 被丢弃 → 客户端 `pickWriteFields(updated, fields)` 把乐观改动回滚 → 表现为「点了没反应」。重命名已实测可用（rename → 返回行与 list 重读 title 都更新）。\n\nDSH 本身没有 archived/hidden/pinned 概念，所以按「Host 侧记账」实现，语义要写清：删除=对控制器隐藏，DSH 日志与桌面 Web UI 不动（可逆）；归档=status:'archived'；置顶=pinnedAt。\n\n验收：patch-meta 应用 status/pinnedAt 并持久化（settings section 的 sessionFlags，重启后仍生效）；list/get/list-active 投影这些字段；写后广播 `local-db:sessions:patched` 给列表订阅者与该会话 watcher（一次一份）；单测覆盖三字段 + 恢复 + 持久化；acceptance 加一轮真实帧断言；doc 记录语义与不可逆删除未做。",
+      "status": "done",
+      "id": 76
+    },
+    {
+      "title": "附件落地：按 cindy 账号从 OSS 取件（presign-get）喂给 agent",
+      "detail": "用户报告：手机上发图片一直转圈。根因已定位（真机调用证据 + 代码引证），共三个 Host 侧缺陷：\n\n1. **纯图片无文字被拒**：手机发无配文图片时 text='' （apps/mobile/src/session/inputProjection.ts buildQueuedTextMessage → text: trimmed），而 cindy-channels.js:847 在解析附件之前就回 BAD_REQUEST 'carried no text'。已用用户手机 05:34:29 的真实调用复现（attachments=1 → BAD_REQUEST）。\n2. **scheme 认错**：手机用旧 scheme `xdt-oss-attach://m/<base64url>`（apps/mobile/src/session/attachments.ts:189 调 buildLegacyAttachmentOssRef），而我们的分类器只认 `cindy-oss-attach://` → 诊断误导性地报 form=host-paths。契约（packages/device-link/src/attachmentOssRef.ts）要求两个 scheme 永久兼容，并带 size/sha256 完整性声明。\n3. **没有取件步骤**：hostAttachmentsOf 把任何含 `://` 的 path 丢掉（host-attachments.js:189），即使配了文字图片也会静默消失。\n\n参考实现（同一仓库的桌面被控端）：apps/desktop/src/main/maker-ipc/normalizeAttachments.ts:336（isAttachmentOssRef → parseAttachmentOssRef → downloadToFile(ossKey,dest,integrity) → block.path=临时文件 → 用后删 OSS），下载接口 apps/desktop/src/main/device-link/mediaTransfer.ts:53,574：POST {apiBase}/api/device-link/media/presign-get {key}（同账号鉴权）→ {getUrl} → GET 字节，不经 relay。\n\nDSH 侧已就绪（host-attachments.js 已能把本地文件转成 {type:'image',mediaType,data:base64} 与 {type:'file',receiptId}），缺的只是按 key 取回字节。\n\n验收：单测覆盖两个 scheme 解析（含 base64url、size/sha256 校验、非法引用）、presign-get→GET→校验的完整取件（本地假 HTTP 服务）、超限与完整性不匹配的处理；通道层覆盖「无文字+附件」被接受且附件真的进入 prompt；诊断分类器不再把旧 scheme 报成 host-paths；acceptance 加一条真实帧断言；doc 记录与桌面端一致的语义（含用后删的时机）。",
+      "status": "done",
+      "id": 77
+    },
+    {
+      "title": "图片回显：从 DSH 附件库读回图片字节，让手机气泡直接显示（不再显示「没有可展示的远程路径」）",
+      "detail": "用户报告（功能已确认可用，只剩回显）：图片发送成功后，手机端不显示图片，显示「没有可展示的远程路径」。\n\n**根因已用用户自己的数据 + 客户端源码定位**：\n- 我们给手机的 user 行：`{\"text\":\"\",\"files\":[{\"name\":\"368492.jpg\",\"size\":311456,\"mimeType\":\"image/jpeg\"}]}`（实测抓自 588c7fe7 会话）。\n- 手机 `messageNormalize.ts` 的 `readFileAttachments`：`path = record.path ?? record.url` → 两者都没有 → `{kind:'file', path:undefined}` → `payloadSummary.buildFilePayload(name, '')` → body = `missingRemotePath` = 「没有可展示的远程路径」（`i18n/locales/zh-CN/message.json:261`）。\n- 手机**只在 `images[]` 里渲染图片**：`readImageAttachments` 要求 `uri = url ?? (base64 ? 'data:'+mimeType+';base64,'+base64 : undefined)`，没有 uri 的条目**直接丢弃**。所以图片必须走 `images[]` 且带 url 或 base64。\n\n**为什么一直没有做**：我们原来的注释假设「手机要从 url 或 base64 取图，而我们两者都不提供」。现在不用再依赖 OSS 或媒体通道 —— **DSH 自己就存了归一化后的图片**：`ctx.attachments`（`dsh-attachment` 的 `AttachmentStore`）提供 `readImage(ref, signal) → StoredImageAttachment`（读回并校验字节）。而我们的 fold 已经看得到 `block.attachment` 这个 `ImageAttachmentRef`（`{attachmentId, mediaType, bytes, width, height, name}`），只是把它降级成了 files 条目。注意其注释明确：该 ref 「never a filesystem path or bearer URL」，所以**没有**可回显的路径 —— 唯一正解就是读字节内联。\n\n**验收**：read 路径把用户消息里的 image 附件字节读出来（最多一页内的图，有上限与失败降级）→ 行里发 `images:[{originalName,mimeType,base64}]`；手机归一化后是 `kind:'image'` + `data:` uri + `previewable` → 气泡直接渲染图片；读不到或超大时回退成原来的 files 条目（仍然诚实，不伪造路径）；单测覆盖两个分支 + 有/无 attachments 服务；探针（tools/attachment-probe.mjs）加一条断言：发图后读回的 user 行确实带 images.base64；真机确认气泡显示图片。",
+      "status": "done",
+      "id": 78
+    },
+    {
+      "title": "断线自动重连：按 Cindy 客户端的退避策略重试，不再要求人工点重连",
+      "detail": "用户报告（真机）：先是「没看到 dsh」，随后「打开设置，显示断线了」；要求：需要一个断线重连机制，不应该需要用户手动操作 dsh，并提示「可以看看 cindy 客户端的重连机制，我印象中它从来没有掉线过」。\n\n**根因（活体证据）**：Host 跑了数小时后 relay 心跳丢失，`recoverFromDeadSocket()` 直接 `status.setState('failed', '与 Cindy relay 的心跳已丢失')` 并**停止**（这是当初刻意的设计：不在循环里重连，让卡片提供显式重连按钮）。对一台“被手机控制”的 Host 而言这是静默中断：手机设备列表里没有 DSH，直到有人走到电脑前点重新连接。实测：status route 返回 `state=failed`、`devices=[]`；手动 `POST /reconnect` 后立即 `state=connected`、3 台设备回来。\n\n**参考实现（按用户提示读的 Cindy 客户端）**：`packages/device-link/src/client.ts` —— `reconnectBaseMs: 1000`、`reconnectMaxMs: 30000`、`reconnectStableResetMs: 10000`，延迟 = `min(base*2^attempt, max)` 再乘**向下抖动** 0.7–1.0×；状态词表是 `'stopped' | 'connecting' | 'online'`，普通网络掉线**不产生 failed**（注释写明“UI 已有 connecting 态兜底”）；心跳每 20s 发 ping，miss 上限 3，且**任何入站帧都清零 miss 计数**。\n\n**改法**：新增 `src/host-reconnect.js`（策略常量 + `computeReconnectDelayMs`，含 NaN/越界夹紧）；host.js 增加重连阶梯与三个调度点（socket error / socket close / 心跳僵死）+ 一个以前遗漏的 **`openSocket` 抛错**（开机时网络未就绪就是这个），成功后 10s 稳定期重置阶梯；status 词表新增 `connecting`（正在重连，warn 色），卡片 bundle 同步；心跳改为任意入站帧清零、上限对齐为 3；`/reconnect` 保留为跳过等待的逃生门（重置阶梯）；开关关闭时取消待重连（明确关就是关）；诊断新增 `reconnect: {attempts, pending, lastReason}`。\n\n**验证**：单测 364/364（新增 host-reconnect 3 条曲线/夹紧测试 + host.test 3 条注入定时器的行为测试：关掉的 socket 自己回来、关开关取消重连、openSocket 失败改为重试）；`npm run verify` exit 0（audit unclassified 0、acceptance 73/73）；活体重启后 `state=connected / stateLabel=已连接 / reconnect: {attempts:0,pending:false,lastReason:null}`。**未做真实 relay 掉线注入**（需要切断用户网络），所以「自动恢复」目前由注入定时器的行为测试 + 诊断计数佐证，下次真实抖动会自己证明。",
+      "status": "done",
+      "id": 79
+    },
+    {
+      "title": "正式环境首批问题：subagent 被列入任务 + 列表因折叠全部标题而 12s 超时",
+      "detail": "用户把插件接入正式环境（`C:\\Users\\chany\\.dsh`，profile web）后的第一个真机问题：「已连接，但任务列表一直转圈，显示还没有任务 / 电脑暂时没有回应请求」，然后「有很多个 untilted dsh task」，确认「你把 subagent 也搞过来了，这是错误来的」。\n\n**接入正式环境（已完成）**：走官方通道 `dsh plugin --profile web add \"link:G:/Projects/DSH-cindy-host\"` —— 它同时写依赖与 `dsh.profile.bundles`（我当时以为要手改 bundles，实际不用）。备份了 `package.json.before-cindy-host-20260917-142644.bak`。验证：node_modules 链接指向仓库；模块可导入（name=dsh-cindy-host / inject=[settings] / apply=function）；`dsh --profile web --dump-config` 的组合树里有我们的行。user 重启后正式环境已连通（`.dsh/settings.yaml` 出现我们的 section 且两个开关为 true；Cindy 设备目录里 `<host-device>… name=DSH Veewo online=true`）。\n\n**缺陷 A（subagent 被当成任务）**：正式环境 219 个会话，绝大多数是 subagent 运行（header 里 `origin=subagent`、`delegationDepth=1`），DSH 自己的 Web 列表不显示它们，而我们的 source 忽略了 `origin`/`parentSessionId` → 手机上一堆「Untitled DSH task」。修：在两者共用的唯一入口 `listItems()` 过滤，并同样过滤 `api-session/added` 推送（否则会给控制端推一条它永远打不开的行）。\n\n**缺陷 B（每次列表都折叠全部标题）**：实测 `local-db:sessions:list` 12.0s / 再调 12.7s（219 行）、`maker:list-active` 8.4s、`local-db:sessions:get`（单会话！）8.4s —— 因为 get 也先取整个列表，且标题是从会话日志折叠的（~50ms/个），全在请求内。手机的响应探测通道就是这个 list，默认 15s 超时 → 「没有回应请求」。修：`titleRefreshBudget=16`（一次读取只折叠一批就回答），剩余标题在**回答之后**由单个 in-flight 后台预热按批补齐（下次轮询全命中缓存）；重命名立即失效自己的缓存条目，60s TTL 兼底；`maker:list-active`/`maker:session-in-turn` 改走新的 `listSessionStates()`（同一列表但不折叠标题、不读 header），只为一个 boolean 花 8.4s 是荒谬的。\n\n**验证**：单测 369/369（新增 subagent 过滤与推送过滤、有界折叠+后台预热+缓存命中、一次只一个预热+重命名失效、credential 作用域）；`local-db:sessions:get` 仍需重启后才能复测（旧代码在跑）。**尚未做的**：这三项都要重启正式 DSH 才生效 —— 我没自己重启，因为它就是承载当前对话的进程（杀掉它这一回合就回不了话）。\n\n**顺带完成**：把凭据按 DSH_HOME 作用域隔离（`credentialAccount()`：未设 DSH_HOME = 正式环境，保持旧 account `session-v1` 不动；设了则用 `session-v1@<digest>`）—— 因为 relay 设备身份来自登录凭据（实测 credential.deviceId == <host-device> == 正式列表里每行的 deviceLinkDeviceId），两个实例共用一份凭据就会拿到同一个 deviceId，而 relay 对同 deviceId 只保留一条连接（客户端源码 `4409: 同 deviceId 的新连接顶掉了本连接`），配上我们的自动重连就是 1s 互相顶。沙箱下次启动会找不到凭据 → 在沙箱设置页登录一次 → 拿到自己的设备。\n\n沙箱 Host 已死亡（它是我在旧 DSH 进程里起的子进程，user 重启 3080 时被连带杀掉），所以碰撞窗口已结束。",
+      "status": "done",
+      "id": 80
+    },
+    {
+      "title": "修复消息页超出 device-link 帧上限导致的丢历史/加载更早无响应",
+      "detail": "症状：手机偶尔只剩自己一行、历史消失，重新加载更早也没有响应。根因：Cindy device-link 的 MAX_FRAME_BYTES=2MiB（packages/device-link-protocol/src/protocol.ts:23），被控端必须按参考实现 apps/desktop/src/main/device-link/dispatch.ts:3125 compactInvokeResultForDeviceLink 的三段降级（内容截断→占位内容→裁行并打 agentMeta.remoteRowsTrimmed/remoteOriginalRowCount）把回复压进 2MiB-1024；本 Host 没有任何帧预算处理，且 MAX_INLINE_IMAGE_BYTES=4MiB 单图 base64≈5.3MiB 必然超帧。交付：新增 src/host-frame-budget.js（预算常量+三段降级+client 契约标记），接入 invoke 回复发送路径，按页总预算限制内联图片，超限时不再发出超帧（fail closed 并回结构化错误），补测试。",
+      "status": "done",
+      "id": 81
+    },
+    {
+      "title": "消息分页不再整篇重折：按会话缓存 transcript",
+      "detail": "症状：加载更早消息每次都很慢，本地实测 local-db:messages:list 单次 216ms~2.3s（17MB 会话日志全量 readSession + 全量 fold，与 limit 无关）。交付：createMessageReader 增加按会话的 rows 缓存（LRU 上限），用 session/event 的 seq 连续性做增量追加与失效（缺口/重启/未知 seq 即失效）；dsh-plugin 的 session/event 监听把事件喂给缓存。首次读仍是全量折叠，之后每页 O(page)。补测试并给出改前/改后实测数字。",
+      "status": "done",
+      "id": 82
+    }
+  ],
+  "references": [
+    {
+      "path": "G:\\Projects\\Cindy\\packages\\device-link\\src\\allowlist.ts",
+      "why": "invoke/push channel 权威清单"
+    },
+    {
+      "path": "G:\\Projects\\Cindy\\packages\\device-link\\src\\topics.ts",
+      "why": "topic 路由与 push channel 归属"
+    },
+    {
+      "path": "G:\\Projects\\Cindy\\apps\\desktop\\src\\main\\device-link\\dispatch.ts",
+      "why": "桌面被控端参考实现（170KB）"
+    },
+    {
+      "path": "G:\\Projects\\Cindy\\apps\\mobile\\src\\device-link\\mobileMakerTransport.ts",
+      "why": "手机侧调用的 channel 与参数形状"
+    },
+    {
+      "path": "C:\\Users\\chany\\AppData\\Roaming\\npm\\node_modules\\@deepseek-ai\\dsh\\node_modules\\@deepseek-ai\\dsh-client-ui-settings\\lib\\types\\client\\contract\\slots.d.ts",
+      "why": "settings.section 页面契约"
+    }
+  ],
+  "rules": [
+    "orca 全系列不实现（invoke 与 push 均排除）；被请求时 fail-closed 返回 CHANNEL_NOT_ALLOWED。",
+    "orca 全系列不实现（invoke 与 push 均排除）；被请求时 fail-closed 返回 CHANNEL_NOT_ALLOWED。",
+    "remote-desktop 整族不实现（device-link:remote-desktop:v1 及其 remoteDesktop*/remoteClipboard/remoteCursor/remoteCredentials/ICE 配套）；被请求时 fail-closed 返回 CHANNEL_NOT_ALLOWED。",
+    "orca 全系列不实现（invoke 与 push 均排除）；被请求时 fail-closed 返回 CHANNEL_NOT_ALLOWED。",
+    "remote-desktop 整族不实现（device-link:remote-desktop:v1 及其 remoteDesktop*/remoteClipboard/remoteCursor/remoteCredentials/ICE 配套）；被请求时 fail-closed。",
+    "media 与 voice 暂时不实现（media:fetch / voice:* 及其 presign/OSS/mirror-cache 配套），后续可单独立项；被请求时 fail-closed。",
+    "清单权威来源：Cindy/packages/device-link/src/allowlist.ts 的 REMOTE_INVOKE_ALLOWLIST（含常量引用，统计时必须解析常量而非只数字面量）与 PUSH_FORWARD_ALLOWLIST。",
+    "实现范围仅限：file-browser、基础 agent 信息流、审批、todo、goal。",
+    "范围外一律 fail-closed 返回 CHANNEL_NOT_ALLOWED，不做部分实现。",
+    "清单权威来源：Cindy/packages/device-link/src/allowlist.ts；统计 invoke channel 时必须解析常量引用。"
+  ],
+  "keyDecisions": [
+    "全量对齐桌面被控端（CORE 73 + EXTENDED 110 invoke、PUSH 39）；权威清单取自 Cindy/packages/device-link/src/allowlist.ts。",
+    "设置改为独立设置页 settings.section（id=dsh-cindy-host），取代 settings.plugin-item 卡片。",
+    "当前 Web profile 无 apiProxy，Host 无真实数据源，手机拿到空会话列表；数据源接缝必须先修，否则任何 channel 都是空壳。",
+    "分阶段交付：先设置页+数据源，再核心环路，再分组补齐；未知 channel 保持 fail-closed。",
+    "推送必须按 topic 分类：sessions=列表读模型，session:<id>=单会话流。手机看单个会话时只持有 session:<id>，任何列表级推送都到不了它——turn 终止信号必须走会话级 maker:event。",
+    "队列的写操作全部走 DSH 真实 API：updateQueue({sessionId,itemId,action:{kind:'edit'|'remove'|'steer'}}) 与 cancel({sessionId})；不做本地假实现，除了 controller 自己拥有的 UI 状态（expanded / edit-lock / interaction-lock）。",
+    "队列项有两个身份：controller 铸造的 clientId（=DSH 的 rpcId，用于回执与投影）与 DSH 的 MessageId（updateQueue 的键）。所有提交前必须翻译，tracker 的 dshItemId() 是唯一入口。",
+    "不伪造：DSH 只有一个 goal 上限 maxGoalRounds，controller 的 budgetTokens/noProgressLimit 无对应物 —— 不发送，且状态读取回报 null，让手机面板自己显示「未设置」。",
+    "能力提供者用显式字段构建 + 不变量测试（seam 产出的每个 capability 必须到达 channel 层），杜绝「实现了但没接上」这类盲区。",
+    "探测只用 throwaway 会话，且不再 arm goal（上一轮的 goal driver 在 selftest 会话上真的空转过 turn）。",
+    "未知 ≠ 缺失：未实现的 channel 一律 CHANNEL_NOT_ALLOWED（客户端据此降级为「该设备无此能力」），NOT_AVAILABLE 只表示通道存在但接缝缺失。maker:provider:list 故意不实现，以触发客户端的扁平模型回退。",
+    "一切以 Cindy 客户端源码与协议常量为权威：分页游标是「行 id」不是时间戳；一帧上限 2MiB；被控端裁行必须打 remoteRowsTrimmed/remoteOriginalRowCount；手机图片只认 images[].url|base64。",
+    "被控端必须自己守帧上限与页字节预算：relay 对超限帧是拒收而非截断，客户端会把缺失的回复读成「历史消失 / 加载更早没响应」。",
+    "分页成本与 limit 无关（整篇 readSession + fold），所以按会话缓存 transcript 并用 session/event 的 seq 连续性做增量与失效。",
+    "只为可验证的东西写代码：每个修复都留活体探针（tools/probe-page.mjs、probe-channel.mjs、probe-export.mjs）、验收检查或单测。"
+  ],
+  "retrospective": {
+    "summary": "目标：让 Cindy 手机客户端驱动 DSH（独立设置页 + 真实 DSH 数据源 + 只实现 file-browser / 基础 agent 信息流 / 审批 / todo / goal 五块，其余 channel 一律 fail-closed）。82/82 任务完成，含用户在真机上的确认（「测试通过」「图片可以正常显示了」）。最终活体验证（用户重启 dsh web 后，本机 3080）：node tools/acceptance.mjs --base http://127.0.0.1:3080 --with-prompts → 97/97 checks passed、49/49 已服务 channel 实跑、9/9 push 通道实发、未实现与完全未知 channel 均得 CHANNEL_NOT_ALLOWED；npm test 392/392；npm run audit:channels 49 served / 0 unclassified。\n\n重启后新增并已验证的四件事：(1) device-link 帧预算——镜像 2MiB 上限（relay 直接拒收超帧），消息页按参考实现三段降级（内容截断→丢内联图→整行占位→按消息边界裁行并打 agentMeta.remoteRowsTrimmed/remoteOriginalRowCount），其余 channel 回结构化 PAYLOAD_TOO_LARGE，send() 另有超帧硬拒绝并计数（/status diagnostics.frameBudget）；(2) 按会话 transcript 缓存——每页从整篇 readSession+fold（实测 216ms~2.3s/页）降到 O(page)（最新页 81 行 37ms）；(3) 最新页「行数+字节」双上限（200 行 / 256KiB，按消息边界裁切）——修掉「81 行的会话只给 80 行，第一条消息要再加载一次」；(4) 内联图片预算独立为 1MiB（不再与文本互相挤占）。另：file-browser:remote-op 的 export 对与 device-link:media:fetch 活体验证通过（kitten.png 2.45MB → OSS key；media:fetch 801ms），set-effort 改成「设成已有值是 no-op、模型确实不支持的 effort 回结构化 NOT_AVAILABLE」。",
+    "whatWorked": [
+      "用 selftest 路由在真实 DSH 服务上跑真实通道，比等手机复测快得多：enqueue ack 由空变有、goal 写命令全链路、订阅→推送扇出都是这样定证的。",
+      "把失败证据落到真机转录上：两条逐字节相同的 user 消息证明了重复发送；一条「也可能叫 progress哈喽」证明了草稿未清空导致的输入拼接。",
+      "新增 recentPushes/subscriptions 诊断后，「手机没更新」的两种成因（没人订阅 / 发了被丢弃）第一次可以区分。",
+      "活体探针 + /status diagnostics 把「手机看不到」变成可量化（ask/limit/items/bytes、frameBudget、attachmentReads、recentRefusals、pushTotals）。",
+      "acceptance --with-prompts 作为单一端到端真相（97/97），配合 npm run audit:channels 的 192 通道判定表。",
+      "按客户端源码逐条引证做决定：每个结论都能指到具体文件行（messagePaging.ts 的 20/80 行常量、invokePolicy.ts 的 30s 与 200KB≈18s 实测、protocol.ts 的 2MiB、remoteSessionStore.ts 的 setLatestMessageWindow 规则）。"
+    ],
+    "followUps": [
+      "重启后请用户在手机上复测：插话 / 取消 / 编辑 / 停止 四个动作是否都有响应，草稿是否在发送后清空，回复到了之后「思考中」是否消失。",
+      "缺陷9：goal 读路径（projection 未上报）需另找读取途径，倾向 sessionQuery.observeSession(sessionId,{projectionMode}) 或显式订阅 projection key；在修好之前 goal 卡在手机上不显示。",
+      "仍有被拒但手机在用的通道：maker:usage:model-pricing、maker:api-key:present、maker:schedule:list-sidebar-index-runs、maker:remote-resources:manifest。目前按范围外 fail-closed，若用户体感为「功能缺失」再评估。",
+      "把本轮 6 个缺陷的教训写进 doc/cindy-phone-link.md：push 必须按 topic 分类；能力转发要有不变量测试；跨端 id 必须显式翻译。",
+      "评估并（如值得）实现 local-db:messages:view + view-intent + work-details：把 DSH 的 turn 作为 work 项，让首屏窗口由服务端游标背书，重进会话不再丢历史。",
+      "重启后复测 set-effort：codex 会话恢复默认 effort 应得 no-op 成功、不支持的 effort 应得 NOT_AVAILABLE。",
+      "把本轮新增行为写进 doc/cindy-phone-link.md：帧预算三段降级与 remoteRowsTrimmed 契约、transcript 缓存与失效条件、最新页双上限、内联图片预算、refusalError/refusalCodeOf 拒绝码机制、以及「客户端 20 行页 / 重进丢历史」的成因。",
+      "影像类待改进：thumbnail:true 降采样仍未实现（契约允许 ossKey 形式），media:fetch 也不返回 inlineBase64。"
+    ],
+    "issues": [
+      "claw_run 的 task.done/task.add 只有最小形式 {id} 会落地；带 choice/detail 或 tasks[] 批次时静默 no-op（返回 ok:true 但 plan.json 计数不变，连续三次 task.add 未生效）。",
+      "客户端「重进会话会丢掉之前翻出来的历史」是它自己的规则（setLatestMessageWindow 在满页时丢弃无法确认相接的旧段，sessionWindowCoverage 在会话回收时清空），不是本 Host 的缺陷；参考实现靠 local-db:messages:view 规避。",
+      "手机首屏仍是客户端常量 20 行，长会话仍需多次「加载更早」；本轮把最新页补到 200 行/256KiB 只覆盖了短会话。",
+      "set-effort 的拒绝码分类（NOT_AVAILABLE 而非 THREW）已单测覆盖，但还没在活体上跑过，要等下次重启。"
+    ]
+  },
+  "updatedAt": "2026-09-17T07:53:13.774Z",
+  "summary": "目标：让 DSH Cindy Host 成为与 Cindy 桌面被控端等价的远程控制目标（独立设置页 + 真实 DSH 数据源 + invoke/push 通道对齐）。\n\n【规划现状】已完成 19/24 项。核心路径（设置页、DSH 数据源、会话读模型、发送/中断、审批、todo、file-browser、goal 读写、fail-closed 守卫）已实现；本轮进入真机端到端验收，手机一连上就暴露出 8 个此前被单元测试掩盖的缺陷，已修 7 个。\n\n【本轮最强的一个教训】之前的验证方式本身有漏洞：探针直接调控制器的提取函数（绕过名字门）、测试用 stub 顶替真实装配（掩盖字段名错配）、能力构建了却没人断言它是否转发。三个缺陷因此都「看起来通过了」。现在的做法是让探针/测试走控制器真正的选择分支与真实的装配路径。\n\n【代码现状】245 个测试全绿。本轮新增：turnEventFor（会话级 turn 信号）、10 个队列控制通道、clientId 作为 prompt 身份、queueMirror 本地镜像、capabilityProvider 不变量、推送/订阅诊断（recentPushes / subscriptions）。\n\n【未完成】缺陷9（goal 读路径永远是 null，未修）；#11 端到端验收等用户手机复测；被拒通道中 maker:usage:model-pricing / maker:api-key:present / maker:schedule:* 待评估是否需要。",
+  "completedAt": "2026-09-17T07:53:13.690Z"
+}

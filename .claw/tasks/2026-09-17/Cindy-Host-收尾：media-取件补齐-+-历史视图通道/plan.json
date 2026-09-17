@@ -1,0 +1,76 @@
+{
+  "title": "Cindy Host 收尾：media 取件补齐 + 历史视图通道",
+  "templateId": "default",
+  "status": "end.completed",
+  "goal": {
+    "text": "补齐两个已记录的缺口：(A) device-link:media:fetch 的 thumbnail:true 降采样与 inlineBase64 内联回包（对齐 Cindy 桌面被控端 mediaFetch.ts 的限值：png/jpeg/webp、输入≤48MiB、最长边1024、webp q80、5s 软超时、产物≤700KiB 才内联，否则回退原图 OSS 路径）；(B) local-db:messages:view + view-intent + work-details 历史视图三通道，使手机重进会话不再丢失已翻出的历史，并保持 view 不可用时回退到 messages:list。"
+  },
+  "requirements": {
+    "summary": "A) media:fetch 补齐：thumbnail:true 时按参考语义降采样（可缩 mime={png,jpeg,webp}、输入≤48MiB、最长边1024、webp q80、5s 软超时），产物 ≤700KiB 时以 inlineBase64 返回（ossKey 为空串），否则回退原图上传路径；缩图能力用 DSH 自带的 sharp（懒加载，已实测可从 @deepseek-ai/dsh-session 的解析树找到），不可用/失败一律静默回退，绝不因缩图失败而让整次取件失败。缩不动且原图足够小时，直接内联原图字节（省一次 upload+presign+download 往返），并保持回复在 2MiB 帧上限与客户端 30s 预算内。为内容寻址 URL 加上传去重缓存。B) 历史视图三通道：以 DSH 的 turn 作为 work 单元分组，实现 local-db:messages:view（游标分页）、local-db:messages:work-details（展开详情，支持 after）、local-db:messages:view-intent（展开意图）；形状与语义严格对齐客户端 historyView.ts/historyViewController 与桌面 createHistoryViewReader，游标/分页/失败语义必须让客户端能识别（不可用时 UNSUPPORTED_CAPABILITY 以触发回退到 messages:list）。",
+    "openQuestions": [],
+    "acceptanceCriteria": [
+      "npm test 全绿；新增用例覆盖：缩图成功/输入或产物超限回退/非可缩 mime、小原图 inline 兜底、work 分组与游标（hasMore/nextCursor 语义）",
+      "npm run audit:channels：unclassified 0，served 49 → 52（新增 local-db:messages:view / work-details / view-intent）",
+      "node tools/acceptance.mjs --base http://127.0.0.1:3080 --with-prompts 全过，且新增至少一条 e2e：messages:view 首屏返回 work 项且 hasMore/nextCursor 语义正确",
+      "活体：device-link:media:fetch 带 thumbnail:true 对真图返回 {ossKey:'', mimeType:'image/webp', inlineBase64}（≤700KiB）或明确回退原图；不带 thumbnail 的请求行为不变（仍返回 ossKey）",
+      "view 三通道任一不可用时回客户端可识别的 UNSUPPORTED_CAPABILITY（isHistoryViewUnavailable），保证手机回退到 messages:list 路径（有活体或单测证据）"
+    ]
+  },
+  "tasks": [
+    {
+      "id": 1,
+      "title": "Complete planning with claw-kit:planning",
+      "detail": "1. Determine whether the user's wording is an instruction to act or an open-ended discussion. 2. Use claw-kit:planning to clarify the requirements and prepare the task list. 3. Before adopting the solution, ensure the user has seen its decision-relevant content; if it introduces a meaningful choice, wait for the user's response.",
+      "status": "done"
+    },
+    {
+      "detail": "在 src/host-media-fetch.js 的取件路径上加缩图：可缩 mime 白名单（png/jpeg/webp）、输入≤48MiB、sharp 懒加载（createRequire(require.resolve('@deepseek-ai/dsh-session')) 作为锚点，实测可从 DSH 自身依赖树解析到 sharp 0.35）→ rotate + resize(fit inside, max 1024) + webp(q80)，5s 软超时；产物 0<bytes≤700KiB 时返回 {ossKey:'', mimeType:'image/webp', size, inlineBase64}，否则回退原图上传路径；sharp 不可用或渲染失败一律回退，不报错。",
+      "title": "media:fetch：thumbnail:true 降采样 + inlineBase64 回包（限值对齐桌面参考）",
+      "status": "done",
+      "id": 2
+    },
+    {
+      "detail": "当请求方要缩图但缩不动（无 sharp / 非可缩 mime / 产物超限）且原图够小时，直接内联原图字节（ossKey:'' + 原始 mimeType + inlineBase64），省掉「被控端上传 + presign + 控制端下载」整往返；内联上限取一个能安全装进 2MiB 帧且不触碰客户端 30s 超时的值。另外为内容寻址类 URL 加 30 分钟/512 条的上传去重缓存（对齐参考 uploadCache），避免重复打开同一张图就重传。",
+      "title": "media:fetch：小原图 inlineBase64 兜底 + 上传去重缓存",
+      "status": "done",
+      "id": 3
+    },
+    {
+      "detail": "读 packages/maker-shared/src/historyView.ts + historyViewController.ts、桌面 apps/desktop/src/main/localDb/ipc/messages.ts 的 createHistoryViewReader、以及手机侧 apps/mobile 里这三个通道的 transport 与渲染，确定：work 分组规则（以 DSH turn 为单元）、HistoryViewPage/HistoryViewItem/HistoryWorkSummary/HistoryDetailPage 的字段、游标语义（nextCursor/hasMore/after）、view-intent 的展开集合形状、以及不可用时用哪个错误码触发 isHistoryViewUnavailable 回退。产出：字段与语义清单（写进 task 证据与文档）。",
+      "title": "对齐 HistoryView 契约（types + 桌面 reader + 手机 transport）",
+      "status": "done",
+      "id": 4
+    },
+    {
+      "detail": "实现 local-db:messages:view：按 DSH turn 把消息分组为 work 项（含 summary/revision/流式标记），支持 before 游标向前翻页，返回客户端能直接消费的 HistoryViewPage 形状；复用 transcript 缓存与帧预算，页大小按客户端记录的弱网预算而非一次性全量。",
+      "title": "实现 local-db:messages:view（work 分组 + 游标分页）",
+      "status": "done",
+      "id": 5
+    },
+    {
+      "detail": "实现 local-db:messages:work-details（按 summary 取该 work 的详情分页，支持 after 游标）与 local-db:messages:view-intent（接收展开集合，登记/释放流式推送意图）；两通道都要 fail-closed：形状不合法回 BAD_REQUEST，服务缺失回 NOT_AVAILABLE。",
+      "title": "实现 work-details 与 view-intent 两通道",
+      "status": "done",
+      "id": 6
+    },
+    {
+      "detail": "补单测与 acceptance 检查；更新 npm run audit:channels 的判定表（served 49→52、unclassified 保持 0）；在 doc/cindy-phone-link.md 增加章节：view 三通道的契约与回退、media 取件的缩图/内联语义与限值、以及「手机 20 行页 / 重进丢历史」的成因与现在的解法；最后给用户一份真机复测清单。",
+      "title": "验收与文档：单测/acceptance/audit + 文档章节 + 真机复测清单",
+      "status": "done",
+      "id": 7
+    }
+  ],
+  "references": [],
+  "rules": [],
+  "keyDecisions": [
+    "被控端要「广告能力」才算实现：手机端 historyViewCapability.ts 在读不到 link-accept 的 history-view-v1 时根本不会调用 view 三通道，所以 HOST_CAPABILITIES 与通道必须同时存在。",
+    "缩图用 harness 自带的 sharp：从 process.argv[1]（dsh web 入口）解析，不引入本插件自己的原生图像依赖；拿不到就整体降级为「小原图内联 → OSS key」，绝不因缩图失败让取件失败。",
+    "history view 的分组单元取 DSH turn（role==='user' 开一个 work 组）：与桌面端更细的分组不同，但契约管的是页与游标，preview/children 可选，粒度更粗反而让短会话一页到齐。",
+    "扫描预算超限回 UNSUPPORTED_CAPABILITY 而不是硬撑：这是参考实现同款的「故意降级」手段，客户端据此回退到原始窗口，也是我们唯一能控制的失败方式。"
+  ],
+  "retrospective": {
+    "summary": "目标：补齐两个已记录缺口——(A) device-link:media:fetch 的 thumbnail:true 降采样与 inlineBase64 内联回包；(B) local-db:messages:view + work-details + view-intent 历史视图三通道，让手机重进会话不再丢历史。7/7 任务完成。\n\n【A 媒体取件】三层答案，对齐桌面参考 mediaFetch.ts：①缩图（png/jpeg/webp、输入≤48MiB、最长边1024、webp q80、5s 软超时）→ 产物 ≤700KiB 时 {ossKey:'', mimeType:'image/webp', size, inlineBase64}；②缩不动但原图 ≤512KiB 且是 image/* → 内联原图；③否则上传 OSS 返回 key，并加 30 分钟/512 条的 path|size|mtime 去重缓存（skipCache 绕过，通道层已透传）。sharp 从 harness 入口懒加载解析（实测 kitten.png 2 454 031 B → 102 350 B webp / 114 ms，内联 136 468 字符），拿不到或渲染失败一律静默回退。\n\n【B 历史视图】按对齐到的契约实现：页内 items 时间正序、nextCursor=该页最旧 id、hasMore 驱动「加载更早」；详情按闭区间 + after 前向翻页；intent 整体替换展开集合。分组单元取 DSH turn。扫描预算（20000 行）超限回 UNSUPPORTED_CAPABILITY、无会话 API 回 NOT_AVAILABLE——两者都被客户端识别为「此处无视图」而回退原始窗口。关键：link-accept 现在广告 history-view-v1，否则手机端连调都不会调。\n\n【验证】npm test 403/403（新增 host-history-view 7 项、host-media-fetch 缩图/缓存用例、cindy-channels 转发用例）；audit:channels 52 served / 0 unclassified（49→52）；acceptance 新增 view 三通道与 thumbnail 的 e2e 检查；doc/cindy-phone-link.md 增加收尾章节与真机复测清单。**未完成的一步**：活体验收未跑——三个新通道与新能力只在 dsh web 重启后生效，重启后应看到 acceptance 覆盖 52/52 且新增检查全过。\n\n【教训】①「能力必须同时广告」：服务端实现通道却不广告 history-view-v1 等于没实现（手机端前置门控）。②项目自带的「seam 构建的能力必须转发」不变量测试当场抓到我漏了 capabilityProvider.historyView——这类守卫值得继续加。③claw_run 的 task.done/task.add 只有最小形式（{id}）会落地，带 choice/detail/tasks 批次都静默 no-op。"
+  },
+  "updatedAt": "2026-09-17T08:13:51.920Z",
+  "completedAt": "2026-09-17T08:13:51.852Z"
+}

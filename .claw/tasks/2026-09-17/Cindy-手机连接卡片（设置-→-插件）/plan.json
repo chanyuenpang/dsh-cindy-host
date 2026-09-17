@@ -1,0 +1,99 @@
+{
+  "title": "Cindy 手机连接卡片（设置 → 插件）",
+  "templateId": "default",
+  "status": "end.completed",
+  "goal": {
+    "text": "让 Cindy 手机客户端能连上这台 DSH Host：设置 → 插件 新增「Cindy 手机连接」卡片（开关 / 连接状态 / 登录流程 / 已连接设备信息），Host 持有唯一真相。"
+  },
+  "requirements": {
+    "summary": "Cindy 手机客户端能连上这台 DSH Cindy Host。设置 → 插件 新增「Cindy 手机连接」卡片：开关、连接状态、登录流程、已连接设备信息。Host 状态为唯一真相，页面只显示。不做二维码（Cindy 无配对协议），不做设备管理/撤销。",
+    "openQuestions": [],
+    "acceptanceCriteria": [
+      "DSH 设置 → 插件 能看到「Cindy 手机连接」卡片",
+      "打开开关后 Host 读取/建立 Cindy 登录态并连上 DeviceLink relay（hello 声明 remoteControlEnabled=true）",
+      "Cindy 手机端设备列表能看到这台 DSH Host 并成功 link-open，卡片显示「已连接」及设备名称/deviceId",
+      "关闭开关后 WebSocket 断开、投影停止、订阅者与已接受设备清空，卡片显示「未连接」",
+      "不改 DSH Web shell、不修改默认 profile；npm test 通过"
+    ]
+  },
+  "tasks": [
+    {
+      "id": 1,
+      "title": "Complete planning with claw-kit:planning",
+      "detail": "1. Determine whether the user's wording is an instruction to act or an open-ended discussion. 2. Use claw-kit:planning to clarify the requirements and prepare the task list. 3. Before adopting the solution, ensure the user has seen its decision-relevant content; if it introduces a meaningful choice, wait for the user's response.",
+      "status": "done"
+    },
+    {
+      "detail": "package.json 增加 exports[\"./client\"]=./lib/client.js 与 exports[\".\"]，否则 dsh-client-modules 在 dsh.client 已声明但无 bundle 时直接抛错（dsh-client-modules/lib/index.js:655）",
+      "title": "修正双面包声明，使 client 半可被 DSH 解析",
+      "status": "done",
+      "id": 2
+    },
+    {
+      "detail": "src/cindy-login-flow.js：non-interactive requestLoginCode / verifyLoginCode（处理 ok/select_account/binding_required/sso_verification_required），auth-session.js 增加 restoreSession（只 refresh，不 readline）",
+      "title": "Host：非交互式 Cindy 登录流程",
+      "status": "done",
+      "id": 3
+    },
+    {
+      "detail": "host.js 状态机：hello(remoteControlEnabled=true)/20s ping/hello-ack/presence-changed/link-open→link-accept/invoke/link-close/relay-error；开关关闭时清空 subscribers+controllers+devices 并停投影",
+      "title": "Host：relay 连接与状态机",
+      "status": "done",
+      "id": 4
+    },
+    {
+      "detail": "ctx.webServer.register 前缀路由 /api/dsh-cindy-host：GET status、POST login/request-code、POST login/verify-code、POST logout",
+      "title": "Host：状态与登录 HTTP 路由",
+      "status": "done",
+      "id": 5
+    },
+    {
+      "detail": "lib/client.js：window.__ModuleLoader__.load CJS 工厂；inject ['slots','settingsScope']；settings.plugin.item key=dsh-cindy-host；渲染开关/状态/登录表单/设备列表，轮询 status",
+      "title": "Client：手写 settings.plugin.item 卡片",
+      "status": "done",
+      "id": 6
+    },
+    {
+      "detail": "node --test 覆盖登录结果映射、状态机推导、frame 处理；README 记录四项协议调查结论与卡片用法",
+      "title": "测试与文档",
+      "status": "done",
+      "id": 7
+    }
+  ],
+  "references": [
+    {
+      "path": "C:\\Users\\chany\\AppData\\Roaming\\npm\\node_modules\\@deepseek-ai\\dsh\\node_modules\\@deepseek-ai\\dsh-client-modules\\lib\\index.js",
+      "why": "client 半发现规则：dsh.client + exports[\"./client\"]"
+    },
+    {
+      "path": "C:\\Users\\chany\\AppData\\Roaming\\npm\\node_modules\\@deepseek-ai\\dsh\\node_modules\\@deepseek-ai\\dsh-client-ui-settings\\lib\\types\\client\\settings-contract.d.ts",
+      "why": "settingsScope/set/getSnapshot 契约"
+    },
+    {
+      "path": "C:\\Users\\chany\\AppData\\Roaming\\npm\\node_modules\\@deepseek-ai\\dsh\\node_modules\\@deepseek-ai\\dsh-host-webserver\\lib\\types\\index.d.ts",
+      "why": "ctx.webServer.register 路由契约"
+    },
+    {
+      "path": "G:\\Projects\\Cindy\\packages\\device-link-protocol\\src\\protocol.ts",
+      "why": "relay 信封与 hello/hello-ack/presence 真实字段"
+    },
+    {
+      "path": "G:\\Projects\\Cindy\\packages\\device-link\\src\\protocol.ts",
+      "why": "DeviceView / PresenceSnapshot 字段"
+    }
+  ],
+  "rules": [],
+  "keyDecisions": [
+    "1) 无二维码：Cindy 协议无 pairing token，Relay hello-ack 只有 deviceId/userId；手机与 Host 的关联=同账号，故不生成任何编造的二维码内容（用户确认）。2) 卡片只做开关+状态+登录+设备显示。3) Host 状态经 ctx.webServer 前缀路由 /api/dsh-cindy-host 暴露给同源页面（DSH 既有插件同款模式，见 dsh-client-connection/lib/index.js:781）。4) 设置读写走 ctx.settingsScope.bind({namespace:'dsh-cindy-host'}), 开关字段 transportEnabled。5) 连接手机需 relay 能路由 link-open 到本机，故 hello 必须声明 remoteControlEnabled=true；同账号显式开启后接受 controller，不做设备管理 UI。",
+    "Cindy 无二维码配对协议：relay hello-ack 只给 deviceId/userId，关联是账号级；因此不生成任何编造二维码，改为卡片内登录 + 设备列表。",
+    "Host 状态经 ctx.webServer 前缀路由 /api/dsh-cindy-host 暴露给同源设置卡片（DSH 既有插件同款模式），设置读写仍走 settingsScope。",
+    "连接手机需 relay 能路由 link-open，故 hello 必须声明 remoteControlEnabled=true；同账号显式开启后接受 controller，保留 revoke 语义。",
+    "投影与 relay 同生命周期：关闭开关即停投影、清 subscribers/controllers/devices 并断 socket。",
+    "客户端半手写为 window.__ModuleLoader__.load CJS 工厂（无构建步骤），仅依赖平台 seed 的 react。"
+  ],
+  "retrospective": {
+    "summary": "四项协议调查全部以 Cindy 源码为准：①relay 不返回 pairing token（device-link-protocol/src/protocol.ts 的 EnvelopeKind/HelloAckPayload）；②Cindy 唯一的手机连接二维码是官网下载页 URL（MobileDownloadDialog.tsx:119-127 + zh-CN i18n），用户据此决定取消二维码；③无配对帧，关联=同 userId，可观测证据是 link-open/invoke；④无 pairing API，二维码渲染用 qrcode 包。据此实现：Host 新增 host-status（五态+设备账本）、host-routes（/api/dsh-cindy-host status/reconnect/login/logout）、cindy-login-flow（非交互式验证码登录）、重写 host.js（relay 状态机+20s 心跳+设备目录补名）；Client 新增 lib/client.js 手写 settings.plugin.item 卡片；package.json 补 exports[\"./client\"]（否则 dsh-client-modules 声明 dsh.client 却找不到 bundle 会直接抛错）。验证：82 个 node --test 全绿（含 React 真实渲染卡片）；隔离 DSH_HOME 下 dsh --dump-config 组合通过、boot graph 含 dsh-cindy-host-demo、/plugins bundle HTTP 200、/api/dsh-cindy-host/status 200；开启开关后真机连上 device-link.cindy.com.cn relay，拿到真实 deviceId/userId 与同账号设备名（<phone>/android 等）并进入「已连接」；关闭开关后回到「未连接」且 dsh 进程 established 连接数为 0。未触及默认 profile 与 DSH shell。遗留：relay server 源码不在本机 Cindy checkout，relay 行为取自双方共同编译的协议包；card 的轮询/登录交互未做浏览器自动化（无浏览器驱动），由 React 渲染测试 + 真机 status 接口覆盖。"
+  },
+  "updatedAt": "2026-09-16T16:52:52.764Z",
+  "completedAt": "2026-09-16T16:52:52.686Z"
+}

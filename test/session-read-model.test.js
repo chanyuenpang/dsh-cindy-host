@@ -1,0 +1,2 @@
+import test from 'node:test'; import assert from 'node:assert/strict'; import { SessionReadModel } from '../src/session-read-model.js';
+test('builds safe DSH conversation rows', () => { const model = new SessionReadModel(); model.replace([{ id: 'one', title: 'Task', running: true, updatedAt: '2026-09-16T00:00:00.000Z' }]); assert.deepEqual(model.list(), [{ sessionId: 'one', title: 'Task', phase: 'running', updatedAt: '2026-09-16T00:00:00.000Z' }]); });

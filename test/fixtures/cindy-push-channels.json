@@ -1,0 +1,31 @@
+{
+  "_comment": "Every channel the Cindy controller handles in its remote-push dispatch, so this Host can prove it never pushes into the void. Extracted from apps/mobile/src/session/remoteSessionStore.ts (the `channel === '<x>'` comparisons inside applyRemotePush), plus the channels that dispatch by constant rather than by literal: SESSION_SYNC_CHANNEL, SESSION_ACTIVITY_CHANNEL, MAKER_EVENT_BATCH_CHANNEL (expanded before the switch), FILE_BROWSER_EVENT_CHANNEL and REMOTE_RESOURCE_CHANGED_CHANNEL. Push channels are not validated by the controller the way invokes are: an unknown channel is simply dropped, so nothing at runtime tells us we addressed a channel nobody reads.",
+  "channels": [
+    "device-link:remote-media-share",
+    "file-browser:event",
+    "local-db:messages:created",
+    "local-db:messages:deleted",
+    "local-db:session:error-persisted",
+    "local-db:sessions:activity",
+    "local-db:sessions:created",
+    "local-db:sessions:patched",
+    "maker:event",
+    "maker:event:batch",
+    "maker:file-browser:event",
+    "maker:goal:status-changed",
+    "maker:input:projection",
+    "maker:interaction-dismissed",
+    "maker:interaction-request",
+    "maker:new-maker-draft:changed",
+    "maker:new-maker-worktree-branch:changed",
+    "maker:session-model-pref:changed",
+    "maker:session-sync",
+    "maker:status-changed",
+    "remote-media",
+    "remote-unavailable",
+    "usage:message-model-mismatch",
+    "usage:message-turn-cost",
+    "usage:session-spend-changed",
+    "usage:session-tokens-changed"
+  ]
+}
