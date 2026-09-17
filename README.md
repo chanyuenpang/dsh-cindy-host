@@ -87,6 +87,23 @@ rules are covered without a browser.
 
 Do not enable Cindy transport in production yet. A separate compatibility slice must adapt the projection source to the current Typert session/event remotes, then add a real-host read-only smoke test. The external package must use only version-pinned public DSH packages and never resolve DSH's nested `node_modules`.
 
+## 安装要求：需要编译原生模块
+
+这个包**在安装时需要编译**，原因是它的凭据存储用的是原生模块：
+
+- `keytar` 是原生模块（Windows 凭据管理器 / macOS Keychain / Linux Secret Service），安装时要编译出
+  `keytar.node`。**没有纯 JS 的等价物**——Cindy 的登录会话必须放进操作系统的凭据库，而不是明文写进
+  配置或仓库。
+- 所以安装需要工具链：Windows 上通常是 **VS Build Tools（含 C++ 工作负载）**，macOS 需要
+  Xcode Command Line Tools，Linux 需要 `libsecret-1-dev` 等。
+- **pnpm 用户**还要显式允许构建脚本（pnpm 10 默认不执行依赖的构建脚本）：`pnpm approve-builds`，
+  或在 profile 的 `package.json` 里加 `"pnpm": { "onlyBuiltDependencies": ["keytar"] }` 后重装。
+  npm 默认会执行构建脚本。
+- **编译失败不会让插件装不上**（0.1.1 起 `keytar` 已改为惰性加载）：插件照常挂载，只有登录/凭据
+  相关能力明确不可用。也就是说"需要编译"影响的是凭据能力，不是能否安装。
+
+细节与实测记录见 [`doc/publishing.md`](doc/publishing.md) §5.2。
+
 ## 发布指南
 
 - [doc/publishing.md](doc/publishing.md) —— **插件发布**：把本插件做成别人/别的 profile 能装上的 npm 包（bundle 三要素、三种消费方式、包内容白名单、干净 profile 验证、撤版）。

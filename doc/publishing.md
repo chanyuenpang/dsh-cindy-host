@@ -107,12 +107,18 @@ dsh plugin --profile <profile> add dsh-cindy-host-demo@<version>
 
 ### 5.2 安装方须知（写进面向用户的说明）
 
-- **pnpm 用户**：需要显式允许构建脚本，否则 `keytar` 没有二进制。二选一：
-  - `pnpm approve-builds`（交互式勾选 `keytar`）；或
-  - 在 profile 的 `package.json` 里加 `"pnpm": { "onlyBuiltDependencies": ["keytar"] }` 后重装。
-- **npm 用户**：默认会跑构建脚本，通常无需额外操作；需要编译工具链（Windows 上通常是 VS Build Tools）。
-- **没有凭据库也能装**（0.1.1 起）：插件照常 mount，只是登录/凭据相关能力明确不可用——这是刻意的降级，
-  不是"装坏了"。
+**这个包在安装时需要编译一个原生模块**，这不是可选项，是它的依赖决定的：
+
+- `keytar` 是**原生模块**（Windows 凭据管理器 / macOS Keychain / Linux Secret Service），
+  安装时必须编译出 `keytar.node`。**原因**：Cindy 的登录会话必须存放进操作系统的凭据库，
+  而不是明文写进配置或仓库——这是本插件的凭据存储方式，没有纯 JS 的等价物。
+- 因此安装需要**编译工具链**：Windows 上通常是 VS Build Tools（含 C++ 工作负载），
+  macOS 需要 Xcode Command Line Tools，Linux 需要 `libsecret-1-dev` 等。
+- **pnpm 用户**还必须显式允许构建脚本（pnpm 10 默认不跑依赖的构建脚本）：
+  `pnpm approve-builds`，或在 profile 的 `package.json` 里加
+  `"pnpm": { "onlyBuiltDependencies": ["keytar"] }` 后重装。npm 默认会跑构建脚本。
+- **编译失败也能装上**（0.1.1 起）：插件照常 mount，只是登录/凭据相关能力明确不可用。
+  换句话说，**"要编译"只影响凭据能力，不影响插件能否挂载**。
 
 ### 5.3 测 tarball 时的一个陷阱
 
