@@ -282,3 +282,71 @@ test('with no event hub the source still lists and disposes cleanly', async () =
   assert.equal(typeof source.onEvent(() => {}), 'function');
   assert.equal((await source.listSessions()).length, 1);
 });
+
+test('concurrent listings share one read instead of missing the deadline together', async () => {
+  // Measured: seven `local-db:sessions:list` invokes rejected with `TimeoutError` in the
+  // thirteen seconds after a restart — the phone reconnecting while the two desktop
+  // controllers polled, all three reading 45 cold sessions at once through a 15s budget.
+  // The controllers are not asking different questions, so they get one answer.
+  let reads = 0;
+  let release;
+  const gate = new Promise((resolve) => {
+    release = resolve;
+  });
+  const source = createSessionControllerSource({
+    sessionController: {
+      async list() {
+        reads += 1;
+        await gate;
+        return { items: [{ sessionId: 's1', updatedAt: 1, running: false }] };
+      },
+    },
+    subscribe: makeSubscribe(),
+  });
+
+  const all = Promise.all([source.listSessions(), source.listSessions(), source.listSessions()]);
+  await new Promise((resolve) => setImmediate(resolve));
+  assert.equal(reads, 1, 'one read for three callers');
+  release();
+  const rows = await all;
+  assert.deepEqual(rows.map((list) => list.length), [1, 1, 1]);
+
+  // And the flight is not remembered: the next read really reads.
+  await source.listSessions();
+  assert.equal(reads, 2);
+});
+
+test('a listing that misses its deadline answers with the list read moments ago', async () => {
+  // A controller renders a failed list as nothing, which is the spinner the user reported —
+  // so a read that misses its budget must not become a failure while a real, recent listing
+  // exists. What is being served is durable data with an age, not an invented row.
+  const failure = Object.assign(new Error('The operation was aborted due to timeout'), { name: 'TimeoutError' });
+  let mode = 'ok';
+  let clock = 1_000_000;
+  const source = createSessionControllerSource({
+    sessionController: {
+      async list() {
+        if (mode === 'fail') throw failure;
+        return { items: [{ sessionId: 's1', updatedAt: 1, running: false }] };
+      },
+    },
+    subscribe: makeSubscribe(),
+    now: () => clock,
+  });
+
+  assert.equal((await source.listSessions()).length, 1, 'the first read is real');
+  assert.deepEqual(source.listDiagnostics().staleServes, 0);
+
+  mode = 'fail';
+  clock += 30_000;
+  const served = await source.listSessions();
+  assert.equal(served.length, 1, 'the recent read is served instead of the failure');
+  assert.equal(served[0].id, 's1');
+  const diagnostics = source.listDiagnostics();
+  assert.equal(diagnostics.staleServes, 1, 'and it is counted, not silent');
+  assert.match(diagnostics.lastStaleReason, /timeout/);
+
+  // Past the bound it is not a recent read any more, and the failure is honest.
+  clock += 200_000;
+  await assert.rejects(() => source.listSessions(), /aborted due to timeout/);
+});

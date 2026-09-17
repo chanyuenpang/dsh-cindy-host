@@ -1356,6 +1356,10 @@ export function apply(ctx) {
       // exception that would otherwise have left the whole `dsh web` process through DSH's
       // fail-loud unhandled-rejection handler.
       handlerErrors: runtime && typeof runtime.getHandlerErrors === 'function' ? runtime.getHandlerErrors() : [],
+      // How the session listing is doing. `staleServes > 0` means a controller was answered
+      // from the previous read because the live one missed its deadline — an absorbed
+      // degradation, and the difference between a rendered list and the reported spinner.
+      listing: typeof sessionSource?.listDiagnostics === 'function' ? sessionSource.listDiagnostics() : null,
       // The topics controllers currently hold. An empty set means the phone
       // never subscribed — the single most likely reason a live reply or a todo
       // card never reaches it.

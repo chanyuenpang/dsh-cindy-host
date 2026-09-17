@@ -54,6 +54,10 @@ export function createSessionControllerSource({
   readTitles,
   readSessionMeta,
   listTimeoutMs = 15_000,
+  // How old a listing may be when it is served in place of one that failed. Long enough to
+  // cover a cold start, short enough that a session created or renamed in the meantime is not
+  // hidden for long — and the controller polls this channel every few seconds anyway.
+  listStaleMaxMs = 120_000,
   // How many uncached titles one read may fold. The phone's responsiveness probe *is*
   // `local-db:sessions:list`, and a title is a log-backed fold (~50ms each) — folding a
   // few hundred of them per read made the probe answer in ~12s on a real profile, which
@@ -75,6 +79,13 @@ export function createSessionControllerSource({
   const titleCache = new Map();
   /** The in-flight background title warm-up, or null. At most one runs at a time. */
   let warming = null;
+  /** The one listing read currently in flight, shared by every concurrent caller. */
+  let inFlightList = null;
+  /** The last listing that was really read, and when — the stale fallback's whole state. */
+  let lastListed = null;
+  /** How many listings were answered from that fallback since start. */
+  let staleServes = 0;
+  let lastStaleReason = null;
 
   /**
    * Titles for the ids asked about, folding only what is missing or stale.
@@ -170,12 +181,42 @@ export function createSessionControllerSource({
    *
    * Filtered **here**, at the single point both readers go through, so a future reader
    * cannot accidentally serve them again.
+   *
+   * Two properties beyond the read itself, both learned from a live failure: seven
+   * `local-db:sessions:list` invokes rejected with `TimeoutError` in the thirteen seconds after
+   * a restart (the phone reconnecting, plus the two desktop controllers polling, while 45 cold
+   * sessions were being read), and a controller renders a failed list as *nothing* — the
+   * spinner the user reported.
+   *
+   * - **Single flight.** Concurrent callers share one read. Three controllers polling during a
+   *   cold start do not multiply the work that is already missing its deadline.
+   * - **A stale answer beats a failed one.** When the read does miss its deadline, the list read
+   *   moments ago is served instead of an error, inside a bound. The data is real and durable —
+   *   only its age is in question, and the controller's next poll corrects it — while the
+   *   failure mode it replaces is an empty list and a spinner.
    */
   async function listItems() {
-    const signal = typeof AbortSignal?.timeout === 'function' ? AbortSignal.timeout(listTimeoutMs) : undefined;
-    const value = await sessionController.list({}, signal);
-    const items = Array.isArray(value?.items) ? value.items : [];
-    return items.filter(isControllerVisible);
+    if (inFlightList !== null) return inFlightList;
+    const attempt = (async () => {
+      const signal = typeof AbortSignal?.timeout === 'function' ? AbortSignal.timeout(listTimeoutMs) : undefined;
+      const value = await sessionController.list({}, signal);
+      const items = (Array.isArray(value?.items) ? value.items : []).filter(isControllerVisible);
+      lastListed = { items, at: now() };
+      return items;
+    })();
+    inFlightList = attempt;
+    try {
+      return await attempt;
+    } catch (error) {
+      if (lastListed !== null && now() - lastListed.at <= listStaleMaxMs) {
+        staleServes += 1;
+        lastStaleReason = error instanceof Error ? error.message : String(error);
+        return lastListed.items;
+      }
+      throw error;
+    } finally {
+      inFlightList = null;
+    }
   }
 
   return {
@@ -267,6 +308,19 @@ export function createSessionControllerSource({
     /** How many titles are cached, for diagnostics. */
     cachedTitleCount() {
       return titleCache.size;
+    },
+
+    /**
+     * How the session listing is doing, for diagnostics.
+     *
+     * `staleServes` should stay at 0 in ordinary use. It counts listings answered from the
+     * previous read because the live one missed its deadline — every one of those is a
+     * controller that would otherwise have been shown an empty list (the reported spinner),
+     * so a non-zero value is the record of a degradation that was absorbed, not a healthy
+     * number to watch grow.
+     */
+    listDiagnostics() {
+      return { staleServes, lastStaleReason, lastListedAt: lastListed === null ? null : lastListed.at, lastListedCount: lastListed === null ? null : lastListed.items.length };
     },
 
     /**
