@@ -743,14 +743,52 @@ export async function startHost(initialSource, settings = DEFAULT_HOST_SETTINGS,
    * handler reads — `{ sessionId, message }` — so a live append and a transcript
    * read produce identical rows.
    */
+  /**
+   * How long view invalidations for one session are coalesced.
+   *
+   * Every renderable row sends one `maker:history-view-changed`, and the controller answers
+   * that channel by re-reading the newest page — up to `HISTORY_PAGE_BYTES` (256 KiB) after
+   * its own 500 ms debounce. A working turn appends several rows a second, so the frames are
+   * cheap but the *re-reads* are not: without coalescing, N rows cost N page reads of up to
+   * 256 KiB. One trailing invalidation per second carries the same fact — the view's content
+   * changed — and the last row of a turn is still announced, because the timer always fires.
+   */
+  const HISTORY_VIEW_PUSH_COALESCE_MS = 1000;
+  /** `sessionId` → the pending view invalidation. */
+  const historyViewPushes = new Map();
+
+  /**
+   * Tell the controllers watching a session that its history view changed.
+   * @param sessionId - the session whose projection changed.
+   */
+  function pushHistoryViewChanged(sessionId) {
+    if (typeof sessionId !== 'string' || sessionId === '') return;
+    if (watchersFor(sessionId) === 0) return;
+    if (historyViewPushes.has(sessionId)) return;
+    const timer = setTimeoutImpl(() => {
+      historyViewPushes.delete(sessionId);
+      pushSessionUpdate(sessionId, 'maker:history-view-changed', { sessionId });
+    }, HISTORY_VIEW_PUSH_COALESCE_MS);
+    if (typeof timer?.unref === 'function') timer.unref();
+    historyViewPushes.set(sessionId, timer);
+  }
+
+  /** Drop every pending view invalidation (teardown: no timers outlive the socket). */
+  function clearHistoryViewPushes() {
+    for (const timer of historyViewPushes.values()) {
+      if (typeof clearTimeoutImpl === 'function') clearTimeoutImpl(timer);
+    }
+    historyViewPushes.clear();
+  }
+
   function pushSessionMessage(sessionId, message) {
     pushSessionUpdate(sessionId, 'local-db:messages:created', { sessionId, message });
-    // …and tell the history view to re-read. The two are not the same message: the row
-    // above feeds the controller's message store, while this one is the *only* signal the
-    // work-grouped view acts on (`DeviceLinkContext` invalidates on it and returns), so a
-    // session the user is already inside did not update until it was reopened — 报
-    // 「重新进入会话之后对话就出来了」.
-    pushSessionUpdate(sessionId, 'maker:history-view-changed', { sessionId });
+    // …and tell the history view to re-read, coalesced. The two are not the same message: the
+    // row above feeds the controller's message store, while this one is the only signal the
+    // work-grouped view acts on (`DeviceLinkContext`: `historyView.invalidate(); return;`).
+    // Without it a session the user was already inside did not update until it was reopened —
+    // 报「重新进入会话之后对话就出来了」.
+    pushHistoryViewChanged(sessionId);
   }
 
   /**
@@ -855,6 +893,8 @@ export async function startHost(initialSource, settings = DEFAULT_HOST_SETTINGS,
         // so the row the controller is showing has to exist in the fold for a later
         // promotion, edit or removal to resolve.
         markQueued: (sessionId, item) => inputQueue.markQueued(sessionId, item),
+        /** Prompts accepted but not yet durable, as transcript rows. */
+        pendingRows: (sessionId) => inputQueue.pendingTranscriptRows(sessionId),
         itemIds: (sessionId) => inputQueue.itemIds(sessionId),
       },
       /** Project a queue DSH actually reported, rather than the folded one. */
@@ -1636,6 +1676,9 @@ export async function startHost(initialSource, settings = DEFAULT_HOST_SETTINGS,
   async function disconnect({ keepSwitch = false } = {}) {
     generation += 1;
     stopHeartbeat();
+    // A pending view invalidation has no socket to reach once this returns; firing it later
+    // would push to a link that is gone.
+    clearHistoryViewPushes();
     acceptedControllers.clear();
     subscribers.clear();
     sessionSubscribers.clear();

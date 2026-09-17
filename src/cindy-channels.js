@@ -527,7 +527,14 @@ export function createChannelRouter({
       const read = capabilitiesNow().readMessages;
       if (typeof read !== 'function') return invokeError(request, 'NOT_AVAILABLE', 'This DSH Host cannot read message history yet');
       const options = args[1] !== null && typeof args[1] === 'object' ? args[1] : {};
-      return invokeResult(request, await read(sessionId, options));
+      const rows = await read(sessionId, options);
+      // The newest window also carries what this Host has **accepted but not yet made
+      // durable** — the prompt waiting in DSH's inbox. Only on the newest page: a cursor
+      // names a durable row, and inventing rows behind a cursor would corrupt paging.
+      const before = typeof options?.before === 'string' && options.before !== '' ? options.before : null;
+      const pending = before === null ? (capabilitiesNow().queueMirror?.pendingRows?.(sessionId) ?? []) : [];
+      // Newest first, and the pending prompts are the newest thing that exists.
+      return invokeResult(request, pending.length === 0 ? rows : [...pending, ...rows]);
     }
 
     if (channel === 'maker:list-active') {
@@ -1358,6 +1365,20 @@ export function createChannelRouter({
         : channel === 'local-db:messages:work-details'
           ? await view.details(sessionId, args[1], args[2]?.after)
           : await view.intent(sessionId, args[1]);
+      if (answered?.ok === true && channel === 'local-db:messages:view'
+        && typeof args[1]?.before !== 'string' && Array.isArray(answered.result?.items)) {
+        // The newest view page also shows the prompts waiting in DSH's inbox: without them a
+        // message sent while a turn is running is absent from the projection the controller
+        // renders, and a reload looks like the message was lost (「退出去再进来，它不见了」)
+        // even though it is queued and will arrive.
+        const pending = capabilitiesNow().queueMirror?.pendingRows?.(sessionId) ?? [];
+        if (pending.length > 0) {
+          return invokeResult(request, {
+            ...answered.result,
+            items: [...answered.result.items, ...pending.map((row) => ({ type: 'messages', key: row.clientId, messages: [row] }))],
+          });
+        }
+      }
       return answered?.ok === true
         ? invokeResult(request, answered.result)
         : invokeError(request, answered?.code ?? 'INTERNAL', answered?.message ?? 'history view failed');

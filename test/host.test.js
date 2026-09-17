@@ -309,20 +309,10 @@ test('pushes a live message only to the controllers watching that session', asyn
 
     runtime.pushSessionMessage('s1', { id: 'm1', role: 'assistant', content: { text: 'hi' } });
     const pushes = socket.sent.filter((frame) => frame.kind === 'push');
-    // Two frames, because they do two different jobs: the row feeds the controller's
-    // message store, and `maker:history-view-changed` is the only signal the work-grouped
-    // view acts on (`DeviceLinkContext` invalidates on it and returns). Without the second
-    // one a message only showed up after re-entering the session —
-    // 报「重新进入会话之后对话就出来了」.
-    assert.equal(pushes.length, 4);
-    assert.deepEqual(
-      pushes.slice(-2).map((frame) => frame.payload.channel),
-      ['local-db:messages:created', 'maker:history-view-changed'],
-    );
-    const viewPush = pushes[pushes.length - 1];
-    assert.equal(viewPush.dst, 'phone-2', 'the view invalidation is addressed to the same watcher');
-    assert.equal(viewPush.payload.payload.sessionId, 's1');
-    const messagePush = pushes[pushes.length - 2];
+    // The row goes out at once; the view invalidation that rides with it is coalesced (its
+    // own test drives that timer), so exactly one frame is added here.
+    assert.equal(pushes.length, 3);
+    const messagePush = pushes[pushes.length - 1];
     assert.equal(messagePush.dst, 'phone-2', 'a session push is addressed to its watcher');
     // Exactly what the controller's `local-db:messages:created` handler reads.
     assert.equal(messagePush.payload.channel, 'local-db:messages:created');
@@ -331,12 +321,70 @@ test('pushes a live message only to the controllers watching that session', asyn
 
     // A session nobody watches must not leak into another session's stream.
     runtime.pushSessionMessage('s2', { id: 'm2' });
-    assert.equal(socket.sent.filter((frame) => frame.kind === 'push').length, 4);
+    assert.equal(socket.sent.filter((frame) => frame.kind === 'push').length, 3);
 
     // Unsubscribing, or the socket going away, stops the stream.
     socket.frame({ v: 1, kind: 'invoke', id: 'unsub-1', src: 'phone-2', payload: { channel: 'device-link:unsubscribe', args: [{ topics: ['session:s1'] }] } });
     await new Promise((resolve) => setImmediate(resolve));
     assert.equal(runtime.watchersFor('s1'), 0);
+  } finally {
+    await runtime.stop();
+  }
+});
+
+test('view invalidations are coalesced, and the last one still fires', async () => {
+  // Every row sends `maker:history-view-changed`, and the controller answers that channel by
+  // re-reading the newest page — up to 256 KiB after its own 500 ms debounce. A working turn
+  // appends rows several times a second, so uncoalesced invalidations meant N rows → N page
+  // re-reads. One trailing invalidation per second carries the same fact.
+  const timers = [];
+  const socket = new FakeSocket();
+  const runtime = await startHost(new FixtureDshSource(), ON, {
+    resolveSession: async () => ({ ok: true, session: { deviceId: 'host-handle', kind: 'phone', identifier: '13800000000' } }),
+    openSocket: () => socket,
+    heartbeatMs: 0,
+    setTimeout: (fn, ms) => {
+      const timer = { fn, ms, cleared: false };
+      timers.push(timer);
+      return timer;
+    },
+    clearTimeout: (timer) => {
+      if (timer !== null && typeof timer === 'object') timer.cleared = true;
+    },
+  });
+  const settle = () => new Promise((resolve) => setImmediate(resolve));
+  const viewPushes = () => socket.sent.filter((frame) => frame.kind === 'push' && frame.payload.channel === 'maker:history-view-changed');
+  try {
+    socket.emit('open');
+    socket.frame({ v: 1, kind: 'hello-ack', payload: { serverProtocolVersion: 1, deviceId: 'dev-host', userId: 'user-1' } });
+    socket.frame({ v: 1, kind: 'invoke', id: 'sub-1', src: 'phone-2', payload: { channel: 'device-link:subscribe', args: [{ topics: ['session:s1'] }] } });
+    await settle();
+
+    // Three rows inside the coalescing window: three row pushes, one invalidation pending.
+    runtime.pushSessionMessage('s1', { id: 'm1' });
+    runtime.pushSessionMessage('s1', { id: 'm2' });
+    runtime.pushSessionMessage('s1', { id: 'm3' });
+    assert.equal(socket.sent.filter((frame) => frame.kind === 'push' && frame.payload.channel === 'local-db:messages:created').length, 3);
+    assert.equal(viewPushes().length, 0, 'nothing is sent until the window closes');
+    const pending = timers.filter((timer) => timer.cleared !== true && timer.ms === 1000);
+    assert.equal(pending.length, 1, 'one invalidation is scheduled, not three');
+
+    // The trailing edge still announces the change — a turn's last row is never lost.
+    await pending[0].fn();
+    assert.equal(viewPushes().length, 1);
+    assert.equal(viewPushes()[0].payload.payload.sessionId, 's1');
+
+    // And a row arriving after that window schedules the next one.
+    runtime.pushSessionMessage('s1', { id: 'm4' });
+    const next = timers.filter((timer) => timer.cleared !== true && timer.ms === 1000);
+    assert.equal(next.length, 2);
+    await next[1].fn();
+    assert.equal(viewPushes().length, 2);
+
+    // Nobody watching means no frame and no timer at all.
+    const before = timers.length;
+    runtime.pushSessionMessage('s-other', { id: 'm5' });
+    assert.equal(timers.length, before, 'a session nobody watches costs nothing');
   } finally {
     await runtime.stop();
   }

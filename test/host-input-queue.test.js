@@ -84,6 +84,34 @@ test('a just-accepted steering prompt is projected as steering, and only that on
   assert.deepEqual(tracker.projectionFor('s1', SOURCE_SESSION).steeringQueueClientIds, []);
 });
 
+test('a prompt accepted but not yet durable is served as a transcript row', () => {
+  // Measured gap: a prompt sent while a turn runs waits in DSH's inbox until the turn
+  // reaches a step boundary — 0.4 s when idle, 42 s in the worst observed case. With no row
+  // in the transcript for it, a controller that reloads shows nothing and the user retypes a
+  // message that is still queued (「退出去再进来，它不见了」).
+  const tracker = createInputQueueTracker();
+  assert.deepEqual(tracker.pendingTranscriptRows('s1'), [], 'nothing accepted, nothing to show');
+
+  tracker.markSteering('s1', {
+    id: 'c9',
+    rpcId: 'c9',
+    message: { id: 'c9', content: [{ type: 'text', text: '插一句' }] },
+  });
+  const rows = tracker.pendingTranscriptRows('s1');
+  assert.equal(rows.length, 1);
+  assert.equal(rows[0].role, 'user');
+  assert.equal(rows[0].clientId, 'c9', 'the controller recognises its own message by this id');
+  assert.equal(rows[0].content.text, '插一句');
+  assert.equal(rows[0].pendingDelivery, 'steering');
+  assert.equal(rows[0].id, 's1:pending:c9');
+  assert.ok(Number.isFinite(Date.parse(rows[0].createdAt)), 'the row carries when it was accepted');
+
+  // The durable row retires it: the two never coexist, and the controller's own echo
+  // reconciliation swaps one for the other.
+  tracker.mirror('s1', 'c9', { kind: 'remove' });
+  assert.deepEqual(tracker.pendingTranscriptRows('s1'), []);
+});
+
 test('folds the baseline, then replaces one session at a time', () => {
   const tracker = createInputQueueTracker();
   tracker.apply({

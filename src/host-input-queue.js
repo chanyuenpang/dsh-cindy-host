@@ -233,7 +233,46 @@ export function createInputQueueTracker() {
     if (id === null) return;
     const items = queues.get(sessionId) ?? [];
     const others = items.filter((entry) => String(entry?.id) !== id);
-    queues.set(sessionId, [...others, { ...item, id, placement }]);
+    // `at` is what a pending transcript row is stamped with, so the message the user is
+    // looking at carries the moment it was accepted rather than the moment it was read.
+    queues.set(sessionId, [...others, { ...item, id, placement, at: Date.now() }]);
+  }
+
+  /**
+   * Transcript-shaped rows for prompts this Host has accepted but DSH has not made durable.
+   *
+   * The gap this closes, measured: a prompt sent while a turn is running waits in DSH's
+   * inbox until the turn reaches a step boundary — 0.4 s when idle, and **42 s** in the worst
+   * observed case. During that window the session's transcript (both the raw window and the
+   * work-grouped view) contains no row for it, so a controller that reloads the session — or
+   * simply drops its own optimistic bubble — shows nothing at all: 「退出去再进来，它不见了，
+   * 我就要重新输入这句话」, while the prompt is still queued and will be delivered. Serving
+   * the pending prompt as a row makes the Host the source of truth for "we have it", and the
+   * durable row replaces it by `clientId` the moment it lands.
+   *
+   * @param sessionId - the session.
+   * @returns newest-last rows in the controller's message shape.
+   */
+  function pendingTranscriptRows(sessionId) {
+    const rows = [];
+    for (const item of queueFor(sessionId)) {
+      const clientId = typeof item?.rpcId === 'string' && item.rpcId !== '' ? item.rpcId : String(item?.id ?? '');
+      if (clientId === '') continue;
+      const content = Array.isArray(item?.message?.content) ? item.message.content : [];
+      rows.push({
+        id: `${sessionId}:pending:${clientId}`,
+        clientId,
+        sessionId,
+        role: 'user',
+        toolUseId: null,
+        agentMeta: null,
+        createdAt: new Date(Number.isFinite(item?.at) ? item.at : Date.now()).toISOString(),
+        content: { text: textOf(content) ?? '' },
+        // Informational: which queue the prompt is waiting in, for anything that reads it.
+        pendingDelivery: item.placement === 'steering' ? 'steering' : 'queued',
+      });
+    }
+    return rows;
   }
 
   /**
@@ -422,6 +461,8 @@ export function createInputQueueTracker() {
     markSteering: (sessionId, item) => { markSteering(sessionId, item); },
     /** Record one just-accepted queued prompt, preserving the rest of the queue. */
     markQueued: (sessionId, item) => { markQueued(sessionId, item); },
+    /** Prompts accepted but not yet durable, in the controller's message shape. */
+    pendingTranscriptRows: (sessionId) => pendingTranscriptRows(sessionId),
     /** Every queued item id, newest fold first — used to clear a queue honestly. */
     itemIds: (sessionId) => (queues.get(sessionId) ?? []).map((item) => String(item?.id)),
   };

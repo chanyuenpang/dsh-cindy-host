@@ -358,6 +358,70 @@ test('an accepted steer is visible as steering before it is durable', async () =
   assert.deepEqual(pushed, ['s1'], 'and the projection is pushed, so the bubble has an answer');
 });
 
+test('the newest window carries prompts the Host has accepted but not yet made durable', async () => {
+  // The experience this fixes: send while a turn is running, the row is not in the transcript
+  // yet (DSH splices it at the turn's next step boundary — 0.4 s idle, 42 s worst observed),
+  // reload the session, and the message looks lost even though it is queued and will arrive.
+  // Serving it as a row on the **newest** page makes the Host answer "we have it" — and only
+  // there, because a cursor names a durable row and inventing rows behind it would corrupt
+  // paging.
+  const pendingRow = {
+    id: 's1:pending:c1',
+    clientId: 'c1',
+    sessionId: 's1',
+    role: 'user',
+    toolUseId: null,
+    agentMeta: null,
+    createdAt: '2026-01-01T00:00:05.000Z',
+    content: { text: '插一句' },
+    pendingDelivery: 'steering',
+  };
+  const durable = [{ id: 's1:m1:0', clientId: 's1:m1:0', role: 'assistant', content: { text: 'hi' }, createdAt: '2026-01-01T00:00:01.000Z' }];
+  const router = createChannelRouter({
+    listSessions: async () => ROWS,
+    resolveCapabilities: () => ({
+      readMessages: async () => durable,
+      queueMirror: { pendingRows: (sessionId) => (sessionId === 's1' ? [pendingRow] : []) },
+    }),
+    subscribers: new Set(),
+  });
+
+  const newest = await router(request('local-db:messages:list', ['s1', { limit: 20 }]));
+  assert.deepEqual(newest.payload.result.map((row) => row.clientId), ['c1', 's1:m1:0'], 'the pending prompt is the newest thing');
+  assert.equal(newest.payload.result[0].role, 'user');
+  assert.equal(newest.payload.result[0].content.text, '插一句');
+
+  const paged = await router(request('local-db:messages:list', ['s1', { limit: 20, before: 's1:m1:0' }]));
+  assert.deepEqual(paged.payload.result.map((row) => row.clientId), ['s1:m1:0'], 'a cursor page is durable rows only');
+
+  // The work-grouped view shows it too, as a readable item on its newest page.
+  const viewItems = [{ type: 'messages', key: 's1:m1:0', messages: durable }];
+  const viewing = createChannelRouter({
+    listSessions: async () => ROWS,
+    resolveCapabilities: () => ({
+      historyView: { page: async () => ({ ok: true, result: { version: 1, items: viewItems, nextCursor: 's1:m1:0', hasMore: true } }) },
+      queueMirror: { pendingRows: () => [pendingRow] },
+    }),
+    subscribers: new Set(),
+  });
+  const page = await viewing(request('local-db:messages:view', ['s1', {}]));
+  assert.equal(page.payload.result.items.length, 2);
+  assert.equal(page.payload.result.items[1].type, 'messages');
+  assert.equal(page.payload.result.items[1].messages[0].clientId, 'c1');
+  assert.equal(page.payload.result.nextCursor, 's1:m1:0', 'the cursor still names the last durable item');
+  // An older page never carries it: the prompt is the newest thing, not an old one.
+  const older = createChannelRouter({
+    listSessions: async () => ROWS,
+    resolveCapabilities: () => ({
+      historyView: { page: async () => ({ ok: true, result: { version: 1, items: viewItems, nextCursor: null, hasMore: false } }) },
+      queueMirror: { pendingRows: () => [pendingRow] },
+    }),
+    subscribers: new Set(),
+  });
+  const olderPage = await older(request('local-db:messages:view', ['s1', { before: 's1:m1:0' }]));
+  assert.equal(olderPage.payload.result.items.length, 1);
+});
+
 test('an empty enqueue is refused rather than accepted with nothing to run', async () => {
   const sent = [];
   const router = createChannelRouter({
