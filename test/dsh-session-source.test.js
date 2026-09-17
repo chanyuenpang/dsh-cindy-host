@@ -346,7 +346,52 @@ test('a listing that misses its deadline answers with the list read moments ago'
   assert.equal(diagnostics.staleServes, 1, 'and it is counted, not silent');
   assert.match(diagnostics.lastStaleReason, /timeout/);
 
-  // Past the bound it is not a recent read any more, and the failure is honest.
+  // Past the bound it is not a recent read any more, and the failure is honest. (The stale
+  // fallback's absence would otherwise earn this read a retry — see the cold-start case below —
+  // so this asserts the rejection after both attempts.)
   clock += 200_000;
   await assert.rejects(() => source.listSessions(), /aborted due to timeout/);
+});
+
+test('the first listing after a cold start gets one retry before it gives up', async () => {
+  // Measured in the boot window, twice over: `invoke:local-db:sessions:get` and
+  // `invoke:local-db:sessions:list` recorded TimeoutErrors, and a failed list read is what the
+  // controller renders as an empty session list (the spinner). The stale fallback cannot help —
+  // nothing has been served yet — and the first read is the one that pays for caches the second
+  // read then finds warm, so the retry is worth more than the honest failure.
+  let reads = 0;
+  const source = createSessionControllerSource({
+    sessionController: {
+      async list() {
+        reads += 1;
+        if (reads === 1) throw Object.assign(new Error('The operation was aborted due to timeout'), { name: 'TimeoutError' });
+        return { items: [{ sessionId: 's1', updatedAt: 1, running: false }] };
+      },
+    },
+    subscribe: makeSubscribe(),
+    now: () => 1_000_000,
+  });
+
+  assert.equal((await source.listSessions()).length, 1, 'the second attempt answers');
+  assert.equal(reads, 2, 'exactly one retry');
+  assert.equal(source.listDiagnostics().staleServes, 0, 'and it is not counted as a stale serve');
+
+  // With a listing already in hand, a failure is served stale instead of retried: the retry exists
+  // for the cold start, not as a second chance on every poll.
+  let failingReads = 0;
+  const failing = createSessionControllerSource({
+    sessionController: {
+      async list() {
+        failingReads += 1;
+        if (failingReads > 1) throw Object.assign(new Error('The operation was aborted due to timeout'), { name: 'TimeoutError' });
+        return { items: [{ sessionId: 's1', updatedAt: 1, running: false }] };
+      },
+    },
+    subscribe: makeSubscribe(),
+    now: () => 1_000_000,
+  });
+  assert.equal((await failing.listSessions()).length, 1, 'the first read is real');
+  assert.equal((await failing.listSessions()).length, 1, 'and a later failure is served stale');
+  assert.equal(failingReads, 2, 'one attempt, no retry, because a fallback existed');
+  assert.equal(failing.listDiagnostics().staleServes, 1);
 });

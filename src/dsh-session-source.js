@@ -194,15 +194,31 @@ export function createSessionControllerSource({
    *   moments ago is served instead of an error, inside a bound. The data is real and durable —
    *   only its age is in question, and the controller's next poll corrects it — while the
    *   failure mode it replaces is an empty list and a spinner.
+   * - **With no previous listing, the read gets one retry.** That is the cold start: a Host that
+   *   has just restarted has served nothing yet, so the stale fallback above has nothing to give,
+   *   and the first read is the one that pays for caches the second read then finds warm. Measured:
+   *   `invoke:local-db:sessions:get` and `invoke:local-db:sessions:list` both recorded
+   *   `TimeoutError`s in the boot window, and a failed list read is what the controller renders as
+   *   an empty session list. The retry is inside the shared flight, so concurrent callers cost one
+   *   retry between them, and it only happens when there is no fallback to serve instead.
    */
   async function listItems() {
     if (inFlightList !== null) return inFlightList;
     const attempt = (async () => {
-      const signal = typeof AbortSignal?.timeout === 'function' ? AbortSignal.timeout(listTimeoutMs) : undefined;
-      const value = await sessionController.list({}, signal);
-      const items = (Array.isArray(value?.items) ? value.items : []).filter(isControllerVisible);
-      lastListed = { items, at: now() };
-      return items;
+      let lastError = null;
+      const tries = lastListed === null ? 2 : 1;
+      for (let index = 0; index < tries; index += 1) {
+        try {
+          const signal = typeof AbortSignal?.timeout === 'function' ? AbortSignal.timeout(listTimeoutMs) : undefined;
+          const value = await sessionController.list({}, signal);
+          const items = (Array.isArray(value?.items) ? value.items : []).filter(isControllerVisible);
+          lastListed = { items, at: now() };
+          return items;
+        } catch (error) {
+          lastError = error;
+        }
+      }
+      throw lastError;
     })();
     inFlightList = attempt;
     try {
