@@ -3,7 +3,7 @@
 <!-- state: current -->
 ## Current behavior
 
-`dsh-cindy-host-demo` (package name `dsh-cindy-host-demo`, version `0.1.2`) is a DSH
+`dsh-cindy-host-demo` (package name `dsh-cindy-host-demo`, version `0.1.4`) is a DSH
 plugin bundle that mounts the 「Cindy 手机连接」 card in **Settings → Plugins** and
 lets this Host be reached from the Cindy mobile client. The Host is the only truth
 for connection state: the card writes settings and renders whatever the Host's
@@ -131,6 +131,11 @@ Failure containment and observability:
 
 ## Distribution
 
+- **0.1.4 is the current registry version** (`dsh plugin --profile <p> add
+  dsh-cindy-host-demo@0.1.4`), verified from the registry itself: install into a brand-new
+  `DSH_HOME` → `profile-local @deepseek-ai == 0`, compose passes, `dsh web` starts,
+  `/api/dsh-cindy-host/status` → `200`. Its change is the new-conversation runtime
+  (`.claw/truth/dsh-cindy-host-new-session-runtime.md`, `.claw/adr/0011`).
 - **0.1.2 ships through the npm registry** (`dsh plugin --profile <p> add
   dsh-cindy-host-demo@0.1.2`), MIT, `private: false`. 0.1.1 was a GitHub Release tarball
   instead, and **its asset is defective** (it drags an old DSH generation into the
