@@ -2153,6 +2153,43 @@ and the re-link that follows immediately reaches the same device for the same tu
 receives nothing (including a turn that ends while it is away) and is told the truth when
 it links again after the window; a re-link inside the window repeats nothing.
 
+### presence 会说谎，设备自己的帧不会
+
+上面那条「离线就撤销订阅」的策略，实测在 09:48:04 造成了它本来要避免的症状：
+
+```
+09:47:04  dsh web 重启，手机重新连上并订阅
+09:48:04  presence-changed { online: false }      ← 但用户正盯着手机看
+          → dropOfflineSubscriptions 撤掉全部订阅 → 之后不再有任何 push
+09:51:13  手机自己重新 subscribe（用户退出会话再进来）
+```
+
+这三分钟里手机既转圈又「没有收到你的这些操作记录」——和这条策略要修的那个症状一模一样。结论：
+**presence 是中继的意见，设备发来的帧是事实**。所以现在任何一帧（`invoke` 或 `link-open`）来自
+被标记离线的设备，就当场撤销判定：
+
+- 它的 `sessions` 主题与会话主题全部恢复（列表主题需要单独记，`watchedListDevices`——会话主题
+  本来就有 `watchedSessionsByDevice`，而 `sessions` 没有 session id 可挂）；
+- 它可能错过的回合状态重新播报（复用 `announceWatchedTurnState`，与 `link-open` 同一条去重窗口）；
+- 它正在看的视图被失效，于是它重读而不是停在旧内容。
+
+presence 改口说 `online: true` 时做同样的事，所以回来的设备不必手动重订阅。
+
+### 一次列表读超时不该变成空列表
+
+同一段时间还量到 **7 次 `local-db:sessions:list` 以 `TimeoutError` 失败**，集中在重启后的 13 秒内：
+手机重连 + 两台桌面端在轮询，同时冷读 45 个会话，都压在那个 15s 预算上。控制器把列表失败渲染成
+**什么都没有**——也就是用户看到的转圈。`dsh-session-source.js` 因此加了两条性质：
+
+- **单飞**：并发调用共享同一次读，三个控制器在冷启动时问同一个问题，不会把已经赶不上期限的活儿
+  再乘三；
+- **陈旧的答案好过失败的答案**：真的错过期限时，把刚才读到的那份列表发出去（120s 内），而不是
+  抛错。数据是真实且持久的，有疑问的只是它的年龄，而且下一次轮询就会纠正——它替代的失败模式是
+  空列表。
+
+陈旧的应答会记数并出现在 `diagnostics.listing`（`staleServes` / `lastStaleReason`），所以「被吸收
+的降级」不会变成静默。**这个数不该增长**：它在长，说明列表读本身需要优化，而不是说明系统健康。
+
 ## 一次未处理的 rejection 会结束整个 dsh web
 
 手机报「DSH 掉线了」的那一次，原因不在中继也不在网络。证据链（时间为 UTC+8）：
