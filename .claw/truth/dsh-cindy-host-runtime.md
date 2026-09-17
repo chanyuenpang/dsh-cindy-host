@@ -1,4 +1,4 @@
-﻿# DSH Cindy Host: runtime and settings card contract
+# DSH Cindy Host: runtime and settings card contract
 
 <!-- state: current -->
 ## Current behavior
@@ -72,6 +72,62 @@ Verification rules:
   `dsh-cindy-host-demo` entry of `window.__DSH_BOOT__`.
 - `npm test` renders the card with React, so card markup and state rules are
   covered without a browser.
+- The sandbox is a second, independently restartable instance (`tools/sandbox.mjs`,
+  `npm run sandbox` / `sandbox:stop`) whose plugin entry is a link to this repository, so
+  it loads new source without touching the instance that hosts a conversation. It has its
+  own credential (`session-v1@<digest>`) and therefore its own relay device, which is what
+  makes two installations on one machine coexist rather than fight over one device id.
+- `tools/restart-host.mjs` restarts an instance — including the one hosting the session —
+  by starting a supervisor through **WMI** (`Win32_Process.Create`), because a process
+  spawned from an agent command stays inside that command's Windows job object and is
+  reaped when the command ends. The relaunched instance must be spawned **detached**: with
+  `detached: false` it dies with the supervisor, and its output must go to a **file**, not a
+  pipe (a destroyed pipe is an EPIPE that DSH's fail-loud handler turns into `exit(1)`).
+
+Turn state and live ordering (the facts behind 「看不到进度」「插入跑到前面」「工作卡在我上面」):
+
+- **The turn state's authority is DSH's own boundaries, not the row cache.** `turn/start`
+  and `turn/end` write `liveTurnState`; `isSessionRunning` consults it first and falls back
+  to a read row only when no boundary has ever been seen. The row cache is filled by *list
+  reads*, so a Host that has just restarted has no row to write to — and the earlier version
+  dropped the fact on the floor, which made a live turn report `isSessionRunning: false` and
+  the history view mark the running group `isStreaming: false`.
+- **The history view is wired to that state.** `createHistoryViewController`'s
+  `sessionRunning` defaults to `() => false`, so `buildDshSource` takes it as an option and
+  the plugin passes `runtime.isSessionRunning` lazily. Without the wiring the running card is
+  never marked streaming: no live card on the phone, and nothing for the pin below to detect.
+- **A running work group is pinned last.** A streaming group is the present tense; anything
+  that sorts after it by time (a prompt still queued for the next turn, a row that arrives
+  while the turn runs) is placed above it. A finished group keeps its place in history.
+- **Pending prompts are placed where the user typed them**, merged into the page by
+  acceptance time (`mergePendingByTime`), on both the view and `local-db:messages:list`
+  (which is newest-first). This is a prediction: a queued prompt is delivered at the next
+  turn boundary, so it can move once, when it becomes durable.
+- **The poisoning codes are reserved for capability absence.** `UNSUPPORTED_CAPABILITY` and
+  `CHANNEL_NOT_ALLOWED` answer "this Host has no such projection at all" and never a property
+  of one session; the controller's `historyViewController.refresh()` returns early forever
+  once its error matches that family, and only a reset clears it.
+- **A steer that DSH refuses is retried as a normal prompt.** The mode follows the session
+  (`maker:input:steer` with no live turn becomes a prompt), and a refusal whose text is about
+  steering (`current turn no longer accepts steering`) is retried once as `queue`, because
+  the gap between our check and DSH's decision is a race and the user's words must not be
+  what loses it. Every other failure still travels to the controller unchanged.
+
+Failure containment and observability:
+
+- **Every listener this plugin hands the host goes through `guarded(label, listener)`.** Cordis
+  dispatches with no `try`/`catch` and its `waterfall` returns a listener's promise to DSH, where
+  a rejection reaches the boot's fail-loud handler (`fatal load failure` → `process.exit(1)`).
+  A source-level test fails on a bare `ctx.on(` registration.
+- **`diagnostics` is a contract**: the block must exist and every key must be present, each
+  volatile field read through a try/catch accessor, because the status route answers a throwing
+  producer by omitting the whole block. `diagnostics.boundaries` carries a verdict —
+  `recovered` (it contained something that would have exited the process), `starting`, or
+  `silent` (up past `BOUNDARY_SILENCE_MS` with nothing contained, which is a finding, not a
+  clean bill of health) — with the installed listener labels beside it.
+- **`handlerErrors[].where` names the channel** (`invoke:<channel>`): seven identical
+  `TimeoutError`s are unattributable without it, and "which read is missing its budget" is the
+  only question that field has to answer.
 
 <!-- state: history -->
 ## Evolution history
