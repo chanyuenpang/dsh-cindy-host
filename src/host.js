@@ -1098,6 +1098,13 @@ export async function startHost(initialSource, settings = DEFAULT_HOST_SETTINGS,
        */
       pushInputProjection: (sessionId) => pushSessionUpdate(sessionId, 'maker:input:projection', inputQueue.projectionFor(sessionId, sessionRowFor(sessionId))),
       /**
+       * Ask the controllers watching a session to re-read its history view.
+       *
+       * Exposed for the subscribe path: a controller that has just (re)subscribed is rebuilding
+       * its view, and every push it missed while it was away was dropped by the relay, not queued.
+       */
+      invalidateHistoryView: (sessionId) => pushHistoryViewChanged(sessionId),
+      /**
        * Whether a turn is live for this session.
        *
        * It decides whether an accepted prompt queues or is admitted immediately,

@@ -298,9 +298,21 @@ test('pushes a live message only to the controllers watching that session', asyn
     // 结束了，但我这边还是显示 思考中". Both frames are asserted, each exactly once:
     // a controller holds the list topic and this session's topic at the same time,
     // and it is still one reader of one row.
+    // Three frames, and the third is new — deliberately.
+    //
+    // A controller that (re)subscribes is rebuilding its view: measured, an app returning from the
+    // background flickers unsubscribe → resubscribe, and a send inside that flicker had its
+    // "accepted" and "the view changed" frames discarded by the relay with nobody to retry them
+    // (the bubble spun forever until the app was restarted). So a subscription now also carries
+    // the authoritative input projection — which retires a spinning bubble — and asks for a
+    // re-read. The view invalidation itself is coalesced, so it rides a timer rather than this
+    // list.
     const announced = socket.sent.filter((frame) => frame.kind === 'push');
-    assert.equal(announced.length, 2, 'the new watcher is told the turn state, once');
-    assert.deepEqual(announced.map((frame) => frame.payload.channel), ['maker:event', 'local-db:sessions:patched']);
+    assert.equal(announced.length, 3, 'the new watcher is told the turn state, the queue, and to re-read');
+    assert.deepEqual(
+      announced.map((frame) => frame.payload.channel),
+      ['maker:event', 'local-db:sessions:patched', 'maker:input:projection'],
+    );
     assert.deepEqual(announced[0].payload.payload.event, { type: 'done' });
     // Exactly what the controller's `local-db:sessions:patched` handler reads.
     assert.equal(announced[1].payload.payload.sessionId, 's1');
@@ -311,7 +323,7 @@ test('pushes a live message only to the controllers watching that session', asyn
     const pushes = socket.sent.filter((frame) => frame.kind === 'push');
     // The row goes out at once; the view invalidation that rides with it is coalesced (its
     // own test drives that timer), so exactly one frame is added here.
-    assert.equal(pushes.length, 3);
+    assert.equal(pushes.length, 4);
     const messagePush = pushes[pushes.length - 1];
     assert.equal(messagePush.dst, 'phone-2', 'a session push is addressed to its watcher');
     // Exactly what the controller's `local-db:messages:created` handler reads.
@@ -321,7 +333,7 @@ test('pushes a live message only to the controllers watching that session', asyn
 
     // A session nobody watches must not leak into another session's stream.
     runtime.pushSessionMessage('s2', { id: 'm2' });
-    assert.equal(socket.sent.filter((frame) => frame.kind === 'push').length, 3);
+    assert.equal(socket.sent.filter((frame) => frame.kind === 'push').length, 4);
 
     // Unsubscribing, or the socket going away, stops the stream.
     socket.frame({ v: 1, kind: 'invoke', id: 'unsub-1', src: 'phone-2', payload: { channel: 'device-link:unsubscribe', args: [{ topics: ['session:s1'] }] } });

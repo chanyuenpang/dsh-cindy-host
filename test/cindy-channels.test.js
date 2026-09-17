@@ -1394,3 +1394,36 @@ test('media:fetch forwards the fields that decide the answer', async () => {
   const absent = await createChannelRouter({ listSessions: async () => ROWS, resolveCapabilities: () => ({}), subscribers: new Set() })(request('device-link:media:fetch', []));
   assert.equal(absent.payload.error.code, 'NOT_AVAILABLE');
 });
+
+test('subscribing to a session repairs what a dropped push would have carried', async () => {
+  // Measured on the handset: an app returning from the background flickers unsubscribe →
+  // resubscribe, a send landed inside the flicker, and the frames carrying "accepted" and "the
+  // view changed" were discarded by the relay with nobody to retry them — the bubble spun forever
+  // and the transcript stayed stale until the app was restarted. A subscription is the one moment
+  // the client is certainly listening, so the repair rides on it: the authoritative input
+  // projection (retires a spinning bubble) and a view invalidation (re-read).
+  const projections = [];
+  const invalidations = [];
+  const router = createChannelRouter({
+    listSessions: async () => [{ id: 's1', title: 'Alpha', running: false, updatedAt: '2026-01-01T00:00:00.000Z' }],
+    resolveCapabilities: () => ({
+      isSessionRunning: () => false,
+      pushTurnIdle: () => {},
+      pushTurnRunning: () => {},
+      pushInputProjection: (sessionId) => projections.push(sessionId),
+      invalidateHistoryView: (sessionId) => invalidations.push(sessionId),
+    }),
+    subscribers: new Set(),
+  });
+
+  await router(request('device-link:subscribe', [{ topics: ['sessions', 'session:s1'] }]));
+  assert.deepEqual(projections, ['s1'], 'the queue is pushed, so a spinning bubble can be retired');
+  assert.deepEqual(invalidations, ['s1'], 'and the view is invalidated, so the transcript re-reads');
+
+  // The list topic alone is not a session: nothing to repair.
+  projections.length = 0;
+  invalidations.length = 0;
+  await router(request('device-link:subscribe', [{ topics: ['sessions'] }]));
+  assert.deepEqual(projections, []);
+  assert.deepEqual(invalidations, []);
+});

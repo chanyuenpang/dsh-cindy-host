@@ -555,6 +555,18 @@ export function createChannelRouter({
           const running = row === null ? subscribing.isSessionRunning(sessionId) === true : row.running === true;
           if (running) subscribing.pushTurnRunning(sessionId);
           else subscribing.pushTurnIdle(sessionId);
+          // …and the two things a push that never arrived would have carried.
+          //
+          // Measured: an app returning from the background does an unsubscribe → resubscribe
+          // flicker (26 subscribes / 13 unsubscribes in one session), a send landed inside it, and
+          // the frames carrying "accepted" and "the view changed" were discarded by the relay with
+          // nobody to retry them — the bubble spun forever and the transcript stayed stale until
+          // the app was restarted. A subscription is the one moment the client is guaranteed to be
+          // listening, so it is where the Host repairs what it could not deliver: the authoritative
+          // input projection (which retires a spinning bubble) and a view invalidation (which makes
+          // it re-read). Both are idempotent and cost one frame each.
+          if (typeof subscribing.pushInputProjection === 'function') subscribing.pushInputProjection(sessionId);
+          if (typeof subscribing.invalidateHistoryView === 'function') subscribing.invalidateHistoryView(sessionId);
         }
       }
       return invokeResult(request, { subscribed: topics });
