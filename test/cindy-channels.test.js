@@ -326,6 +326,38 @@ test('steer uses the same primitive in steer mode and answers a boolean', async 
   assert.equal(sent[0].mode, 'steer', 'a running turn steers instead of queueing');
 });
 
+test('an accepted steer is visible as steering before it is durable', async () => {
+  // The handset reported 「转圈转圈然后就消失了」: it sent while a turn was running, DSH
+  // spliced the prompt into the running turn's next step, and until that became a durable
+  // row the projection said nothing about the message — so the controller retired its own
+  // bubble and nothing replaced it. DSH's splice lands a moment after `prompt()` returns,
+  // so the Host has to say it itself: the client's id belongs in
+  // `steeringQueueClientIds`, and the projection has to be pushed, not merely implied.
+  const sent = [];
+  const steering = [];
+  const pushed = [];
+  const router = createChannelRouter({
+    listSessions: async () => ROWS,
+    resolveCapabilities: () => ({
+      sendMessage: async (input) => { sent.push(input); return { ok: true }; },
+      pushInputProjection: (sessionId) => pushed.push(sessionId),
+      queueMirror: { markSteering: (sessionId, item) => steering.push({ sessionId, item }) },
+    }),
+    subscribers: new Set(),
+  });
+
+  const result = await router(request('maker:input:steer', ['s1', { clientId: 'c1', text: '插一句' }]));
+  assert.equal(result.payload.ok, true);
+  assert.equal(result.payload.result, true);
+  assert.equal(sent[0].requestId, 'c1', 'the controller id is the prompt identity');
+  assert.equal(steering.length, 1);
+  assert.equal(steering[0].sessionId, 's1');
+  assert.deepEqual(steering[0].item.id, 'c1');
+  assert.deepEqual(steering[0].item.rpcId, 'c1', 'the row is keyed by the id the controller mints');
+  assert.deepEqual(steering[0].item.message.content, [{ type: 'text', text: '插一句' }]);
+  assert.deepEqual(pushed, ['s1'], 'and the projection is pushed, so the bubble has an answer');
+});
+
 test('an empty enqueue is refused rather than accepted with nothing to run', async () => {
   const sent = [];
   const router = createChannelRouter({

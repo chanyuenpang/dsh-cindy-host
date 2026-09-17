@@ -891,6 +891,9 @@ export function createChannelRouter({
           const failure = commitQueueActionAndReconcile(capabilities, sessionId, dshId, { kind: 'steer' });
           if (failure !== null) return invokeError(request, failure.code, failure.message);
           capabilities.queueMirror?.mirror(sessionId, namedId, { kind: 'steer' });
+          // The promotion moved the row from "queued" to "steering": tell the controller
+          // that, or the row it is showing disappears in the hand-off.
+          capabilities.pushInputProjection?.(sessionId);
           // The controller answers a steer with a boolean and then refetches.
           return invokeResult(request, true);
         }
@@ -930,7 +933,27 @@ export function createChannelRouter({
         return invokeError(request, sent.code ?? 'ATTACHMENT_UNAVAILABLE', sent.message ?? 'the attachment could not be fetched');
       }
 
-      if (steer) return invokeResult(request, true);
+      if (steer) {
+        // A **new** steering prompt (not a promotion) has to be made visible before it is
+        // durable.
+        //
+        // DSH splices it into the running turn's next step a moment after `prompt()`
+        // returns, so a projection read taken right now may legitimately say nothing about
+        // it. The controller's bubble would then have nothing to hold on to and vanish —
+        // 手机上「转圈转圈然后就消失了」 while the message did reach the desktop. Recording
+        // it as a steering item keeps `steeringQueueClientIds` truthful from this moment,
+        // and `retireQueuedItem` clears it the instant the durable row arrives.
+        const controllerId = namedId ?? request.id;
+        if (typeof capabilities.queueMirror?.markSteering === 'function') {
+          capabilities.queueMirror.markSteering(sessionId, {
+            id: controllerId,
+            rpcId: controllerId,
+            message: { id: controllerId, content: text === null || text === '' ? [] : [{ type: 'text', text }] },
+          });
+        }
+        capabilities.pushInputProjection?.(sessionId);
+        return invokeResult(request, true);
+      }
 
       // Answer with the queue DSH actually holds.
       //

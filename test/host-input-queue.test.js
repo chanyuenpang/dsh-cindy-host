@@ -57,6 +57,33 @@ test('folds a just-accepted item into the projection for a source-shaped session
   assert.deepEqual(projection.pendingQueue.map((row) => row.clientId), ['c1']);
 });
 
+test('a just-accepted steering prompt is projected as steering, and only that one', () => {
+  // The controller keeps its bubble alive from `steeringQueueClientIds`; a prompt DSH has
+  // spliced but not yet made durable has to appear there, without disturbing the queue the
+  // session already holds.
+  const tracker = createInputQueueTracker();
+  tracker.apply({ type: 'queue', sessionId: 's1', items: [item('q1', 'queued', 'queued first')] });
+
+  tracker.markSteering('s1', {
+    id: 'c2',
+    rpcId: 'c2',
+    message: { id: 'c2', content: [{ type: 'text', text: '插一句' }] },
+  });
+
+  const projection = tracker.projectionFor('s1', SOURCE_SESSION);
+  assert.deepEqual(projection.steeringQueueClientIds, ['c2']);
+  assert.deepEqual(projection.pendingQueue.map((row) => row.clientId), ['q1'], 'the real queue is untouched');
+
+  // Marking the same id again replaces that entry rather than duplicating it.
+  tracker.markSteering('s1', { id: 'c2', rpcId: 'c2', message: { id: 'c2', content: [] } });
+  assert.deepEqual(tracker.projectionFor('s1', SOURCE_SESSION).steeringQueueClientIds, ['c2']);
+  assert.equal(tracker.queueFor('s1').filter((entry) => entry.id === 'c2').length, 1);
+
+  // And the durable row retires it, which is what ends the bubble.
+  tracker.mirror('s1', 'c2', { kind: 'remove' });
+  assert.deepEqual(tracker.projectionFor('s1', SOURCE_SESSION).steeringQueueClientIds, []);
+});
+
 test('folds the baseline, then replaces one session at a time', () => {
   const tracker = createInputQueueTracker();
   tracker.apply({

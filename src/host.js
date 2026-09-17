@@ -841,6 +841,10 @@ export async function startHost(initialSource, settings = DEFAULT_HOST_SETTINGS,
         setInteractionLock: (sessionId, lockId, locked) => inputQueue.setInteractionLock(sessionId, lockId, locked),
         clearSession: (sessionId) => inputQueue.clearSession(sessionId),
         adopt: (sessionId, items) => inputQueue.adopt(sessionId, items),
+        // A prompt just accepted as steering: the controller's own id has to appear in
+        // `steeringQueueClientIds`, or its bubble has nothing to hold on to until the
+        // durable row lands (the model driver retires it in between).
+        markSteering: (sessionId, item) => inputQueue.markSteering(sessionId, item),
         itemIds: (sessionId) => inputQueue.itemIds(sessionId),
       },
       /** Project a queue DSH actually reported, rather than the folded one. */
@@ -1321,10 +1325,23 @@ export async function startHost(initialSource, settings = DEFAULT_HOST_SETTINGS,
     // how a live attachment failure was first misread as "the phone never sent".
     if (channel === 'maker:send' || channel === 'maker:input:enqueue' || channel === 'maker:input:steer') {
       const files = Array.isArray(args?.[1]?.files) ? args[1].files : [];
-      if (files.length === 0) return null;
-      const refs = files.filter((file) => isAttachmentOssRef(file?.path)).length;
-      const form = refs === files.length ? 'oss-refs' : refs === 0 ? 'host-paths' : 'mixed';
-      return `attachments=${files.length} form=${form}`;
+      // Which session received the prompt, and which text: a send is the one request whose
+      // effect is invisible in this log otherwise, and 「我发了两条消息，你收到了吗」 took a
+      // log excavation to answer — the session id and a bounded length make it a lookup.
+      const sessionId = typeof args?.[0] === 'string' && args[0] !== '' ? args[0] : (typeof args?.[0]?.sessionId === 'string' ? args[0].sessionId : '?');
+      const text = typeof args?.[1] === 'string' ? args[1] : (typeof args?.[1]?.text === 'string' ? args[1].text : null);
+      const clientId = typeof args?.[1]?.clientId === 'string' && args[1].clientId !== '' ? args[1].clientId : null;
+      const parts = [
+        sessionId,
+        `text=${text === null ? 'none' : `${text.length}c`}`,
+        `clientId=${clientId ?? 'none'}`,
+      ];
+      if (files.length > 0) {
+        const refs = files.filter((file) => isAttachmentOssRef(file?.path)).length;
+        const form = refs === files.length ? 'oss-refs' : refs === 0 ? 'host-paths' : 'mixed';
+        parts.push(`attachments=${files.length} form=${form}`);
+      }
+      return parts.join(' ');
     }
     if (channel !== 'local-db:messages:list') return null;
     // Which session is being read matters as much as the cursor: two sessions

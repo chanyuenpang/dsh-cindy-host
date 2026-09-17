@@ -212,6 +212,29 @@ export function createInputQueueTracker() {
     }
   }
 
+  /**
+   * Record a prompt this Host has just accepted as a **steering** item.
+   *
+   * `mirror(..., { kind: 'steer' })` can only re-place an item the fold already holds, and
+   * a *new* steering prompt is in neither `next-turn` nor (yet) `next-step`: DSH splices it
+   * into the running turn's next step a moment after `prompt()` returns. Without this the
+   * projection said nothing about the message the user had just sent, so the controller
+   * retired its own bubble and nothing replaced it — reported as
+   * 「在我的手机端它直接转圈转圈然后就消失了」. The entry is stored under the controller's
+   * own id and is removed by `retireQueuedItem` the moment the durable row lands.
+   *
+   * @param sessionId - the session the prompt went to.
+   * @param item - `{ id, rpcId, message }` for the accepted prompt.
+   */
+  function markSteering(sessionId, item) {
+    if (typeof sessionId !== 'string' || sessionId === '') return;
+    const id = item?.id === undefined || item?.id === null ? null : String(item.id);
+    if (id === null) return;
+    const items = queues.get(sessionId) ?? [];
+    const others = items.filter((entry) => String(entry?.id) !== id);
+    queues.set(sessionId, [...others, { ...item, id, placement: 'steering' }]);
+  }
+
   /** Reorder one queued item, as `maker:input:move` asks. */
   function moveItem(sessionId, controllerId, targetIndex) {
     const items = queues.get(sessionId);
@@ -374,6 +397,8 @@ export function createInputQueueTracker() {
      * resolves instead of reporting NOT_FOUND.
      */
     adopt: (sessionId, items) => { setItems(sessionId, items); },
+    /** Record one just-accepted steering prompt, preserving the rest of the queue. */
+    markSteering: (sessionId, item) => { markSteering(sessionId, item); },
     /** Every queued item id, newest fold first — used to clear a queue honestly. */
     itemIds: (sessionId) => (queues.get(sessionId) ?? []).map((item) => String(item?.id)),
   };

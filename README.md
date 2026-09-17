@@ -98,7 +98,11 @@ Do not enable Cindy transport in production yet. A separate compatibility slice 
 **不入库的内容**（见 `.gitignore`）：
 
 - `node_modules/`；
-- `.sandbox/` —— 沙箱用的 DSH home，带它自己的凭据与会话存储；
+- `.sandbox/` —— 沙箱用的 DSH home，带它自己的凭据与会话存储。
+  注意：`.sandbox/dsh-home/profiles/<profile>/node_modules/dsh-cindy-host-demo` 是指向本仓库的
+  **junction**（不是副本），所以任何**跟随链接递归**的工具（`git status --ignored`、部分索引器）
+  会绕圈并报 `Filename too long`。普通 `git add/status` 因为整目录被忽略不会进去；不要据此
+  「清理」出一个递归副本，磁盘上并没有重复的仓库。
 - `.claw/runtime/`、`.claw/logs/`、`.claw/memory.sqlite*` —— claw 守护进程的运行时状态；
 - 仓库根目录的一次性探测残留（`.claw-*.txt|log|mjs|cjs|report`）与 agent 生成的图片。
 
