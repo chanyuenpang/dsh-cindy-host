@@ -1,0 +1,12 @@
+# Normalize line endings in the repository; the working tree keeps whatever the
+# platform uses. These files are binary or would be mangled by text conversion.
+* text=auto
+
+*.png binary
+*.jpg binary
+*.jpeg binary
+*.webp binary
+*.zstd binary
+*.sqlite binary
+*.sqlite-shm binary
+*.sqlite-wal binary

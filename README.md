@@ -87,6 +87,33 @@ rules are covered without a browser.
 
 Do not enable Cindy transport in production yet. A separate compatibility slice must adapt the projection source to the current Typert session/event remotes, then add a real-host read-only smoke test. The external package must use only version-pinned public DSH packages and never resolve DSH's nested `node_modules`.
 
+## 仓库治理
+
+分支 `main`，当前只有本地提交（尚未配置远端）。
+
+**入库的内容**：`src/`（插件与运行时）、`lib/`（设置页客户端入口）、`test/`（单测）、
+`tools/`（验收脚本与活体探针）、`doc/`、`package.json` / `package-lock.json`、
+`cordis.patch.yml`，以及 claw 的**项目记忆** `.claw/{tasks,adr,truth}/` 与 `.claw/project.json`。
+
+**不入库的内容**（见 `.gitignore`）：
+
+- `node_modules/`；
+- `.sandbox/` —— 沙箱用的 DSH home，带它自己的凭据与会话存储；
+- `.claw/runtime/`、`.claw/logs/`、`.claw/memory.sqlite*` —— claw 守护进程的运行时状态；
+- 仓库根目录的一次性探测残留（`.claw-*.txt|log|mjs|cjs|report`）与 agent 生成的图片。
+
+**验证入口**：
+
+```bash
+npm test                                                              # 单测（407 项）
+npm run audit:channels                                                # 通道判定表（served 52 / declined 140 / unclassified 0）
+node tools/acceptance.mjs --base http://127.0.0.1:3080 --with-prompts # 端到端（105 项）
+npm run verify                                                        # 上面三者的串行组合
+```
+
+`tools/probe-*.mjs` 是活体探针（分页耗时、媒体缩图、todo 投影、会话日志、历史视图形状），
+它们只读本地 DSH 状态，用来把「手机上看到什么」量化成数字。
+
 ## Documents
 
 - [Research](doc/research.md)
