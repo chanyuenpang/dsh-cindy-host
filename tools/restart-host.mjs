@@ -21,12 +21,14 @@
  * time there is anything to read.
  */
 import { execFileSync, spawn } from 'node:child_process';
-import { appendFileSync, existsSync, mkdirSync } from 'node:fs';
+import { appendFileSync, closeSync, existsSync, mkdirSync, openSync, readFileSync } from 'node:fs';
 import { dirname, join, resolve } from 'node:path';
 import { fileURLToPath } from 'node:url';
 
 const repoRoot = resolve(dirname(fileURLToPath(import.meta.url)), '..');
 const logFile = join(repoRoot, '.sandbox', 'host-restart.log');
+/** Where the relaunched instance's own stdout/stderr go: a file, so it outlives the supervisor. */
+const childLog = join(repoRoot, '.sandbox', 'dsh-web.log');
 
 /** Parse `--flag value` pairs, with a dry run as the default. */
 export function parseArgs(argv) {
@@ -152,16 +154,38 @@ async function supervise({ port, graceSeconds, retries, dshHome }) {
         log(`supervise: cannot find ${globalBin}; the instance must be started by hand`);
         return;
       }
+      // The child's output goes to a **file**, not a pipe.
+      //
+      // Measured the hard way: the first version piped stdout/stderr and then destroyed the pipes
+      // before exiting, to avoid lingering. The instance it had just started survived two seconds
+      // — long enough for `up after attempt 1` and `identity preserved` — and then died, because
+      // DSH writes to stdout and a destroyed pipe is an EPIPE, which DSH's fail-loud handler turns
+      // into `exit(1)`. A file is a real sink that outlives this process, so the relaunched
+      // instance keeps a stdout for as long as it runs, and the token URL is still readable here.
+      mkdirSync(dirname(childLog), { recursive: true });
+      const sink = openSync(childLog, 'a');
       const child = spawn(process.execPath, [globalBin, ...args], {
         cwd: repoRoot,
         env: dshHome === null || dshHome === undefined ? process.env : { ...process.env, DSH_HOME: dshHome },
-        stdio: ['ignore', 'pipe', 'pipe'],
-        detached: false,
+        stdio: ['ignore', sink, sink],
+        // **Detached, or it dies with us.** Measured twice: with `detached: false` the new
+        // instance was answering 20 s later and gone seconds after this supervisor exited —
+        // attached to a process group whose leader is leaving. `tools/sandbox.mjs` spawns its
+        // instances detached and they outlive every shell that started them, which is the
+        // difference. A restart helper whose instance dies when the helper exits is worse than
+        // no helper: it looks like it worked.
+        detached: true,
       });
-      let output = '';
-      child.stdout.on('data', (chunk) => { output += String(chunk); });
-      child.stderr.on('data', (chunk) => { output += String(chunk); });
-      log(`supervise: attempt ${attempt + 1}, new pid ${child.pid}`);
+      closeSync(sink);
+      child.unref();
+      log(`supervise: attempt ${attempt + 1}, new pid ${child.pid}, output -> ${childLog}`);
+      const readOutput = () => {
+        try {
+          return readFileSync(childLog, 'utf8');
+        } catch {
+          return '';
+        }
+      };
 
       let up = null;
       for (let poll = 0; poll < 120; poll += 1) {
@@ -172,7 +196,7 @@ async function supervise({ port, graceSeconds, retries, dshHome }) {
       }
       if (up !== null) {
         log(`supervise: up after attempt ${attempt + 1}`);
-        log(`supervise: reopen ${tokenUrlFrom(output, port) ?? '(token not captured — check the terminal)'}`);
+        log(`supervise: reopen ${tokenUrlFrom(readOutput(), port) ?? '(token not captured — see ' + childLog + ')'}`);
         // The identity check needs the relay handshake, and the status route answers before it:
         // the first probe of a fresh instance says `state=authenticating deviceId=?`. Reporting
         // that as IDENTITY CHANGED is a false accusation, and a check that cries wolf is worse
@@ -195,18 +219,25 @@ async function supervise({ port, graceSeconds, retries, dshHome }) {
         }
         log(`supervise: boundaries=${JSON.stringify(up.diagnostics?.boundaries ?? null)}`);
         log(`supervise: handlerErrors=${up.diagnostics?.handlerErrors?.length ?? 'n/a'}`);
-        log(`supervise: launch output tail: ${output.trim().split(/\r?\n/).slice(-3).join(' | ').slice(0, 600)}`);
-        // Let go of the new instance and go away. The pipes were only held to read the token URL,
-        // and leaving them attached keeps this process alive for as long as the server runs —
-        // measured: two supervisors from two tests were still resident minutes later. One stray
-        // process per restart is exactly the kind of leak a restart loop accumulates.
-        child.stdout.destroy();
-        child.stderr.destroy();
+        log(`supervise: launch output tail: ${readOutput().trim().split(/\r?\n/).slice(-3).join(' | ').slice(0, 600)}`);
+        // **Up is not alive.** The first version of this file reported success on the first probe
+        // and left; the instance it had started died seconds later and the user was the one who
+        // found out. So the last thing this does is wait and check that it is *still* answering,
+        // which is the only evidence that separates "started" from "running".
+        await new Promise((done) => setTimeout(done, 20_000));
+        const settled = await probe(port);
+        if (settled === null) {
+          log('supervise: NOT ALIVE 20s after it came up — check ' + childLog + '; the instance is DOWN');
+        } else {
+          log(`supervise: still alive 20s later (state=${settled.status?.state ?? '?'}, uptime=${settled.diagnostics?.boundaries?.uptimeMs ?? '?'}ms)`);
+        }
+        // Then let go and go away: the child's output is a file, so exiting costs it nothing (the
+        // pipe version of this line is what killed the instance it had just started).
         child.unref();
         log('supervise: done, supervisor exiting');
-        process.exit(0);
+        process.exit(settled === null ? 1 : 0);
       }
-      log(`supervise: attempt ${attempt + 1} did not answer; output tail: ${output.trim().slice(-600)}`);
+      log(`supervise: attempt ${attempt + 1} did not answer; output tail: ${readOutput().trim().slice(-600)}`);
     }
     log('supervise: every attempt failed — the instance is DOWN and needs a hand');
     process.exit(1);

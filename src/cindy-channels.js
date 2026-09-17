@@ -91,6 +91,58 @@ function answerQueueCommand(request, capabilities, sessionId) {
 }
 
 /**
+ * When one controller-facing entry happened, for ordering.
+ *
+ * Three shapes reach this: a view `work` item (which spans a range, so it is placed by its end),
+ * a view `messages` item (placed by its last message), and a raw transcript row (its own
+ * `createdAt`).
+ * @param entry - a view item or a transcript row.
+ * @returns epoch ms, or 0 when the shape carries no time.
+ */
+export function occurredAtMs(entry) {
+  if (entry?.type === 'work') return Number(entry.summary?.endedAtMs) || 0;
+  if (Array.isArray(entry?.messages)) {
+    const last = entry.messages[entry.messages.length - 1];
+    return Date.parse(last?.createdAt ?? '') || 0;
+  }
+  return Date.parse(entry?.createdAt ?? '') || 0;
+}
+
+/**
+ * Place accepted-but-not-durable prompts **where the user typed them**, not at the end.
+ *
+ * The reported symptom: 「插入之后顺序会变，它会插入到我前面说的两行话前面」. Two of the user's
+ * messages were queued for the next turn (10:45:11, 10:45:24) and a third was **inserted** — a
+ * steer, which jumps the queue and became durable at 10:46:11, before either of them. So the
+ * transcript order is genuinely insert-first, and this Host was making it worse: pending rows were
+ * appended after the whole page, which put two rows the user typed *earlier* visually below a row
+ * they typed later.
+ *
+ * Ordering them by acceptance time restores the user's own order while they wait. It is a
+ * **prediction**, and the prediction is not always right: a queued message is delivered at the
+ * next turn boundary, so it may still end up after the insert that overtook it — the rows move
+ * once, when they become durable. Delivery order is the transcript's; typing order is what the
+ * user is looking at while nothing has been delivered yet.
+ *
+ * @param items - the page's own entries, already in the page's order.
+ * @param pending - the pending entries, oldest acceptance first.
+ * @param options - `newestFirst` for a descending page (`local-db:messages:list`).
+ * @returns the merged sequence.
+ */
+export function mergePendingByTime(items, pending, { newestFirst = false } = {}) {
+  const merged = [...items];
+  for (const entry of pending) {
+    const at = occurredAtMs(entry);
+    const index = newestFirst
+      ? merged.findIndex((candidate) => occurredAtMs(candidate) < at)
+      : merged.findIndex((candidate) => occurredAtMs(candidate) > at);
+    if (index === -1) merged.push(entry);
+    else merged.splice(index, 0, entry);
+  }
+  return merged;
+}
+
+/**
  * Commit one queue mutation to DSH.
  *
  * `control.update` is **async** — it resolves the session's agent before asking DSH to change
@@ -544,7 +596,7 @@ export function createChannelRouter({
       const before = typeof options?.before === 'string' && options.before !== '' ? options.before : null;
       const pending = before === null ? (capabilitiesNow().queueMirror?.pendingRows?.(sessionId) ?? []) : [];
       // Newest first, and the pending prompts are the newest thing that exists.
-      return invokeResult(request, pending.length === 0 ? rows : [...pending, ...rows]);
+      return invokeResult(request, pending.length === 0 ? rows : mergePendingByTime(rows, pending, { newestFirst: true }));
     }
 
     if (channel === 'maker:list-active') {
@@ -1421,7 +1473,7 @@ export function createChannelRouter({
         if (pending.length > 0) {
           return invokeResult(request, {
             ...answered.result,
-            items: [...answered.result.items, ...pending.map((row) => ({ type: 'messages', key: row.clientId, messages: [row] }))],
+            items: mergePendingByTime(answered.result.items, pending.map((row) => ({ type: 'messages', key: row.clientId, messages: [row] }))),
           });
         }
       }
