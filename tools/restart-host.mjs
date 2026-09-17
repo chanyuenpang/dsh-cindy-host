@@ -1,71 +1,63 @@
 /**
- * Restart the `dsh web` instance that owns a port — including the one hosting the conversation.
+ * Restart the `dsh web` that owns a port — including the one hosting this conversation.
  *
- * Why this needs a script rather than a command: the agent's shells are **children** of that
- * process, so killing it also kills the shell that would do the verifying, and the turn dies
- * half-written. Everything after the kill therefore has to happen in a process that is not in
- * that tree: this file re-launches itself detached, and the detached half does the killing,
- * starting, waiting and reporting.
+ * The whole job is two statements: stop it, start it. Everything else here exists because of two
+ * facts measured the hard way (the reasoning is in ADR-0009):
  *
- * What it cannot fix: a fresh `dsh web` prints a **new** token URL, so the page holding the old
- * one has to be reopened. That is true of a manual restart too — the script saves the typing,
- * not the reconnect.
+ * 1. The process that runs those two statements is a **child of the process being stopped**, and
+ *    it lives inside a Windows job object belonging to the command that started it. So the kill
+ *    is done by a supervisor started through **WMI**, which no job of ours owns.
+ * 2. The instance it starts must be **detached with its output on a file**. Non-detached, it dies
+ *    with the supervisor; piped, a destroyed pipe is an EPIPE that DSH's fail-loud handler turns
+ *    into `exit(1)` — both measured, and both killed the instance that had just come up.
+ *
+ * What this deliberately does not do: retries, identity checks, token scraping. A fresh instance
+ * opens its own browser tab, and the log is enough to tell success from failure afterwards.
  *
  * Usage:
- *   node tools/restart-host.mjs                      # dry run: print exactly what would happen
- *   node tools/restart-host.mjs --apply --grace 30   # do it, 30s from now
- *   node tools/restart-host.mjs --apply --grace 0 --port 3081
- *
- * The outcome (new pid, the token URL to open, the status and diagnostics snapshot) is appended
- * to `.sandbox/host-restart.log`, because the process that asked for the restart is dead by the
- * time there is anything to read.
+ *   node tools/restart-host.mjs                      # dry run: what would happen
+ *   node tools/restart-host.mjs --apply --grace 20   # do it, 20s from now
  */
 import { execFileSync, spawn } from 'node:child_process';
-import { appendFileSync, closeSync, existsSync, mkdirSync, openSync, readFileSync } from 'node:fs';
+import { appendFileSync, closeSync, existsSync, mkdirSync, openSync } from 'node:fs';
 import { dirname, join, resolve } from 'node:path';
 import { fileURLToPath } from 'node:url';
 
 const repoRoot = resolve(dirname(fileURLToPath(import.meta.url)), '..');
 const logFile = join(repoRoot, '.sandbox', 'host-restart.log');
-/** Where the relaunched instance's own stdout/stderr go: a file, so it outlives the supervisor. */
+/** Where the relaunched instance's own output goes: a file, so it outlives the supervisor. */
 const childLog = join(repoRoot, '.sandbox', 'dsh-web.log');
+const settle = (ms) => new Promise((done) => setTimeout(done, ms));
 
-/** Parse `--flag value` pairs, with a dry run as the default. */
+/** `--apply` is the only thing that changes behaviour; a dry run is the default. */
 export function parseArgs(argv) {
-  const options = { apply: false, graceSeconds: 20, port: 3080, retries: 3, dshHome: null };
+  const options = { apply: false, graceSeconds: 20, port: 3080, dshHome: null };
   for (let index = 0; index < argv.length; index += 1) {
     const flag = argv[index];
-    const value = argv[index + 1];
     if (flag === '--apply') options.apply = true;
     else if (flag === '--supervise') options.supervise = true;
-    else if (flag === '--grace') { options.graceSeconds = Number(value); index += 1; }
-    else if (flag === '--port') { options.port = Number(value); index += 1; }
-    else if (flag === '--retries') { options.retries = Number(value); index += 1; }
-    else if (flag === '--dsh-home') { options.dshHome = value; index += 1; }
+    else if (flag === '--grace') { options.graceSeconds = Number(argv[index + 1]); index += 1; }
+    else if (flag === '--port') { options.port = Number(argv[index + 1]); index += 1; }
+    else if (flag === '--dsh-home') { options.dshHome = argv[index + 1]; index += 1; }
   }
   return options;
 }
 
 /**
- * The arguments the target was started with, read from its own command line.
+ * The argv to hand a fresh `dsh`, copied from the target's own command line.
  *
- * Restarting with different ones would silently move the instance — a `--profile` typo costs a
- * login, a wrong `--port` costs the page the user is holding — so they are copied, not assumed,
- * and the **subcommand** is part of them: the live instance's tail is `… bin.js web`, so a
- * relaunch that copied only the flags would start `dsh` with no command at all.
- *
+ * Copied, not assumed: a wrong `--profile` costs a login and a wrong `--port` moves the instance
+ * away from the page the user is holding. The **subcommand counts** — the live instance's tail is
+ * `… bin.js web`, so a flag-only copy would start `dsh` with no command at all.
  * @param commandLine - the target process's command line.
- * @returns the argv to hand a fresh `dsh` (subcommand first).
+ * @returns the argv for a fresh `dsh` (subcommand first), or `[]` when it cannot be read.
  */
 export function launchArgsFrom(commandLine) {
   const text = typeof commandLine === 'string' ? commandLine : '';
   const marker = text.lastIndexOf('bin.js');
-  // No `bin.js` at all means this is not a `dsh` entry point, and guessing a subcommand from an
-  // arbitrary tail is how a restart turns into `dsh dable`.
   if (marker === -1) return [];
   const tail = text.slice(marker + 'bin.js'.length).trim();
   const args = [];
-  // The subcommand is the first bare token after bin.js; flags may follow it in any order.
   const subcommand = tail.match(/^([a-zA-Z][\w-]*)/);
   if (subcommand !== null) args.push(subcommand[1]);
   const profile = tail.match(/--profile\s+("([^"]+)"|(\S+))/);
@@ -75,30 +67,23 @@ export function launchArgsFrom(commandLine) {
   return args;
 }
 
-/** The token URL a starting `dsh web` prints, or null while it has not printed one yet. */
-export function tokenUrlFrom(output, port = 3080) {
-  const match = String(output ?? '').match(new RegExp(`http://127\\.0\\.0\\.1:${port}/\\?token=[A-Za-z0-9_-]+`));
-  return match === null ? null : match[0];
-}
-
 function log(line) {
   mkdirSync(dirname(logFile), { recursive: true });
   appendFileSync(logFile, `${new Date().toISOString()} ${line}\n`, 'utf8');
 }
 
-/** The pid listening on a local port, via netstat (no dependency, and it is the truth). */
+/** The pid listening on a local port, via netstat: the truth, with no dependency. */
 function listenerPid(port) {
   try {
     const output = execFileSync('netstat', ['-ano', '-p', 'TCP'], { encoding: 'utf8' });
     for (const line of output.split(/\r?\n/)) {
       const columns = line.trim().split(/\s+/);
-      if (columns.length < 5 || columns[3] !== 'LISTENING') continue;
-      if (!columns[1].endsWith(`:${port}`)) continue;
+      if (columns.length < 5 || columns[3] !== 'LISTENING' || !columns[1].endsWith(`:${port}`)) continue;
       const pid = Number(columns[4]);
       if (Number.isInteger(pid) && pid > 0) return pid;
     }
   } catch {
-    // no netstat: caller decides what to do with null
+    // no netstat: the caller decides what to do with null
   }
   return null;
 }
@@ -111,7 +96,7 @@ function commandLineOf(pid) {
   }
 }
 
-async function probe(port, timeoutMs = 1500) {
+async function probe(port, timeoutMs = 5_000) {
   try {
     const response = await fetch(`http://127.0.0.1:${port}/api/dsh-cindy-host/status`, { signal: AbortSignal.timeout(timeoutMs) });
     return await response.json();
@@ -120,145 +105,61 @@ async function probe(port, timeoutMs = 1500) {
   }
 }
 
-/** The detached half: kill, start, wait, report. */
-async function supervise({ port, graceSeconds, retries, dshHome }) {
-  log(`supervise: start (port ${port}, grace ${graceSeconds}s)`);
+/** The detached half: stop, start, confirm it is alive, and log one line per fact. */
+async function supervise({ port, graceSeconds, dshHome }) {
   const oldPid = listenerPid(port);
-  log(`supervise: target pid=${oldPid ?? 'none'}`);
-  const before = await probe(port);
-  const beforeDeviceId = before?.status?.host?.deviceId ?? null;
-  log(`supervise: identity before = ${beforeDeviceId ?? 'unknown'}`);
-  if (oldPid !== null) {
-    const args = launchArgsFrom(commandLineOf(oldPid));
-    log(`supervise: relaunch args = ${JSON.stringify(args)}`);
-    await new Promise((done) => setTimeout(done, Math.max(0, graceSeconds) * 1000));
-
-    const old = await probe(port);
-    if (old !== null) {
-      try {
-        process.kill(oldPid);
-      } catch (error) {
-        log(`supervise: kill failed: ${error.message}`);
-      }
-    } else {
-      log('supervise: nothing answered the probe, not killing anything');
-    }
-    for (let attempt = 0; attempt < 20; attempt += 1) {
-      if (listenerPid(port) === null) break;
-      await new Promise((done) => setTimeout(done, 250));
-    }
-
-    for (let attempt = 0; attempt < Math.max(1, retries); attempt += 1) {
-      const globalBin = join(process.env.APPDATA ?? '', 'npm', 'node_modules', '@deepseek-ai', 'dsh', 'lib', 'bin.js');
-      if (!existsSync(globalBin)) {
-        log(`supervise: cannot find ${globalBin}; the instance must be started by hand`);
-        return;
-      }
-      // The child's output goes to a **file**, not a pipe.
-      //
-      // Measured the hard way: the first version piped stdout/stderr and then destroyed the pipes
-      // before exiting, to avoid lingering. The instance it had just started survived two seconds
-      // — long enough for `up after attempt 1` and `identity preserved` — and then died, because
-      // DSH writes to stdout and a destroyed pipe is an EPIPE, which DSH's fail-loud handler turns
-      // into `exit(1)`. A file is a real sink that outlives this process, so the relaunched
-      // instance keeps a stdout for as long as it runs, and the token URL is still readable here.
-      mkdirSync(dirname(childLog), { recursive: true });
-      const sink = openSync(childLog, 'a');
-      const child = spawn(process.execPath, [globalBin, ...args], {
-        cwd: repoRoot,
-        env: dshHome === null || dshHome === undefined ? process.env : { ...process.env, DSH_HOME: dshHome },
-        stdio: ['ignore', sink, sink],
-        // **Detached, or it dies with us.** Measured twice: with `detached: false` the new
-        // instance was answering 20 s later and gone seconds after this supervisor exited —
-        // attached to a process group whose leader is leaving. `tools/sandbox.mjs` spawns its
-        // instances detached and they outlive every shell that started them, which is the
-        // difference. A restart helper whose instance dies when the helper exits is worse than
-        // no helper: it looks like it worked.
-        detached: true,
-      });
-      closeSync(sink);
-      child.unref();
-      log(`supervise: attempt ${attempt + 1}, new pid ${child.pid}, output -> ${childLog}`);
-      const readOutput = () => {
-        try {
-          return readFileSync(childLog, 'utf8');
-        } catch {
-          return '';
-        }
-      };
-
-      let up = null;
-      for (let poll = 0; poll < 120; poll += 1) {
-        await new Promise((done) => setTimeout(done, 500));
-        up = await probe(port);
-        if (up !== null) break;
-        if (child.exitCode !== null) break;
-      }
-      if (up !== null) {
-        log(`supervise: up after attempt ${attempt + 1}`);
-        log(`supervise: reopen ${tokenUrlFrom(readOutput(), port) ?? '(token not captured — see ' + childLog + ')'}`);
-        // The identity check needs the relay handshake, and the status route answers before it:
-        // the first probe of a fresh instance says `state=authenticating deviceId=?`. Reporting
-        // that as IDENTITY CHANGED is a false accusation, and a check that cries wolf is worse
-        // than no check — so wait for a device id, and say "inconclusive" if it never comes.
-        let afterDeviceId = up.status?.host?.deviceId ?? null;
-        for (let poll = 0; poll < 60 && (afterDeviceId === null || afterDeviceId === ''); poll += 1) {
-          await new Promise((done) => setTimeout(done, 500));
-          up = (await probe(port)) ?? up;
-          afterDeviceId = up.status?.host?.deviceId ?? null;
-        }
-        log(`supervise: state=${up.status?.state ?? '?'} deviceId=${afterDeviceId ?? '?'}`);
-        if (afterDeviceId === null || afterDeviceId === '') {
-          log('supervise: identity inconclusive — the instance is up but has not reached the relay yet');
-        } else if (beforeDeviceId === null || beforeDeviceId === '') {
-          log(`supervise: identity ${afterDeviceId} (the old instance never reported one)`);
-        } else {
-          log(afterDeviceId === beforeDeviceId
-            ? `supervise: identity preserved (${afterDeviceId})`
-            : `supervise: IDENTITY CHANGED ${beforeDeviceId} -> ${afterDeviceId} — this relaunched against a different DSH_HOME`);
-        }
-        log(`supervise: boundaries=${JSON.stringify(up.diagnostics?.boundaries ?? null)}`);
-        log(`supervise: handlerErrors=${up.diagnostics?.handlerErrors?.length ?? 'n/a'}`);
-        log(`supervise: launch output tail: ${readOutput().trim().split(/\r?\n/).slice(-3).join(' | ').slice(0, 600)}`);
-        // **Up is not alive.** The first version of this file reported success on the first probe
-        // and left; the instance it had started died seconds later and the user was the one who
-        // found out. So the last thing this does is wait and check that it is *still* answering.
-        //
-        // And it retries, because one failed probe is not a death: measured, a 1.5s probe during
-        // the boot window (cost-meter backfilling, sessions replaying) timed out and this logged
-        // `NOT ALIVE` for an instance that was in fact up for the next two minutes. A check that
-        // cries wolf is worse than no check, so the verdict needs more than one sample.
-        let settled = null;
-        let waited = 0;
-        for (let attempt = 0; attempt < 6 && settled === null; attempt += 1) {
-          const pause = attempt === 0 ? 20_000 : 5_000;
-          await new Promise((done) => setTimeout(done, pause));
-          waited += pause;
-          settled = await probe(port, 5_000);
-        }
-        if (settled === null) {
-          log(`supervise: NOT ALIVE after ${Math.round(waited / 1000)}s of probes — check ${childLog}; the instance is DOWN`);
-          log(`supervise: last launch output: ${readOutput().trim().split(/\r?\n/).slice(-3).join(' | ').slice(0, 400)}`);
-        } else {
-          log(`supervise: still alive ${Math.round(waited / 1000)}s later (state=${settled.status?.state ?? '?'}, uptime=${settled.diagnostics?.boundaries?.uptimeMs ?? '?'}ms)`);
-        }
-        // Then let go and go away: the child's output is a file, so exiting costs it nothing (the
-        // pipe version of this line is what killed the instance it had just started).
-        child.unref();
-        log('supervise: done, supervisor exiting');
-        process.exit(settled === null ? 1 : 0);
-      }
-      log(`supervise: attempt ${attempt + 1} did not answer; output tail: ${readOutput().trim().slice(-600)}`);
-    }
-    log('supervise: every attempt failed — the instance is DOWN and needs a hand');
+  const args = oldPid === null ? [] : launchArgsFrom(commandLineOf(oldPid));
+  log(`restart: port ${port}, target ${oldPid ?? 'none'}, grace ${graceSeconds}s, args ${JSON.stringify(args)}`);
+  if (oldPid !== null && args.length === 0) {
+    log('refusing: the target has no readable subcommand, so a relaunch would start `dsh` bare');
     process.exit(1);
   }
-  log('supervise: no listener found; nothing to restart');
+  if (oldPid !== null) {
+    await settle(Math.max(0, graceSeconds) * 1000);
+    try {
+      process.kill(oldPid);
+    } catch (error) {
+      log(`kill failed: ${error.message}`);
+    }
+    for (let attempt = 0; attempt < 20 && listenerPid(port) !== null; attempt += 1) await settle(250);
+  }
+
+  const globalBin = join(process.env.APPDATA ?? '', 'npm', 'node_modules', '@deepseek-ai', 'dsh', 'lib', 'bin.js');
+  if (!existsSync(globalBin)) {
+    log(`cannot find ${globalBin}; start the instance by hand`);
+    process.exit(1);
+  }
+  const sink = openSync(childLog, 'a');
+  const child = spawn(process.execPath, [globalBin, ...args], {
+    cwd: repoRoot,
+    env: dshHome === null || dshHome === undefined ? process.env : { ...process.env, DSH_HOME: dshHome },
+    stdio: ['ignore', sink, sink],
+    detached: true,
+  });
+  closeSync(sink);
+  child.unref();
+  log(`started pid ${child.pid}`);
+
+  // Its startup takes seconds, and nothing is a verdict until it has answered once.
+  let up = null;
+  for (let attempt = 0; attempt < 100 && up === null; attempt += 1) {
+    await settle(500);
+    up = await probe(port);
+  }
+  if (up === null) {
+    log('DOWN: nothing answered after 50s — start it by hand');
+    process.exit(1);
+  }
+  log(`up: state=${up.status?.state ?? '?'} deviceId=${up.status?.host?.deviceId ?? '?'}`);
+  // One confirmation, later: answering once is not the same as staying up, and the difference is
+  // what the user feels. Measured: a version that reported success on its first probe left an
+  // instance that died seconds afterwards.
+  await settle(20_000);
+  log((await probe(port)) === null ? 'DOWN 20s after it came up' : 'alive 20s later');
   process.exit(0);
 }
 
-// Importing this file for its pure helpers must not run the CLI — and with process.exit calls
-// below, an unguarded block would exit a test process that only wanted parseArgs.
+// Importing this file for its pure helpers must not run the CLI.
 const isMain = process.argv[1] !== undefined && resolve(process.argv[1]) === fileURLToPath(import.meta.url);
 const options = parseArgs(process.argv.slice(2));
 if (!isMain) {
@@ -267,61 +168,31 @@ if (!isMain) {
   await supervise(options);
 } else {
   const pid = listenerPid(options.port);
-  const commandLine = pid === null ? '' : commandLineOf(pid);
-  const plan = {
+  console.log(JSON.stringify({
     port: options.port,
     targetPid: pid,
-    targetCommandLine: commandLine.slice(0, 300),
-    relaunchArgs: launchArgsFrom(commandLine),
+    relaunchArgs: pid === null ? [] : launchArgsFrom(commandLineOf(pid)),
     dshHome: options.dshHome ?? process.env.DSH_HOME ?? '(inherited default)',
     graceSeconds: options.graceSeconds,
-    logFile,
     mode: options.apply ? 'APPLY' : 'DRY RUN',
-  };
-  console.log(JSON.stringify(plan, null, 2));
-  if (options.apply) {
-    if (plan.relaunchArgs.length === 0 && pid !== null) {
-      console.log('\nrefusing: the target has no readable subcommand, so a relaunch would start `dsh` bare.');
-      process.exitCode = 1;
-    } else if (!plan.relaunchArgs.includes('--port') && options.port !== 3080) {
-      console.log(`\nwarning: the target names no --port, so the relaunch will come up on the default (3080), not ${options.port}.`);
-    }
-  }
+  }, null, 2));
   if (!options.apply) {
-    console.log('\ndry run: nothing was touched. Re-run with --apply to kill and relaunch the target.');
-    console.log('note: a fresh dsh web prints a NEW token URL — read it from the log above after the restart.');
+    console.log('\ndry run: nothing was touched. --apply kills the target and starts it again.');
   } else {
-    const superviseArgs = [fileURLToPath(import.meta.url), '--supervise', '--port', String(options.port), '--grace', String(options.graceSeconds), '--retries', String(options.retries), ...(options.dshHome === null ? [] : ['--dsh-home', options.dshHome])];
+    // Through WMI: this process is a child of the very pid that is about to die, and a plain
+    // `detached` child stays inside the harness's per-command job object (ADR-0009).
+    const superviseArgs = [fileURLToPath(import.meta.url), '--supervise', '--port', String(options.port), '--grace', String(options.graceSeconds), ...(options.dshHome === null ? [] : ['--dsh-home', options.dshHome])];
     const commandLine = [process.execPath, ...superviseArgs].map((part) => `"${part}"`).join(' ');
-    // Started by **WMI**, not by this process.
-    //
-    // Measured: a `spawn(detached: true)` supervisor is usually reaped anyway — the harness runs
-    // each command inside its own Windows job object, and a detached child does not escape a job
-    // without `CREATE_BREAKAWAY_FROM_JOB`. Two of three live restarts worked and the third was
-    // silently killed during its grace period, leaving the instance untouched. A process created
-    // through `Win32_Process.Create` is a child of the WMI service instead, so no job of mine owns
-    // it. Kept as a fallback: the plain detached spawn, for a machine where WMI is unavailable.
-    let startedBy = 'wmi';
-    let helperPid = null;
+    let via = 'wmi';
     try {
-      const created = execFileSync('powershell', [
-        '-NoProfile',
-        '-Command',
-        `Invoke-CimMethod -ClassName Win32_Process -MethodName Create -Arguments @{ CommandLine = '${commandLine.replace(/'/g, "''")}' } | Select-Object -ExpandProperty ProcessId`,
-      ], { encoding: 'utf8' }).trim();
-      helperPid = Number(created) || null;
-      if (helperPid === null) startedBy = 'spawn';
+      execFileSync('powershell', ['-NoProfile', '-Command', `Invoke-CimMethod -ClassName Win32_Process -MethodName Create -Arguments @{ CommandLine = '${commandLine.replace(/'/g, "''")}' } | Out-Null`], { encoding: 'utf8' });
     } catch {
-      startedBy = 'spawn';
-    }
-    if (startedBy === 'spawn') {
+      via = 'spawn';
       const helper = spawn(process.execPath, superviseArgs, { cwd: repoRoot, env: process.env, stdio: 'ignore', detached: true });
       helper.unref();
-      helperPid = helper.pid;
     }
-    log(`requested: port ${options.port}, target pid ${pid ?? 'none'}, grace ${options.graceSeconds}s, helper ${helperPid ?? '?'} via ${startedBy}`);
-    console.log(`\nAPPLY: supervisor ${helperPid ?? '?'} (via ${startedBy}) will restart port ${options.port} in ${options.graceSeconds}s.`);
-    console.log(`outcome and the new token URL go to ${logFile}`);
-    console.log('this process (and the conversation it hosts) may be killed in the meantime.');
+    log(`requested: port ${options.port}, grace ${options.graceSeconds}s, via ${via}`);
+    console.log(`\nAPPLY: restarting port ${options.port} in ${options.graceSeconds}s (via ${via}).`);
+    console.log(`outcome goes to ${logFile}; this process may be killed in the meantime.`);
   }
 }
