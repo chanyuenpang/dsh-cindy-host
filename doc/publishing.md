@@ -177,11 +177,12 @@ dsh web: http://127.0.0.1:3095/?token=…
 
 ### 5.5 发行渠道的历史：0.1.1 走 GitHub Release，0.1.2 起走 npm registry（2026-09-17）
 
-**0.1.1（历史，且附件有缺陷）**：当时按上面第 6 步的"仅发 tarball"分支执行——发 GitHub Release
+**0.1.1（历史；附件有缺陷，已删除）**：当时按上面第 6 步的"仅发 tarball"分支执行——发 GitHub Release
 `v0.1.1` 并把 `dsh-cindy-host-demo-0.1.1.tgz` 作为附件，同时打 tag 推远端。选它的理由是当时
 `license` 还是 `UNLICENSED`（公开进 registry 等于以未授权状态分发），而"干净 profile 冷启动"那一层
-又失败（后来查明是**我们自己的依赖污染**，见 §5.4）。**那个附件会让装它的 profile 起不来**，不要再
-用它安装。
+又失败（后来查明是**我们自己的依赖污染**，见 §5.4）。**那个附件会让装它的 profile 起不来，已经删掉**
+（下载地址返回 `404`）；`v0.1.1` 的 Release 页与 tag 保留作追溯，页面正文写的是"本版本已撤回，请用
+npm 的 0.1.2"。
 
 **0.1.2（当前渠道：npm registry）**：`private: false` + `license: MIT` + 仓库根 `LICENSE`，然后
 
