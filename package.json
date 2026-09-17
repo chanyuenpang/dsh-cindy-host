@@ -23,6 +23,8 @@
     "acceptance:sandbox": "node tools/acceptance.mjs --base http://127.0.0.1:3081",
     "sandbox": "node tools/sandbox.mjs start",
     "sandbox:stop": "node tools/sandbox.mjs stop",
+    "restart": "node tools/restart-host.mjs",
+    "restart:apply": "node tools/restart-host.mjs --apply",
     "audit:channels": "node tools/channel-audit.mjs",
     "verify": "npm test && npm run audit:channels && npm run acceptance",
     "demo": "node src/demo.js",
