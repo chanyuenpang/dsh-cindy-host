@@ -554,6 +554,76 @@ export async function startHost(initialSource, settings = DEFAULT_HOST_SETTINGS,
     scheduleReconnect(reason);
   }
 
+  /**
+   * Every session a device has held a subscription to, remembered past a disconnect.
+   *
+   * Subscriptions are dropped when the relay reports the device offline (there is no route
+   * to push into), but the device still believes it is inside those sessions. When it links
+   * again, this is what lets the Host tell it the truth about each one instead of leaving a
+   * stale spinner until the user re-enters the session by hand.
+   */
+  const watchedSessionsByDevice = new Map();
+  /**
+   * `deviceId\0sessionId` → when that pair was last told a turn is over.
+   *
+   * A `done` is not idempotent for the controller, and a re-link can race the ordinary
+   * terminal announcement for the same turn; this is the de-duplication window.
+   */
+  const lastTerminalAnnounce = new Map();
+  const TERMINAL_ANNOUNCE_WINDOW_MS = 30_000;
+  /**
+   * Devices the relay has told us it cannot route to.
+   *
+   * Their subscriptions are already gone; this is what keeps the *unwatched* fallback in
+   * {@link announceTurnIdle} from sending into the same void and then recording the frame as
+   * delivered. Cleared the moment the device links again, which is itself proof of a route.
+   */
+  const offlineDevices = new Set();
+
+  /** De-duplication key for "this device was told this session's turn is over". */
+  function terminalAnnounceKey(deviceId, sessionId) {
+    return `${deviceId}\u0000${sessionId}`;
+  }
+
+  /** Note that one device has just been told a session's turn is over. */
+  function noteTerminalAnnounce(deviceId, sessionId) {
+    lastTerminalAnnounce.set(terminalAnnounceKey(deviceId, sessionId), now().getTime());
+  }
+
+  /** Note that a device is (or was) watching one session. */
+  function rememberWatchedSession(deviceId, sessionId) {
+    let sessions = watchedSessionsByDevice.get(deviceId);
+    if (sessions === undefined) {
+      sessions = new Set();
+      watchedSessionsByDevice.set(deviceId, sessions);
+    }
+    sessions.add(sessionId);
+  }
+
+  /**
+   * Forget a device's subscriptions because the relay says it is offline.
+   *
+   * The failure this prevents, measured: the relay reported the phone `online:false` at
+   * 09:17:38, the phone's last request was 09:18:29, and the Host went on pushing rows and
+   * turn events at it for minutes — every frame dropped by a relay with no route, while the
+   * handset sat on 思考中 and only a manual re-entry fixed it. A subscription the relay
+   * cannot reach is not a subscription.
+   *
+   * @param deviceId - the device the relay reports offline.
+   * @returns the sessions it was watching, so a later re-link can be answered truthfully.
+   */
+  function dropOfflineSubscriptions(deviceId) {
+    subscribers.delete(deviceId);
+    const watched = watchedSessionsByDevice.get(deviceId);
+    for (const [sessionId, devices] of sessionSubscribers) {
+      if (!devices.has(deviceId)) continue;
+      devices.delete(deviceId);
+      if (watched !== undefined) watched.add(sessionId);
+      if (devices.size === 0) sessionSubscribers.delete(sessionId);
+    }
+    return watched === undefined ? [] : [...watched];
+  }
+
   /** Accept a device as a controller of this Host and reflect it in the status. */
   function linkController(deviceId) {
     const known = status.snapshot().devices.find((device) => device.deviceId === deviceId);
@@ -624,6 +694,9 @@ export async function startHost(initialSource, settings = DEFAULT_HOST_SETTINGS,
         // asks are theirs to answer even if they have since looked away. See
         // `claimsInteraction`.
         remoteOwnedSessions.add(sessionId);
+        // …and beyond a *disconnect*: when this device re-links, the Host has to be able to
+        // tell it the turn state of every session it was inside, not just the running ones.
+        rememberWatchedSession(deviceId, sessionId);
       }
     }
   }
@@ -737,13 +810,6 @@ export async function startHost(initialSource, settings = DEFAULT_HOST_SETTINGS,
   }
 
   /**
-   * Push one live message to the controllers watching that session.
-   *
-   * The payload is exactly what the controller's `local-db:messages:created`
-   * handler reads — `{ sessionId, message }` — so a live append and a transcript
-   * read produce identical rows.
-   */
-  /**
    * How long view invalidations for one session are coalesced.
    *
    * Every renderable row sends one `maker:history-view-changed`, and the controller answers
@@ -781,6 +847,13 @@ export async function startHost(initialSource, settings = DEFAULT_HOST_SETTINGS,
     historyViewPushes.clear();
   }
 
+  /**
+   * Push one live message to the controllers watching that session.
+   *
+   * The payload is exactly what the controller's `local-db:messages:created`
+   * handler reads — `{ sessionId, message }` — so a live append and a transcript
+   * read produce identical rows.
+   */
   function pushSessionMessage(sessionId, message) {
     pushSessionUpdate(sessionId, 'local-db:messages:created', { sessionId, message });
     // …and tell the history view to re-read, coalesced. The two are not the same message: the
@@ -1047,7 +1120,14 @@ export async function startHost(initialSource, settings = DEFAULT_HOST_SETTINGS,
       if (typeof clearTimeoutImpl === 'function') clearTimeoutImpl(timer);
     }
     setCachedRunning(sessionId, false);
+    // Who this announcement actually reaches, recorded before it is sent: the same
+    // `device × session` pair must not be told twice inside the window, whichever path
+    // tells it first. The subscribe path announces the terminal state to a controller
+    // that has just attached, and a re-link right afterwards reaches the very same
+    // device — one turn boundary, one `done`.
+    const reached = [...(sessionSubscribers.get(sessionId) ?? [])];
     pushSessionUpdate(sessionId, 'maker:event', { sessionId, event: { type: 'done' } });
+    for (const deviceId of reached) noteTerminalAnnounce(deviceId, sessionId);
     // …and, when nobody is watching, to the controllers that could still be waiting.
     //
     // A controller whose subscription died with the process (a Host restart, a reconnect)
@@ -1058,9 +1138,16 @@ export async function startHost(initialSource, settings = DEFAULT_HOST_SETTINGS,
     // reached everyone who asked), so this cannot duplicate work or leak content.
     if (watchersFor(sessionId) === 0 && acceptedControllers.size > 0 && acceptedControllers.size <= MAX_TURN_ANNOUNCE) {
       const payload = { sessionId, event: { type: 'done' } };
-      recordPush(sessionId, 'maker:event', acceptedControllers.size, payload);
-      for (const deviceId of acceptedControllers) {
-        send({ v: PROTOCOL_VERSION, kind: 'push', dst: deviceId, payload: { channel: 'maker:event', payload } });
+      // Reachable controllers only. A device the relay has declared offline is not told and
+      // is not counted as told — the de-duplication entry below is a claim that the frame
+      // arrived, and the re-link announcement above depends on it being true.
+      const reachable = [...acceptedControllers].filter((deviceId) => !offlineDevices.has(deviceId));
+      if (reachable.length > 0) {
+        recordPush(sessionId, 'maker:event', reachable.length, payload);
+        for (const deviceId of reachable) {
+          send({ v: PROTOCOL_VERSION, kind: 'push', dst: deviceId, payload: { channel: 'maker:event', payload } });
+          noteTerminalAnnounce(deviceId, sessionId);
+        }
       }
     }
     publishRowTurnState(sessionId, false);
@@ -1502,11 +1589,30 @@ export async function startHost(initialSource, settings = DEFAULT_HOST_SETTINGS,
           online: snapshot.online === true,
           lastSeenAt: typeof snapshot.lastSeenAt === 'number' ? new Date(snapshot.lastSeenAt).toISOString() : null,
         });
+        // The relay's own answer about reachability, and the only one that counts.
+        //
+        // Measured failure this prevents: the relay reported the handset `online:false` at
+        // 09:17:38 while the Host kept pushing rows and turn events at it for minutes — each
+        // frame dropped with no route, the phone frozen on 思考中, and only a manual
+        // re-entry fixing it. A subscription the relay cannot reach is not a subscription;
+        // the sessions it held are remembered so its re-link can be answered truthfully.
+        if (snapshot.online !== true) {
+          // Remembered *before* the subscriptions go, because the terminal announcement for a
+          // turn that ends while the device is away must not be counted as delivered: it is a
+          // frame into a void, and recording it would suppress the re-link announcement that
+          // is supposed to repair exactly that.
+          if (typeof snapshot.deviceId === 'string' && snapshot.deviceId !== '') offlineDevices.add(snapshot.deviceId);
+          dropOfflineSubscriptions(snapshot.deviceId);
+        } else if (typeof snapshot.deviceId === 'string') {
+          offlineDevices.delete(snapshot.deviceId);
+        }
         return;
       }
       case 'link-open': {
         if (typeof frame.id !== 'string' || typeof frame.src !== 'string') return;
         if (!policy.canAccept(frame.src)) return;
+        // A link-open is itself proof the relay has a route to this device.
+        offlineDevices.delete(frame.src);
         linkController(frame.src);
         send(acceptLink(frame, acceptedControllers));
         // A controller that has just re-linked knows nothing about this Host's live state.
@@ -1519,6 +1625,28 @@ export async function startHost(initialSource, settings = DEFAULT_HOST_SETTINGS,
         // bounded by the sessions actually in a turn, and the frame is session-scoped, so
         // it lands on the row the controller already holds.
         void announceRunningSessions(frame.src);
+        // …and the *terminal* truth for the sessions it was watching before the relay
+        // dropped it. `announceRunningSessions` covers a turn still in flight; a turn that
+        // ended while the device was away would otherwise be announced by nothing, and the
+        // handset would keep spinning until the user re-entered the session by hand — the
+        // reported 「我必须要返回上一页退出会话重新进才能看到你的回答」.
+        for (const sessionId of watchedSessionsByDevice.get(frame.src) ?? []) {
+          // Only when the cache positively says the turn is over: a cold row must never be
+          // read as idle, or this would clear a spinner on a turn that is still running.
+          const cached = sessionRowFor(sessionId);
+          if (cached === undefined || cached.running === true) continue;
+          // A `done` is not idempotent for the controller — it finalizes streaming rows —
+          // and a re-link can race the ordinary terminal announcement for the same turn
+          // (most often the subscribe that just announced it), so the pair is
+          // de-duplicated through the same window every other terminal announcement uses.
+          const key = terminalAnnounceKey(frame.src, sessionId);
+          const at = now().getTime();
+          if ((lastTerminalAnnounce.get(key) ?? 0) + TERMINAL_ANNOUNCE_WINDOW_MS > at) continue;
+          lastTerminalAnnounce.set(key, at);
+          const payload = { sessionId, event: { type: 'done' } };
+          recordPush(sessionId, 'maker:event', 1, payload);
+          send({ v: PROTOCOL_VERSION, kind: 'push', dst: frame.src, payload: { channel: 'maker:event', payload } });
+        }
         return;
       }
       case 'link-close': {
