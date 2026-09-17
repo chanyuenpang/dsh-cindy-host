@@ -3,7 +3,7 @@
 <!-- state: current -->
 ## Current behavior
 
-`dsh-cindy-host-demo` (package name `dsh-cindy-host-demo`, version `0.1.0`) is a DSH
+`dsh-cindy-host-demo` (package name `dsh-cindy-host-demo`, version `0.1.1`) is a DSH
 plugin bundle that mounts the 「Cindy 手机连接」 card in **Settings → Plugins** and
 lets this Host be reached from the Cindy mobile client. The Host is the only truth
 for connection state: the card writes settings and renders whatever the Host's
@@ -129,8 +129,37 @@ Failure containment and observability:
   `TimeoutError`s are unattributable without it, and "which read is missing its budget" is the
   only question that field has to answer.
 
+## Distribution
+
+- **0.1.1 ships as a GitHub Release tarball, not to a registry**: tag `v0.1.1` +
+  asset `dsh-cindy-host-demo-0.1.1.tgz` on
+  `https://github.com/chanyuenpang/dsh-cindy-host/releases`. `package.json` therefore
+  keeps `private: true` and `license: UNLICENSED`; `private` here is the
+  accidental-publish switch, not a "not ready" marker (`doc/publishing.md` §5.5).
+- **Optional capabilities may never block mounting.** `@deepseek-ai/dsh-host-apiproxy`
+  (only used on the older DSH `apiProxy` path) and `keytar` (native, and not built by
+  default under pnpm 10) are both loaded **lazily, inside a try/catch, with a
+  degradation path**; the proxy dependency also lives in `optionalDependencies`. A
+  top-level `import` of either one turns an optional capability into a hard
+  requirement that fails the whole profile at boot — that is exactly what 0.1.0 did.
+- **`keytar` is the one install-time compilation requirement** (`keytar.node`), because
+  the Cindy login session belongs in the OS credential store rather than on disk.
+  Since 0.1.1 a failed build still mounts the plugin, with credential abilities
+  answering `CREDENTIAL_STORE_UNAVAILABLE`.
+
 <!-- state: history -->
 ## Evolution history
+
+<!-- dated: 2026-09-17 -->
+### Optional capabilities became hard requirements
+
+0.1.0 was the first version installed from a tarball into a brand-new `DSH_HOME`
+instead of the sandbox's `link:` profile, and that install failed: the top-level
+`import` of `@deepseek-ai/dsh-host-apiproxy` resolved a transitive copy of
+`@deepseek-ai/dsh-agent-presets` without `InvalidPresetIdError`, and the top-level
+`import keytar` resolved an unbuilt native module (pnpm 10 does not run dependency
+build scripts). Either one aborted the profile's boot. 0.1.1 makes both lazy and gives
+each a degradation path; the retained lesson is the rule above, not the two incidents.
 
 <!-- dated: 2026-09-17 -->
 ### Card mounted without the client bundle
