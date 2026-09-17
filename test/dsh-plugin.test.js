@@ -36,7 +36,7 @@ test('the diagnostics block is complete, and one broken field cannot remove it',
   for (const key of [
     'dataSource', 'projectionRunning', 'projectedSessions', 'recentInvokes', 'recentRefusals',
     'recentPushes', 'pushTotals', 'invokeTotals', 'refusalTotals', 'attachmentReads', 'reconnect',
-    'frameBudget', 'handlerErrors', 'listing', 'subscriptions',
+    'frameBudget', 'handlerErrors', 'listing', 'subscriptions', 'suppressedNotices',
   ]) {
     assert.ok(key in diagnostics, `${key} must be present`);
   }

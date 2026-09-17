@@ -4,7 +4,7 @@ import { InProcessApiClient, toFetchHandler } from '@deepseek-ai/dsh-host-apipro
 import { DEFAULT_HOST_SETTINGS, SETTINGS_NAMESPACE, validateHostSettings } from './host-settings.js';
 import { DshHostSource } from './dsh-host-source.js';
 import { createSessionControllerSource } from './dsh-session-source.js';
-import { createMessageCounter, createMessageReader, foldSessionEvent, promptRpcIdOf } from './dsh-message-fold.js';
+import { createMessageCounter, createMessageReader, foldSessionEvent, isHarnessNotice, promptRpcIdOf } from './dsh-message-fold.js';
 import { createHistoryViewController } from './host-history-view.js';
 import { createFileReader } from './host-files.js';
 import { createFileBrowser } from './host-file-browser.js';
@@ -1068,6 +1068,9 @@ export function buildDiagnostics({ runtime, sourceKind, seam, listingDiagnostics
     // from the previous read because the live one missed its deadline — an absorbed
     // degradation, and the difference between a rendered list and the reported spinner.
     listing: field(() => (typeof listingDiagnostics === 'function' ? listingDiagnostics() : null), null),
+    // Rows this Host deliberately did not show the phone. Hidden is not dropped: the count is how
+    // a projection decision stays distinguishable from a lost message.
+    suppressedNotices: field(() => (runtime && typeof runtime.getSuppressedNotices === 'function' ? runtime.getSuppressedNotices() : 0), 0),
     // The topics controllers currently hold. An empty set means the phone
     // never subscribed — the single most likely reason a live reply or a todo
     // card never reaches it.
@@ -1451,6 +1454,10 @@ export function apply(ctx) {
       && typeof currentSeam.readMessages.noteEvent === 'function') {
       currentSeam.readMessages.noteEvent(sessionId, event);
     }
+    // A harness notice is hidden from the phone (the fold returns no rows for it), and the count is
+    // what keeps that hiding honest: "there was nothing to show" and "the Host dropped a message"
+    // must not look alike from the desk.
+    if (isHarnessNotice(event) && typeof runtime.noteSuppressedNotice === 'function') runtime.noteSuppressedNotice();
     // Nothing to do unless a controller is watching; the fold is not free.
     if (runtime.watchersFor(sessionId) === 0) return;
     for (const row of foldSessionEvent(event, { sessionId })) runtime.pushSessionMessage(sessionId, row);

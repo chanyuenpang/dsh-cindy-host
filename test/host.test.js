@@ -545,6 +545,20 @@ test('an error on the invoke path answers the controller and is recorded, never 
   }
 });
 
+test('a row this Host hides is counted, so hiding cannot look like losing', async () => {
+  // The projection hides harness notices (a background job finishing). Hidden is not dropped: the
+  // count is what separates a projection decision from a message that never arrived.
+  const { runtime } = await runtimeWithSocket();
+  try {
+    assert.equal(runtime.getSuppressedNotices(), 0, 'nothing hidden yet');
+    runtime.noteSuppressedNotice();
+    runtime.noteSuppressedNotice();
+    assert.equal(runtime.getSuppressedNotices(), 2, 'and every hidden row is counted');
+  } finally {
+    await runtime.stop();
+  }
+});
+
 test('a live turn is visible on a Host that has never read a session list', async () => {
   // Measured right after a restart: `local-db:messages:view` marked the running work group
   // `isStreaming: false` while the agent was working, so the phone drew no live card and the

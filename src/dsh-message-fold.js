@@ -88,10 +88,49 @@ export function foldSessionEvent(event, { sessionId, now = () => new Date() }) {
     return [];
   }
   if (message === null || message === undefined) return [];
+  // A harness notice is bookkeeping, not conversation. `tool-jobs` writes one when a background
+  // job finishes (`source: {kind: 'plugin', plugin: 'tool-jobs', form: 'notice'}`), and this
+  // projection was handing it to the phone as a **user bubble** — so the user read
+  // 「background job pwsh-1 (pwsh: …) finished [status: completed, exit code: 0]」 as if they had
+  // said it, and DSH's own inbox splice can steer the same text into a running turn
+  // (measured: `next-step inserted … plugin: tool-jobs`).
+  //
+  // Hidden, not dropped: the caller counts it (`suppressedNotices`), because a row this Host
+  // decides not to show has to stay discoverable. Only `kind === 'plugin'` is touched — a
+  // message a person sent, or any other producer's row, is unaffected.
+  if (messageSourceOf(message)?.kind === 'plugin') return [];
   const createdAt = Number.isFinite(event.time) ? new Date(event.time).toISOString() : now().toISOString();
   // The controller's own id for a submitted prompt travels with the row so it
   // can retire the copy it showed optimistically.
   return toCindyMessageRows(message, { sessionId, createdAt, now, promptClientId: promptRpcIdOf(event) });
+}
+
+/** The `source` a message carries, whichever shape the surface handed over. */
+function messageSourceOf(message) {
+  const source = message?.source;
+  return source !== null && typeof source === 'object' ? source : null;
+}
+
+/**
+ * Whether one event is harness bookkeeping rather than something a person said.
+ *
+ * Exported because the caller counts what this projection hides: a row the phone never sees must
+ * be observable somewhere, or "the Host silently dropped a message" and "there was nothing to
+ * show" would look the same from the desk.
+ * @param event - one `session/event` payload.
+ * @returns true for a `plugin`-sourced message.
+ */
+export function isHarnessNotice(event) {
+  // No `isAppendSurfaceEvent` gate: this asks "is this event a plugin-sourced message", and the
+  // caller may hand over an event the fold would not render for other reasons anyway. Gating here
+  // made the predicate answer *false* for a real notice, which is a worse failure than a redundant
+  // true.
+  if (event === null || typeof event !== 'object') return false;
+  try {
+    return messageSourceOf(deriveEventMessage(event))?.kind === 'plugin';
+  } catch {
+    return false;
+  }
 }
 
 /**

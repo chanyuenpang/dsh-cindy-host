@@ -1,6 +1,6 @@
 import test from 'node:test';
 import assert from 'node:assert/strict';
-import { promptRpcIdOf, foldSessionEvent, pageRows, createMessageCounter, createMessageReader, entryForTodoWrite, NEWEST_WINDOW_ROWS, NEWEST_WINDOW_TEXT_BYTES } from '../src/dsh-message-fold.js';
+import { isHarnessNotice, promptRpcIdOf, foldSessionEvent, pageRows, createMessageCounter, createMessageReader, entryForTodoWrite, NEWEST_WINDOW_ROWS, NEWEST_WINDOW_TEXT_BYTES } from '../src/dsh-message-fold.js';
 import { toCindyMessages } from '../src/cindy-message-row.js';
 
 test('names the controller id of a prompt that just became durable', () => {
@@ -304,3 +304,21 @@ test('a text-heavy newest page is cut to the byte budget, at a message boundary'
   assert.equal(rest[0].content.text.startsWith(`row-${19 - page.length}-`), true);
 });
 
+
+test('a harness notice is not conversation, and a person still is', () => {
+  // Reported from the phone: 「background job pwsh-1 (pwsh: cd G:\Projects\DSH-cindy-host\node
+  // tools/acceptance.mjs …) finished [status: completed, exit code: 0]」 arrived as a **user
+  // bubble**. It is `tool-jobs` bookkeeping (`source.kind === 'plugin'`), and DSH's own inbox
+  // splice can even steer the same text into a running turn, so this Host stopped projecting it.
+  // Hidden, not dropped: the caller counts every one (see the runtime's suppressedNotices).
+  const notice = { type: 'user/message', seq: 2, time: 1, data: { content: [{ type: 'text', text: 'background job pwsh-1 finished' }], source: { kind: 'plugin', plugin: 'tool-jobs', form: 'notice' } } };
+  assert.equal(isHarnessNotice(notice), true, 'harness bookkeeping is hidden');
+  assert.deepEqual(foldSessionEvent(notice, { sessionId: 's1' }), [], 'and renders no row at all');
+
+  // Everything else keeps its row — a person's message above all.
+  const mine = { type: 'user/message', seq: 3, time: 2, data: { content: [{ type: 'text', text: 'hello' }], source: { kind: 'user', rpcId: 'c1' } } };
+  assert.equal(isHarnessNotice(mine), false);
+  for (const other of [null, undefined, {}, { type: 'assistant/message', data: { source: { kind: 'assistant' } } }]) {
+    assert.equal(isHarnessNotice(other), false, `not a notice: ${JSON.stringify(other)}`);
+  }
+});

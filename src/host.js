@@ -372,6 +372,15 @@ export async function startHost(initialSource, settings = DEFAULT_HOST_SETTINGS,
    */
   const handlerErrors = [];
   const HANDLER_ERROR_LIMIT = 20;
+  /**
+   * Rows this Host decided the phone should not see, counted.
+   *
+   * Today that is one thing: a harness notice (a background job finishing, written by the
+   * `tool-jobs` plugin) used to be projected as a **user bubble**, so the user read a command
+   * line as if they had said it. Hiding it is a projection decision; counting it is what keeps
+   * the decision from being indistinguishable from a dropped message.
+   */
+  let suppressedNotices = 0;
   /** When this Host started, for the diagnostics liveness verdict. */
   const startedAtMs = now().getTime();
 
@@ -2108,6 +2117,10 @@ export async function startHost(initialSource, settings = DEFAULT_HOST_SETTINGS,
      * this list is the record of an outage that was prevented rather than survived.
      */
     getHandlerErrors: () => handlerErrors.slice(),
+    /** How many rows were deliberately not shown; see {@link suppressedNotices}. */
+    getSuppressedNotices: () => suppressedNotices,
+    /** Count one hidden row. */
+    noteSuppressedNotice: () => { suppressedNotices += 1; },
     /**
      * How long this Host has been up.
      *
