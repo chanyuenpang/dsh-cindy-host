@@ -83,6 +83,11 @@ a by-hand restart works too.
 
 - An agent can load its own changes into the live instance without asking the user to type
   anything; the user's cost is one page reload (the relaunch opens the browser tab itself).
+- **The restart must be announced before it happens, and the default grace is 60 s for that
+  reason.** 「如果有重启的话一定要提前告诉我，不然我不知道你已经掉线了」 — a message that arrives
+  together with the disconnect is not a warning. So: say it in the conversation, wait long enough
+  for it to be read, and only then fire. The tool's default `--grace` is 60 s, not 20 s, so the
+  announcement and the countdown cannot be accidentally coincident.
 - The turn in flight dies with the old process. The session survives (its log is durable), but
   **nothing resumes automatically**: the agent is idle until a message arrives, and a message
   from the phone is the recommended wake-up because it does not depend on the web token.

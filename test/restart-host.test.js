@@ -18,7 +18,7 @@ import { launchArgsFrom, parseArgs } from '../tools/restart-host.mjs';
 const LIVE = '"D:\\Program Files\\nodejs\\node.exe" C:\\Users\\chany\\AppData\\Roaming\\npm/node_modules/@deepseek-ai/dsh/lib/bin.js web';
 
 test('a dry run is the default, and flags parse with or without values', () => {
-  assert.deepEqual(parseArgs([]), { apply: false, graceSeconds: 20, port: 3080, dshHome: null });
+  assert.deepEqual(parseArgs([]), { apply: false, graceSeconds: 60, port: 3080, dshHome: null }, 'the default grace is long enough to warn first');
   assert.equal(parseArgs(['--apply']).apply, true);
   assert.equal(parseArgs(['--apply', '--grace', '45', '--port', '3081']).graceSeconds, 45);
   assert.equal(parseArgs(['--port', '3081']).port, 3081);

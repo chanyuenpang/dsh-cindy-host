@@ -17,7 +17,7 @@
  *
  * Usage:
  *   node tools/restart-host.mjs                      # dry run: what would happen
- *   node tools/restart-host.mjs --apply --grace 20   # do it, 20s from now
+ *   node tools/restart-host.mjs --apply --grace 60   # do it, 60s from now (the default)
  */
 import { execFileSync, spawn } from 'node:child_process';
 import { appendFileSync, closeSync, existsSync, mkdirSync, openSync } from 'node:fs';
@@ -32,7 +32,10 @@ const settle = (ms) => new Promise((done) => setTimeout(done, ms));
 
 /** `--apply` is the only thing that changes behaviour; a dry run is the default. */
 export function parseArgs(argv) {
-  const options = { apply: false, graceSeconds: 20, port: 3080, dshHome: null };
+  // 60s, not 20: an agent that restarts this instance must first say so in the conversation, and
+  // the message and the disconnect arriving together is the same as no warning at all
+  // (「如果有重启的话一定要提前告诉我，不然我不知道你已经掉线了」).
+  const options = { apply: false, graceSeconds: 60, port: 3080, dshHome: null };
   for (let index = 0; index < argv.length; index += 1) {
     const flag = argv[index];
     if (flag === '--apply') options.apply = true;
