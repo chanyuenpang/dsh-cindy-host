@@ -2153,6 +2153,61 @@ and the re-link that follows immediately reaches the same device for the same tu
 receives nothing (including a turn that ends while it is away) and is told the truth when
 it links again after the window; a re-link inside the window repeats nothing.
 
+## 一次未处理的 rejection 会结束整个 dsh web
+
+手机报「DSH 掉线了」的那一次，原因不在中继也不在网络。证据链（时间为 UTC+8）：
+
+```
+17:30:10  用户从手机发来「我已经重启了。」（进程 17:29:04 启动）
+17:30:12  本轮 turn 113 开始；同一时刻我启动了 tools/acceptance.mjs --with-prompts
+17:30:23  turn/end {"reason":{"kind":"interrupted"}}   ← 回合中途进程消失
+17:30:24  settings.yaml 与 acceptance-probe 会话日志的最后几笔写入（退出前的落盘）
+17:32:35  用户手动重启，cordis.yml 重新生成
+```
+
+Windows 事件日志里**没有** node.exe 崩溃记录，`~/.dsh` 里也没有崩溃报告，说明不是原生
+崩溃。原因在 DSH 自己的启动代码里：
+
+```js
+// node_modules/@deepseek-ai/dsh-app-boot/lib/index.js — installFailLoud
+const handler = (err) => {
+  …
+  proc.stderr.write(`${binName}: fatal load failure: ${err instanceof Error ? err.stack ?? err.message : String(err)}\n`)
+  …
+  proc.exit(1)
+}
+proc.on('unhandledRejection', handler)
+```
+
+即：**进程里任何一处未处理的 promise rejection，都会让 `dsh web` 把堆栈写到 stderr 并
+`exit(1)`**。`exit(1)` 是正常退出，系统层面因此什么都没有；而本插件住在同一个进程里，中继
+websocket 随之断开，手机看到的就是「掉线」，直到 2.5 分钟后手动重启才恢复。
+
+Cordis 不会替插件兜底——它的监听器分发没有 `try`/`catch`：
+
+```js
+// @deepseek-ai/cordis/lib/index.js
+emit(...args) { this.dispatch("emit", args).map((cb) => cb(...args)); }
+```
+
+所以一个插件抛出的异常不是「这个插件坏了」，而是「桌面的 DSH 没了」。据此把本插件所有边界
+都封住：
+
+- socket `'message'` 监听器不再裸调 `handleFrame`；
+- invoke 应答路径（`fitReplyToFrame` + `send`）不再可能在 `.then(onOk)` 里抛；
+- 心跳、重连、设备目录、活跃会话播报这些浮动 promise 全部挂上 rejection handler；
+- Cordis 的 `session/event` 监听器整体包 `try`/`catch`——它跑在 DSH 自己的事件分发里，
+  抛出去就没人接。
+
+捕获到的东西统一进有界的 `handlerErrors` 环形缓冲，并通过 `/status` 的
+`diagnostics.handlerErrors` 暴露（含 `where`、`message`、前 6 行 `stack`）。**这个数组非空
+意味着刚刚挡住了一次会让整个 dsh web 退出的异常**，而不是「Host 扛住了」。
+`test/host.test.js` 钉住这一点：某个通道抛错时，控制器仍然收到 `INTERNAL` 应答，错误被记录
+而不是逃逸。
+
+排查同类问题的最快证据是**启动 `dsh web` 那个终端的 stderr**：那一行 `dsh: fatal load
+failure:` 后面就是完整的堆栈，它指向真正的抛出点。
+
 ## 删除 / 归档 / 置顶: one channel, and only one of its fields had a counterpart
 
 The controller's session menu is four actions and **one** write. Desktop
