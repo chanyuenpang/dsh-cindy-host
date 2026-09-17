@@ -92,12 +92,13 @@ git clone --depth 1 <url> /tmp/verify && grep -r <pattern> /tmp/verify
 ## 4. 部署到 DSH（重启才是生效点）
 
 插件以 bundle 形式挂在 profile 里（`link:` 指向本仓库，或 `cordis.patch.yml` 覆盖行）。**改完代码必须
-重启 `dsh web` 才生效**。重启有两条路：
+重启 `dsh web` 才生效**。重启有三条路：
 
 | 场景 | 做法 |
 |---|---|
 | 迭代/功能验证 | `npm run sandbox`（3081，独立实例）→ 我自己重启，不打扰用户 |
 | 真机生效 | `node tools/restart-host.mjs --apply`（默认 60s 缓冲，通过 WMI 启动 supervisor） |
+| **别的 agent / 别的项目** | 全局 skill **`dsh-restart`**：`~/.agents/skills/dsh-restart/scripts/restart-dsh.mjs`（同一套逻辑，去掉了仓库依赖；日志在 `~/.agents/logs/dsh-restart/`）。任何 agent 触发「重启 dsh」时都会用到它，规则同样遵守 ADR-0009 |
 
 **重启的硬规则**（写进 ADR-0009）：
 
@@ -105,7 +106,8 @@ git clone --depth 1 <url> /tmp/verify && grep -r <pattern> /tmp/verify
 2. 重启会**杀掉正在跑的那一轮**；会话日志是持久的，但**没有任何东西会自动续上**——需要一条新消息
    唤醒（手机发最稳，因为它不依赖网页 token）。
 3. 新实例会自己打开新标签页（旧页面的 token 失效）。
-4. 失败模式：**DSH 停在那里**，只有人能手动起。日志在 `.sandbox/host-restart.log`。
+4. 失败模式：**DSH 停在那里**，只有人能手动起。日志在 `.sandbox/host-restart.log`（全局 skill 那条路写在
+   `~/.agents/logs/dsh-restart/host-restart.log`，新实例自己的输出在 `dsh-web.log`，新 token 在其最后一行）。
 
 重启后自检三件事：`/status` 的 `boundaries`（`recovered`/`starting`/`silent`）、`handlerErrors`（应为空
 或已归因到具体通道）、以及本轮新增诊断字段是否在场。

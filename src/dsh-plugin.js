@@ -408,6 +408,55 @@ export function buildDshSource(ctx, serviceName, options = {}) {
     }
 
     /**
+     * Install one session-local model selection, resolving the provider when the
+     * caller has none.
+     *
+     * The controller's model option carries no provider id — the catalog flattens
+     * models out of their provider groups — so a choice usually arrives with the
+     * model alone. This Host's own catalog is the authority on which provider
+     * serves it, and guessing would risk switching to a different model than the
+     * user picked.
+     *
+     * DSH's `session.selectModel` is the only write that installs a selection, and
+     * it has two effects by design: the session's coming request uses it **and** the
+     * profile's `agent-default-model` is updated — exactly what the desk's own model
+     * picker does. That is why a conversation created from the handset with gpt also
+     * becomes the default for sessions no picker has touched yet.
+     * @param request - the session, its requested provider/model, and optional effort.
+     * @returns DSH's normalized `{ selected }` answer.
+     */
+    async function applyModelSelection({ sessionId, provider, model, reasoningEffort }) {
+      let resolved = provider;
+      if (typeof resolved !== 'string' || resolved === '') {
+        const catalog = await sessionController.modelCatalog();
+        const groups = Array.isArray(catalog?.groups) ? catalog.groups : [];
+        resolved = groups.find((group) => (Array.isArray(group?.models) ? group.models : [])
+          .some((entry) => entry?.id === model))?.id;
+      }
+      if (typeof resolved !== 'string' || resolved === '') {
+        throw refusalError('NOT_AVAILABLE', "no provider in this Host's catalog serves " + model);
+      }
+      try {
+        return await sessionController.selectModel({
+          sessionId,
+          provider: resolved,
+          model,
+          ...(reasoningEffort === undefined ? {} : { reasoningEffort }),
+        });
+      } catch (error) {
+        // DSH refuses a route it cannot resolve with `session/model-unavailable`.
+        // Passed through raw that reaches the controller as `THREW`, which it reads
+        // as this Host crashing rather than as "that model is not usable here" — the
+        // same misreading the effort refusal was fixed for. Only that refusal is
+        // translated; anything else is a genuine failure and travels unchanged.
+        if (error?.code === 'session/model-unavailable') {
+          throw refusalError('NOT_AVAILABLE', String(error?.message ?? error));
+        }
+        throw error;
+      }
+    }
+
+    /**
      * The routed model's context window, when the provider discloses one.
      *
      * `LlmResolvedModelInfo.context` is optional — a provider that lists an id and
@@ -565,14 +614,36 @@ export function buildDshSource(ctx, serviceName, options = {}) {
        * genuinely new to DSH). A `workspaceRegistry` that cannot place the path — not
        * mounted, relative, missing, a file — falls back to the bare `cwd`, which keeps
        * the old behaviour: the session is created, it just is not grouped on the desk.
+       *
+       * It also installs the model the controller picked, because a new conversation
+       * has no other way to say it: the handset's pipeline is create, getSession,
+       * enqueue, and it never calls `setModel` (`newSessionCreation.ts`), so the
+       * runtime it chose reaches this Host **only** in these options. Creating first
+       * and selecting second is the only order DSH allows — a selection needs a
+       * session — and it is the difference between the user's pick and the profile
+       * default: without it the first prompt runs on `agent-default-model` and the
+       * handset reports 「新对话选了 gpt，一运行又变成 deepseek」.
+       *
+       * A model this Host cannot route **throws** rather than being swallowed. The
+       * session exists either way, and the controller's create retry is idempotent
+       * and probes for the session before rebuilding, so the honest refusal costs one
+       * retry while a silent wrong model costs a conversation.
        */
       createSession: async (options) => {
         const cwd = typeof options?.cwd === 'string' && options.cwd !== '' ? options.cwd : undefined;
         const workspace = await workspaceForNewSession(cwd);
-        return sessionController.create({
+        const created = await sessionController.create({
           ...(options.sessionId === undefined ? {} : { sessionId: options.sessionId }),
           ...(workspace === undefined ? (cwd === undefined ? {} : { cwd }) : { workspaceId: workspace.id }),
         });
+        if (typeof options?.model !== 'string' || options.model === '') return created;
+        const applied = await applyModelSelection({
+          sessionId: created.sessionId,
+          provider: options.provider,
+          model: options.model,
+          reasoningEffort: options.reasoningEffort,
+        });
+        return { ...created, selection: applied?.selected ?? null };
       },
       /**
        * Send one prompt, carrying whatever attachments this Host can serve.
@@ -776,29 +847,8 @@ export function buildDshSource(ctx, serviceName, options = {}) {
        */
       readSessionState: readSessionStateNow,
       /** Apply the controller's model choice to one session. */
-      selectModel: async ({ sessionId, provider, model, reasoningEffort }) => {
-        // The controller's model option carries no provider id — the catalog
-        // flattens models out of their provider groups — so a choice usually
-        // arrives with the model alone. The catalog is the authority on which
-        // provider serves it, and guessing would risk switching to a different
-        // model than the user picked.
-        let resolved = provider;
-        if (typeof resolved !== 'string' || resolved === '') {
-          const catalog = await sessionController.modelCatalog();
-          const groups = Array.isArray(catalog?.groups) ? catalog.groups : [];
-          resolved = groups.find((group) => (Array.isArray(group?.models) ? group.models : [])
-            .some((entry) => entry?.id === model))?.id;
-        }
-        if (typeof resolved !== 'string' || resolved === '') {
-          throw new Error(`no provider in this Host's catalog serves ${model}`);
-        }
-        return sessionController.selectModel({
-          sessionId,
-          provider: resolved,
-          model,
-          ...(reasoningEffort === undefined ? {} : { reasoningEffort }),
-        });
-      },
+      selectModel: async ({ sessionId, provider, model, reasoningEffort }) =>
+        applyModelSelection({ sessionId, provider, model, reasoningEffort }),
       /**
        * Change one session's reasoning effort.
        *

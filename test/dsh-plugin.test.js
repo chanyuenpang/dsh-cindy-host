@@ -138,6 +138,21 @@ function makeCtx(services = {}) {
   return ctx;
 }
 
+/**
+ * The error a call rejected with.
+ *
+ * `assert.rejects` answers `undefined`, which cannot show *which* refusal arrived —
+ * and the refusal code is the whole point of the two tests that use this.
+ */
+async function rejectionOf(promise) {
+  try {
+    await promise;
+  } catch (error) {
+    return error;
+  }
+  return assert.fail('expected the call to reject');
+}
+
 test('waits for the session service instead of reading it at apply time', () => {
   const ctx = makeCtx({});
   apply(ctx);
@@ -230,6 +245,123 @@ test('a controller-created session is registered in its workspace, or DSH never 
   assert.equal(created.sessionId, 'session-new');
   assert.deepEqual(workspaces, [{ path: 'G:\\Projects\\DSH-cindy-host', title: undefined }], 'the directory is resolved to its workspace');
   assert.deepEqual(calls, [{ sessionId: 'session-new', workspaceId: 'ws-1' }], 'the workspace form registers the session — and cwd is never sent alongside it');
+});
+
+test('a new conversation created with a model installs it, instead of running the profile default', async () => {
+  // 「新对话选了 gpt，一运行又变成 deepseek」的被控端一半：控制端只在 create 的
+  // options 里说 runtime（新建页没有会话可 setModel），所以 create 之后必须立刻把
+  // 它落成会话级选择，否则首个 prompt 走 agent-default-model。
+  const selects = [];
+  const ctx = makeCtx({
+    sessionController: {
+      async create(request) { return { sessionId: request.sessionId ?? 'session-new' }; },
+      async selectModel(request) {
+        selects.push(request);
+        return { selected: { provider: request.provider, model: request.model, reasoningEffort: request.reasoningEffort } };
+      },
+    },
+  });
+  const built = buildDshSource(ctx, 'sessionController');
+
+  const created = await built.createSession({
+    sessionId: 'session-new',
+    cwd: 'G:\\Projects\\DSH-cindy-host',
+    model: 'gpt-5.6-sol',
+    provider: 'openai-codex',
+    reasoningEffort: 'high',
+  });
+
+  assert.deepEqual(selects, [{
+    sessionId: 'session-new',
+    provider: 'openai-codex',
+    model: 'gpt-5.6-sol',
+    reasoningEffort: 'high',
+  }], 'the create has to install the selection; nothing else in the pipeline will');
+  assert.deepEqual(created.selection, {
+    provider: 'openai-codex',
+    model: 'gpt-5.6-sol',
+    reasoningEffort: 'high',
+  }, 'the caller gets what the session is actually on');
+});
+
+test('a model with no provider named is resolved from this Host catalog', async () => {
+  const selects = [];
+  const ctx = makeCtx({
+    sessionController: {
+      async create() { return { sessionId: 'session-new' }; },
+      async modelCatalog() {
+        return { groups: [
+          { id: 'deepseek-official', models: [{ id: 'deepseek-flash' }] },
+          { id: 'openai-codex', models: [{ id: 'gpt-5.6-sol' }] },
+        ] };
+      },
+      async selectModel(request) { selects.push(request); return { selected: { provider: request.provider, model: request.model } }; },
+    },
+  });
+  const built = buildDshSource(ctx, 'sessionController');
+
+  await built.createSession({ sessionId: 'session-new', model: 'gpt-5.6-sol' });
+  assert.deepEqual(selects, [{ sessionId: 'session-new', provider: 'openai-codex', model: 'gpt-5.6-sol' }], 'the catalog decides the provider, never a guess');
+});
+
+test('a model no catalog group serves is refused rather than silently created', async () => {
+  const ctx = makeCtx({
+    sessionController: {
+      async create() { return { sessionId: 'session-new' }; },
+      async modelCatalog() { return { groups: [{ id: 'deepseek-official', models: [{ id: 'deepseek-flash' }] }] }; },
+      async selectModel() { throw new Error('unreachable: an unresolvable model must not reach DSH'); },
+    },
+  });
+  const built = buildDshSource(ctx, 'sessionController');
+
+  const refusal = await rejectionOf(built.createSession({ sessionId: 'session-new', model: 'gpt-9' }));
+  assert.match(refusal.message, /no provider in this Host's catalog serves gpt-9/);
+  assert.equal(refusal.refusalCode, 'NOT_AVAILABLE', 'the channel layer answers this code; a raw Error would reach the controller as THREW');
+});
+
+test('a route DSH itself refuses is reported as NOT_AVAILABLE, not as a Host crash', async () => {
+  // DSH 用 `session/model-unavailable` 拒绝一条解析不出来的路由（例如来源在挑选与创建之间
+  // 掉线）。原样抛出去，控制器读到的是 `THREW`——它把 THREW 读成「Host 崩了」，而不是
+  // 「这个模型在这里不可用」，于是用户看到的是设备异常而不是一条可理解的拒绝。
+  const dshRefusal = Object.assign(new Error('session/model-unavailable: no adapter serves provider "openai-codex"'), { code: 'session/model-unavailable' });
+  const ctx = makeCtx({
+    sessionController: {
+      async create() { return { sessionId: 'session-new' }; },
+      async selectModel() { throw dshRefusal; },
+    },
+  });
+  const built = buildDshSource(ctx, 'sessionController');
+
+  const refusal = await rejectionOf(built.createSession({ sessionId: 'session-new', model: 'gpt-5.6-sol', provider: 'openai-codex' }));
+  assert.equal(refusal.refusalCode, 'NOT_AVAILABLE');
+  assert.match(refusal.message, /no adapter serves provider/);
+
+  // 任何别的失败都不是拒绝，必须原样上报。
+  const broken = Object.assign(new Error('socket hang up'), { code: 'ECONNRESET' });
+  const other = makeCtx({
+    sessionController: {
+      async create() { return { sessionId: 'session-new' }; },
+      async selectModel() { throw broken; },
+    },
+  });
+  const otherRefusal = await rejectionOf(buildDshSource(other, 'sessionController').createSession({ sessionId: 'session-new', model: 'gpt-5.6-sol', provider: 'openai-codex' }));
+  assert.equal(otherRefusal.message, 'socket hang up');
+  assert.equal(otherRefusal.refusalCode, undefined, 'a genuine failure must not be dressed up as a refusal');
+});
+
+test('a create that names no model touches no selection', async () => {
+  const selects = [];
+  const ctx = makeCtx({
+    sessionController: {
+      async create() { return { sessionId: 'session-new' }; },
+      async selectModel(request) { selects.push(request); },
+    },
+  });
+  const built = buildDshSource(ctx, 'sessionController');
+
+  const created = await built.createSession({ sessionId: 'session-new' });
+  assert.deepEqual(selects, [], 'a controller with no opinion must not move any session');
+  assert.equal(created.selection, undefined, 'and the reply must not claim a selection either');
 });
 
 test('a session is still created when no workspace can own its directory', async () => {

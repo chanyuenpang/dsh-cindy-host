@@ -1075,13 +1075,76 @@ test('creates a session through DSH and echoes the id the controller preallocate
   assert.equal(preallocated.payload.result.sessionId, 'client-id-1', 'passing the id through avoids a rekey');
   assert.equal(preallocated.payload.result.agentKind, 'pi');
 
-  const generated = await router(request('maker:create-session', [{ agentKind: 'claude-code', model: 'x' }]));
-  assert.equal(generated.payload.result.sessionId, 'dsh-generated', 'the picker is ignored; DSH creates the session');
+  const generated = await router(request('maker:create-session', [{ agentKind: 'claude-code' }]));
+  assert.equal(generated.payload.result.sessionId, 'dsh-generated', 'a create with no id still returns the one DSH made');
 
   assert.deepEqual(seen, [
     { sessionId: 'client-id-1', cwd: 'G:\\w' },
     { sessionId: undefined, cwd: undefined },
   ]);
+});
+
+test('the runtime the controller picked for a new conversation reaches the Host', async () => {
+  // 实测症状:「新对话选了 gpt，一运行又变成 deepseek」。新建页没有会话可写，
+  // 控制端把整套 runtime 只放进 create-session 的 args
+  // (`newSessionCreation.ts` 全程不调 setModel)，所以这里丢掉它 = 新会话没有任何
+  // 会话级选择，首个 prompt 回落到 profile 的 agent-default-model。
+  const seen = [];
+  const router = createChannelRouter({
+    listSessions: async () => ROWS,
+    createSession: async (options) => {
+      seen.push(options);
+      // 被控端（DSH）会把选择规范化后回话，回帧必须以它为准。
+      return { sessionId: 'session-1', selection: { provider: 'openai-codex', model: 'gpt-5.6-sol', reasoningEffort: 'high' } };
+    },
+    subscribers: new Set(),
+  });
+
+  const result = await router(request('maker:create-session', [{
+    id: 'session-1',
+    workingDir: 'G:\\w',
+    agentKind: 'pi',
+    workspaceKind: 'project',
+    model: 'gpt-5.6-sol',
+    providerId: 'openai-codex',
+    effort: 'high',
+    permissionMode: 'auto',
+    fastMode: false,
+  }]));
+
+  assert.deepEqual(seen, [{
+    sessionId: 'session-1',
+    cwd: 'G:\\w',
+    model: 'gpt-5.6-sol',
+    provider: 'openai-codex',
+    reasoningEffort: 'high',
+  }]);
+  assert.equal(result.payload.ok, true);
+  assert.equal(result.payload.result.model, 'gpt-5.6-sol', 'the reply names what the session is actually on');
+  assert.equal(result.payload.result.providerId, 'openai-codex');
+  assert.equal(result.payload.result.effort, 'high');
+});
+
+test('a blank picker is not a selection, and one the Host cannot route is refused', async () => {
+  const seen = [];
+  const router = createChannelRouter({
+    listSessions: async () => ROWS,
+    createSession: async (options) => {
+      seen.push(options);
+      if (options.model === 'gpt-9') throw refusalError('NOT_AVAILABLE', "no provider in this Host's catalog serves gpt-9");
+      return { sessionId: 'session-3' };
+    },
+    subscribers: new Set(),
+  });
+
+  const blank = await router(request('maker:create-session', [{ id: 'session-3', agentKind: 'pi', model: '   ', providerId: '', effort: '' }]));
+  assert.deepEqual(seen, [{ sessionId: 'session-3', cwd: undefined }], 'blank fields must not be forwarded as a selection');
+  assert.equal(blank.payload.result.providerId, undefined, 'nothing was selected, so the reply names nothing');
+
+  const unroutable = await router(request('maker:create-session', [{ id: 'session-4', model: 'gpt-9' }]));
+  assert.equal(unroutable.payload.ok, false, 'a created session whose model cannot be routed is not a clean success');
+  assert.equal(unroutable.payload.error.code, 'NOT_AVAILABLE', 'the controller reads this code; THREW reads as the Host crashing');
+  assert.match(unroutable.payload.error.message, /gpt-9/);
 });
 
 test('sends a prompt, accepting both message shapes the controller uses', async () => {

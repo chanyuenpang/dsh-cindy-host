@@ -900,20 +900,61 @@ export function createChannelRouter({
       const create = capabilitiesNow().createSession;
       if (typeof create !== 'function') return invokeError(request, 'NOT_AVAILABLE', 'This DSH Host cannot create sessions yet');
       const options = args[0] !== null && typeof args[0] === 'object' ? args[0] : {};
-      // The controller may pre-allocate the session id so its optimistic row and
-      // route use the final id from the start; DSH's create is idempotent on a
-      // supplied id, so passing it through is safe and avoids a rekey.
-      const created = await create({
-        sessionId: typeof options.id === 'string' && options.id !== '' ? options.id : undefined,
-        cwd: typeof options.workingDir === 'string' && options.workingDir !== '' ? options.workingDir : undefined,
-      });
-      return invokeResult(request, {
-        sessionId: String(created?.sessionId ?? options.id ?? ''),
-        // One harness, whatever the picker offered.
-        agentKind: DSH_AGENT_KIND,
-        workDir: options.workingDir ?? null,
-        usedProjectContext: false,
-      });
+      // The runtime the controller picked for this conversation arrives **here and
+      // nowhere else**. A new chat on the handset has no session to call
+      // `maker:set-model` on yet — its whole pipeline is create, getSession, enqueue,
+      // with no model write in between (measured in
+      // `apps/mobile/src/session/newSessionCreation.ts`, which never calls `setModel`).
+      // A Host that reads only `id`/`workingDir` therefore leaves the new session with
+      // no session-local selection at all, and DSH's first prompt falls back to the
+      // profile's `agent-default-model` — reported as
+      // 「新对话选了 gpt，一运行又变成 deepseek」.
+      //
+      // The names are the controller's own: the handset
+      // (`buildRemoteCreateSessionOptions`) and the desktop (`buildDeviceLinkCreateArgs`)
+      // both send `model`, an optional `providerId` (absent/blank = follow this Host's
+      // default route) and `effort`.
+      const model = typeof options.model === 'string' ? options.model.trim() : '';
+      const provider = typeof options.providerId === 'string' ? options.providerId.trim() : '';
+      const effort = typeof options.effort === 'string' ? options.effort.trim() : '';
+      try {
+        // The controller may pre-allocate the session id so its optimistic row and
+        // route use the final id from the start; DSH's create is idempotent on a
+        // supplied id, so passing it through is safe and avoids a rekey.
+        const created = await create({
+          sessionId: typeof options.id === 'string' && options.id !== '' ? options.id : undefined,
+          cwd: typeof options.workingDir === 'string' && options.workingDir !== '' ? options.workingDir : undefined,
+          ...(model === '' ? {} : { model }),
+          ...(provider === '' ? {} : { provider }),
+          ...(effort === '' ? {} : { reasoningEffort: effort }),
+        });
+        // What the session is actually on, never what was asked for: DSH resolves and
+        // normalizes the selection, so echoing the request would claim a route the
+        // session may not be running. Absent means the Host named no selection, which
+        // is the only honest answer when the controller named none either.
+        const applied = created?.selection ?? null;
+        return invokeResult(request, {
+          sessionId: String(created?.sessionId ?? options.id ?? ''),
+          // One harness, whatever the picker offered.
+          agentKind: DSH_AGENT_KIND,
+          workDir: options.workingDir ?? null,
+          usedProjectContext: false,
+          ...(applied === null ? {} : {
+            model: applied.model,
+            providerId: applied.provider,
+            ...(typeof applied.reasoningEffort === 'string' && applied.reasoningEffort !== ''
+              ? { effort: applied.reasoningEffort }
+              : {}),
+          }),
+        });
+      } catch (error) {
+        // A session that was created but whose model cannot be routed must not be
+        // reported as a clean success: its row would then read deepseek while the user
+        // is looking at the model they picked — the silent lie this path exists to
+        // avoid. The refusal travels as a code the controller already understands, and
+        // its idempotent retry adopts the existing session instead of creating another.
+        return invokeError(request, refusalCodeOf(error), String(error?.message ?? error));
+      }
     }
 
     if (channel === 'local-db:sessions:patch-meta') {

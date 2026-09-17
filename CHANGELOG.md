@@ -26,6 +26,23 @@
 
 ## [Unreleased]
 
+### Fixed
+
+- **新建对话时选的模型被丢掉，首个 prompt 跑在默认模型上**：`maker:create-session` 只读 `id` /
+  `workingDir`，把控制端**一起提交**的 `model` / `providerId` / `effort` 全丢了。新建页没有会话可以调
+  `maker:set-model`（手机管线是 create → getSession → enqueue，`setModel` 在仓库里连一个生产调用点都没有），
+  所以这套 runtime 只有这一条路能到达 Host。丢掉它 = 新会话没有任何会话级选择，DSH 的 `selectionFor`
+  于是回落到 profile 的 `agent-default-model`（deepseek-flash），首个 prompt 就跑在它上面；而手机随后从
+  权威会话行读到 `modelSelection.next ?? lastUsed` 也是 deepseek——用户看到的就是「新对话选了 gpt，
+  一运行又变成 deepseek」。现在 create 会把这三个字段转给 seam，并在**创建成功后立刻落成会话级选择**
+  （DSH 只允许这个顺序：选择必须属于某个会话）；`providerId` 缺省时按 `maker:set-model` 已有的口径从本
+  Host 目录解析 provider，若整个目录里都没有能路由该模型的 provider，则回拒绝码 `NOT_AVAILABLE` 而不是
+  回一个假的成功（会话此时已存在，控制端的 create 幂等且重试前会 probe `getSession`，所以老实的拒绝只花
+  一次重试，而静默的错模型会毁掉一整段对话）。
+- 同一条路径上 `maker:set-effort` 与 create 现在共用同一个 `applyModelSelection`，避免第二份 provider 解析；
+  并把 DSH 自己的 `session/model-unavailable`（来源在挑选与创建之间掉线等）翻成 `NOT_AVAILABLE`——原样抛出去，
+  控制器读到的 `THREW` 是「Host 崩了」，而不是「这个模型在这里不可用」。
+
 ### 文档与注释（无行为变化）
 
 - 一次独立复核（更强模型对抗式核对）发现若干**与实现相反**的说法，已修正：presence 报离线

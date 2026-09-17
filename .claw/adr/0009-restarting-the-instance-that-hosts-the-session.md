@@ -96,3 +96,11 @@ a by-hand restart works too.
 - The instance being restarted must not be the one whose `--dsh-home` provides a different
   device identity: the identity check exists so a wrong `DSH_HOME` cannot silently move the
   Host onto someone else's credentials.
+- **The capability is also a global skill** (`~/.agents/skills/dsh-restart`, 2026-09-17), because
+  "restart DSH" is not specific to this repository: any agent, in any project, hits the same
+  problem — the process it must restart is its own parent, inside a job it cannot escape. The
+  skill carries the same two measured facts (a WMI supervisor; a detached child with file-backed
+  output) and the same rules (announce first, 60 s grace, nothing resumes on its own, failure
+  means DSH stays down). It has no repository dependency: its logs go to
+  `~/.agents/logs/dsh-restart/`, and the relaunch's working directory is the caller's unless
+  `--cwd` says otherwise.

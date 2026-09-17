@@ -922,6 +922,100 @@ the channel layer may see. Two of the three capabilities that live outside the
 seam — `files` and `goalWrite` — are named explicitly because they come from
 their own injections.
 
+## A new conversation's model arrived, and this Host dropped it
+
+Reported from the handset: 「新对话选择了 gpt 模型，一运行又变成了 deepseek」. The picker is
+not the defect, and neither is DSH: this Host's `maker:create-session` read two fields out of
+the controller's argument and ignored the rest of the runtime it was handed.
+
+A **new** conversation has nowhere else to put that runtime. Measured in the handset's own
+pipeline (`apps/mobile/src/session/newSessionCreation.ts`), the order is create → getSession →
+enqueue, and `setModel` is never called anywhere in it — the transport declares the verb, and
+the only callers in the tree are tests. What the user picked travels in the create args, under
+the same names in both controllers:
+
+```ts
+// apps/mobile/src/session/newSession.ts — buildRemoteCreateSessionOptions
+{ agentKind, workspaceKind, model, permissionMode, fastMode,
+  ...(effort ? { effort } : {}), ...(providerId ? { providerId } : {}),
+  ...(workingDir ? { workingDir, extraDirs } : {}) }
+
+// apps/desktop/src/renderer/features/cc-agent/deviceLinkCreateArgs.ts
+{ agentKind, id?, workingDir?, workspaceKind, model, effort, permissionMode, fastMode,
+  extraDirs?, writableDirs?, providerId? }
+```
+
+The consequence is visible one layer down, in DSH's own route resolution
+(`dsh-api-session-controller`, `selectionFor`):
+
+```js
+get current() {
+  if (picked !== undefined) return picked;                            // a session-local selection
+  const loggedHeader = agent.session.requestHeader();
+  if (loggedHeader === undefined) return defaultModel.currentSelection();  // ← the profile default
+  …
+}
+```
+
+A session created through this channel has `picked === undefined` (no `model/selection` event
+was ever appended) and no request header yet, so its **first prompt runs on the profile's
+`agent-default-model`** — `deepseek-official/deepseek-flash` in the profile this was reported
+from. The handset then reads the authoritative row back: `dsh-session-source.js` folds
+`projections.values.modelSelection.next ?? lastUsed`, the pending selection is empty, so the row
+answers deepseek and replaces the optimistic gpt row the user was looking at. That is the
+「一运行就变成 deepseek」.
+
+The fix keeps the contract in one place. The seam's `createSession` now accepts the selection
+and installs it immediately after the create — the only order DSH allows, because a selection
+needs a session to belong to — and the provider-resolution plus write that `maker:set-model`
+already used became `applyModelSelection`, so both paths share one implementation instead of a
+second copy. The channel layer forwards the three fields the controllers actually send, so the
+seam is not a second place that has to guess them.
+
+Three decisions are worth stating outright:
+
+- **Absent means absent.** A blank `model` is not forwarded and no selection is installed: a
+  controller with no opinion must not move the session off the Host's default.
+- **A model that cannot be routed is refused, never swallowed.** Two shapes reach the write and
+  both answer `NOT_AVAILABLE` rather than `THREW` — which the controller reads as this Host
+  crashing: a model no catalog group serves is refused before the write, and DSH's own
+  `session/model-unavailable` (a route it cannot resolve, e.g. a provider that lost its
+  credential between the picker read and the create) is translated by the seam. In the second
+  case the session does exist by then — but the controller's create is idempotent and probes
+  `getSession` before rebuilding, so the honest refusal costs one retry instead of a
+  conversation running a model nobody picked. A failure that is **not** a refusal is left alone.
+- **DSH's write has two effects, and this Host inherits both.** `session.selectModel` installs
+  the session's coming request **and** updates the profile's `agent-default-model` — what the
+  desk's own model picker does. A conversation created from the handset on gpt therefore also
+  becomes the default for sessions no picker has touched. That is DSH's semantics, not
+  something this Host invented; only a future DSH API that separates "this session" from "the
+  default" would change it.
+
+Measured through the Host's own self-test route against the sandboxed instance (`.sandbox`, port
+3081, whose plugin entry is a link to this repository):
+
+```
+control  (no model asked)             -> created, row.model = deepseek-flash   (the profile default)
+picked   (deepseek-v4-pro, low)       -> created, row.model = deepseek-v4-pro, row.effort = low
+bogus    (gpt-9-nope)                 -> NOT_AVAILABLE  no provider in this Host's catalog serves gpt-9-nope
+unrouted (openai-codex, unconfigured) -> NOT_AVAILABLE  no adapter registered for provider "openai-codex"
+```
+
+The control line is what makes the probe worth running: the path with no pick is untouched. The
+pick line is the defect's opposite — the row the handset reads back reports the model the user
+chose. And the third decision above is measurable, not just claimed: read immediately after that
+probe, the sandbox's own `settings.yaml` said `agent-default-model: provider deepseek-official /
+model deepseek-v4-pro / reasoningEffort low` — the pick had become the profile default. (The
+acceptance run that followed set the model back to `deepseek-flash`, which is why the same file
+reads that way now.) `node tools/acceptance.mjs --base http://127.0.0.1:3081` passes 81/81 on the
+same instance.
+
+Every shape is pinned by a test: the runtime is forwarded to the seam, a blank picker installs
+nothing, an unroutable model is refused with the code the controller reads, DSH's own refusal is
+translated, and a genuine failure is not dressed up as one. The assertion that used to say
+*"the picker is ignored; DSH creates the session"* was this defect written down as a contract;
+it now asserts the opposite.
+
 ## Record what was asked, not just what was answered
 
 Two diagnostics earned their place this round, both for the same reason: the
