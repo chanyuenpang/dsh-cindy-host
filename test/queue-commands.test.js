@@ -174,6 +174,54 @@ test('an insert that arrives after the turn ended is a normal prompt, not a refu
   assert.equal(sent[0].text, 'sent a moment too late', 'and the words are not lost');
 });
 
+test('a steer DSH refuses mid-turn is retried as a prompt, and the words survive', async () => {
+  // The error the handset showed: 「current turn no longer accepts steering」. The turn *was*
+  // running, so the session-state check passes, and DSH refuses anyway because the turn moved past
+  // its steerable point. That gap is a race, and the user's message must not be what loses it.
+  const sent = [];
+  const router = createChannelRouter({
+    listSessions: async () => ROWS,
+    resolveCapabilities: () => ({
+      isSessionRunning: () => true,
+      queueMirror: { dshItemId: () => null, markSteering: () => {} },
+      readSessionState: async () => ({ inbox: { 'next-turn': [], 'next-step': [] }, hasGoalKey: false }),
+      pushInputProjection: () => {},
+      sendMessage: async (input) => {
+        sent.push(input.mode);
+        if (input.mode === 'steer') throw new Error('current turn no longer accepts steering');
+        return { ok: true };
+      },
+    }),
+    subscribers: new Set(),
+  });
+
+  const result = await router(request('maker:input:steer', ['s1', { clientId: 'raced', text: 'said too late' }]));
+  assert.equal(result.payload.ok, true, 'the insert is not answered with an error');
+  assert.deepEqual(sent, ['steer', 'queue'], 'the refused steer is retried as a plain prompt');
+});
+
+test('a failure that is not about steering still travels', async () => {
+  // The retry is for one specific refusal. Swallowing every error would turn a real failure — a
+  // dead attachment, a model that cannot take images — into a silent success.
+  const router = createChannelRouter({
+    listSessions: async () => ROWS,
+    resolveCapabilities: () => ({
+      isSessionRunning: () => true,
+      queueMirror: { dshItemId: () => null },
+      readSessionState: async () => ({ inbox: { 'next-turn': [], 'next-step': [] }, hasGoalKey: false }),
+      sendMessage: async () => {
+        throw new Error('session/model-unavailable: no adapter serves provider "x"');
+      },
+    }),
+    subscribers: new Set(),
+  });
+
+  await assert.rejects(
+    () => router(request('maker:input:steer', ['s1', { clientId: 'bad', text: 'x' }])),
+    /model-unavailable/,
+  );
+});
+
 test('the queue UI flags are recorded, not ignored', async () => {
   // The controller sets these here and reads them back out of the projection, so
   // dropping them makes its panel forget what the user just did.

@@ -1027,15 +1027,17 @@ export function createChannelRouter({
         return invokeError(request, 'BAD_REQUEST', `${channel} carried no text and no attachment this Host can serve`);
       }
 
-      // A steer needs a **live turn**, and the user's tap can arrive a moment too late.
+      // A steer needs a **live turn**, and even then DSH can refuse it: "current turn no longer
+      // accepts steering" is what the phone showed when the user's tap landed as the turn moved
+      // past its steerable point. Checking the session state answers the first half (a turn that
+      // never started), and it cannot answer the second: the gap between our check and DSH's
+      // decision is a race, and **the user's words must not be the thing that loses it**.
       //
-      // Measured: the second 插入 of a session whose turn had already ended answered
-      // `session/steer-unavailable` — the phone showed 「current turn no longer running」 and the
-      // message the user was looking at was the one that suffered, for a request that only wanted
-      // to say something. DSH's own steer primitive refuses without a running agent; a normal
-      // prompt is the same intent one step later and starts the turn it would have steered into.
-      // So the mode follows the **session**, not the channel.
-      const steer = channel === 'maker:input:steer' && capabilities.isSessionRunning?.(sessionId) === true;
+      // So a refused steer is retried once as a normal prompt: the same intent one step later,
+      // which starts the turn it could not join. Measured before this: the insert produced an
+      // error string on the handset and the message the user was looking at was lost from the
+      // conversation until they sent it again.
+      const wantsSteer = channel === 'maker:input:steer' && capabilities.isSessionRunning?.(sessionId) === true;
       if (typeof capabilities.sendMessage !== 'function') return invokeError(request, 'NOT_AVAILABLE', 'This DSH Host cannot send prompts yet');
       // The controller's own `clientId` is the prompt identity, and DSH persists
       // it as the queued item's `rpcId` — the field the controller retires its
@@ -1043,15 +1045,27 @@ export function createChannelRouter({
       // Sending the relay's envelope id instead left the draft in the composer
       // (so the next thing the user typed was appended to it) and made a retry
       // indistinguishable from a new message.
-      const sent = await capabilities.sendMessage({
+      const send = (mode) => capabilities.sendMessage({
         sessionId,
         text: text ?? '',
         requestId: namedId ?? request.id,
-        mode: steer ? 'steer' : 'queue',
+        mode,
         // A message with no serveable attachment keeps the exact shape it always
         // had: an empty list is not information, and every seam test pins it.
         ...(attachments.length > 0 ? { attachments } : {}),
       });
+      let steer = wantsSteer;
+      let sent;
+      try {
+        sent = await send(wantsSteer ? 'steer' : 'queue');
+      } catch (error) {
+        const message = String(error?.message ?? error);
+        if (!wantsSteer || !/steer/i.test(message)) throw error;
+        // The turn would not take it. Say it as a prompt instead, and remember that this was not a
+        // steering row so the projection does not claim one.
+        steer = false;
+        sent = await send('queue');
+      }
       // An attachment-only prompt whose bytes could not be fetched is refused with
       // the reason: sending it would deliver a photo the agent never saw.
       if (sent !== undefined && sent !== null && sent.ok === false) {
