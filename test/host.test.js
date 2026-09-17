@@ -535,8 +535,9 @@ test('an error on the invoke path answers the controller and is recorded, never 
     assert.equal(results[0].payload.ok, false);
     assert.equal(results[0].payload.error.code, 'INTERNAL');
 
-    const errors = runtime.getHandlerErrors().filter((entry) => entry.where === 'invoke');
+    const errors = runtime.getHandlerErrors().filter((entry) => entry.where.startsWith('invoke'));
     assert.equal(errors.length, 1, 'and what it caught is recorded');
+    assert.equal(errors[0].where, 'invoke:local-db:sessions:list', 'named with the channel, or a timeout is unattributable');
     assert.match(errors[0].message, /unavailable/);
     assert.match(errors[0].stack, /listSessions/);
   } finally {

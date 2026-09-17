@@ -1819,7 +1819,10 @@ export async function startHost(initialSource, settings = DEFAULT_HOST_SETTINGS,
             }
           },
           (error) => {
-            recordHandlerError('invoke', error);
+            // Named with the channel: seven identical `TimeoutError`s in the diagnostics after one
+            // restart were unattributable, and "which read is missing its budget" is the whole
+            // question. `frame.payload.channel` is the only thing that answers it.
+            recordHandlerError(`invoke:${typeof frame?.payload?.channel === 'string' ? frame.payload.channel : '?'}`, error);
             send({ v: PROTOCOL_VERSION, kind: 'invoke-result', id: frame.id, dst: frame.src, payload: { ok: false, error: { code: 'INTERNAL', message: 'DSH Host failed to serve this channel' } } });
           },
         );

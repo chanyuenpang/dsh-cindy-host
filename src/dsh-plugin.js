@@ -55,7 +55,7 @@ const PRESET_INVENTORY_TTL_MS = 30_000;
  * @param serviceName - which candidate became available.
  * @returns the source and the label naming its seam.
  */
-export function buildDshSource(ctx, serviceName) {
+export function buildDshSource(ctx, serviceName, options = {}) {
   if (serviceName === 'sessionController') {
     const sessionController = ctx.get('sessionController');
     const sessionQuery = ctx.get('sessionQuery');
@@ -484,7 +484,15 @@ export function buildDshSource(ctx, serviceName) {
      */
     const historyView = readMessages === undefined
       ? undefined
-      : createHistoryViewController({ rows: (sessionId) => readMessages.all(sessionId) });
+      : createHistoryViewController({
+        rows: (sessionId) => readMessages.all(sessionId),
+        // The turn state has to be **wired** here; the controller's own default is `() => false`.
+        // That default is why a running turn was never marked `isStreaming`, which cost two things
+        // at once and looked like a client problem both times: the phone drew no live card, and
+        // the "running card is last" rule had nothing to detect, so the user's own messages stayed
+        // below their own conversation.
+        sessionRunning: (sessionId) => options.isSessionRunning?.(sessionId) === true,
+      });
     // Bound once, not inline: the rename path has to be able to invalidate this source's
     // cached title, and a property of the object literal below is not in scope here.
     const sessionSource = createSessionControllerSource({
@@ -1334,7 +1342,11 @@ export function apply(ctx) {
   // projection reading a dead service.
   for (const serviceName of SOURCE_SERVICES) {
     ctx.inject([serviceName], (sourceCtx) => {
-      const built = buildDshSource(sourceCtx, serviceName);
+      const built = buildDshSource(sourceCtx, serviceName, {
+        // Read lazily: the runtime resolves after this seam is built, and the state changes on
+        // every turn boundary.
+        isSessionRunning: (sessionId) => runtime?.isSessionRunning?.(sessionId) === true,
+      });
       // The filesystem is a separate service; the controller's file reads are
       // only wired when this profile composes one.
       const fileSystem = sourceCtx.get('fs');
