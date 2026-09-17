@@ -87,6 +87,10 @@ rules are covered without a browser.
 
 Do not enable Cindy transport in production yet. A separate compatibility slice must adapt the projection source to the current Typert session/event remotes, then add a real-host read-only smoke test. The external package must use only version-pinned public DSH packages and never resolve DSH's nested `node_modules`.
 
+## 发布指南
+
+见 [doc/releasing.md](doc/releasing.md)：门禁 → claw 留证 → 脱敏 → 部署（重启才是生效点） → 回滚。
+
 ## 仓库治理
 
 分支 `main`，当前只有本地提交（尚未配置远端）。
