@@ -233,7 +233,28 @@ export function createHistoryViewController({
   pageItems = HISTORY_PAGE_ITEMS,
   pageBytes = HISTORY_PAGE_BYTES,
   detailBytes = HISTORY_DETAIL_PAGE_BYTES,
+  hydrate,
 } = {}) {
+  /**
+   * Turn the served rows' image handles into bytes, in place.
+   *
+   * A view page is a **second** read path, and the reason this hook exists: image hydration was
+   * wired into `local-db:messages:list` alone, so when the controller moved onto this view
+   * (`history-view-v1`) every user photo silently went back to a path-less file chip — the
+   * 「发送的照片看不到」 regression, on a path nothing hydrated. Anything that serves rows to the
+   * phone has to run this.
+   *
+   * Called **after** the page's items are chosen, so only the rows being served pay for reading
+   * image bytes, and the page's own byte budget still counts text only (the pictures carry their
+   * own budget inside the hydrator).
+   *
+   * @param servedRows - the rows of the page about to be returned.
+   */
+  async function hydrateServed(servedRows) {
+    if (typeof hydrate !== 'function' || servedRows.length === 0) return;
+    await hydrate(servedRows);
+  }
+
   /** `sessionId` → the work keys the controller currently has expanded. */
   const expanded = new Map();
 
@@ -309,6 +330,7 @@ export function createHistoryViewController({
       bytes += size;
     }
     const hasMore = selected.length > 0 && end - selected.length > 0;
+    await hydrateServed(selected.flatMap((item) => (item.type === 'messages' ? item.messages ?? [] : [])));
     return {
       ok: true,
       result: {
@@ -355,6 +377,7 @@ export function createHistoryViewController({
     }
     const lastSent = messages[messages.length - 1];
     const hasMore = messages.length > 0 && start + messages.length < range.length;
+    await hydrateServed(messages);
     return {
       ok: true,
       result: {

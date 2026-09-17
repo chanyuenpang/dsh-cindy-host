@@ -3,6 +3,27 @@
 本文件记录**用户可见**的变化与**每次发布验证过的 DSH 版本**。格式遵循
 [Keep a Changelog](https://keepachangelog.com/zh-CN/1.1.0/)，版本号遵循语义化版本。
 
+## [0.1.3] - 2026-09-17
+
+### Fixed
+
+- **手机又看不到自己发的照片了** —— 这是修过的回归，但**修复本身没有失效**：它只挂在一条读取路径上。
+  图片水合（把行里的 `imageRef` 读成内联 `images[]`）当年只接在 `local-db:messages:list`（旧转录读取）；
+  后来控制器改用 `local-db:messages:view`（历史视图，广告了 `history-view-v1`），而那条路从没接过水合
+  —— 照片于是又变成"没有可展示的远程路径"的文件条目。线上实测：那一行确实带着 `imageRef` 被服务出去，
+  而 `diagnostics.attachmentReads` 是 `{attempted:0, served:0, failed:0}`，即水合一次都没跑。
+- **刚发完的那一刻同样看不到**：实时推送 `local-db:messages:created` 也从不水合，所以承载照片的那一帧
+  到达时渲染不出图片，要等某次"刚好走水合路径"的重读才会出现。
+
+现在**三条路（`messages:list` 页面、`messages:view` 页面、实时推送）共用同一个水合器**，因此
+"live append 与 transcript read 产生同样的行"这句注释重新成立；水合失败只损失那一张图片，绝不损失消息。
+
+### Tests
+
+- 历史视图页面：带 `imageRef` 的行返回时必须带 `images[]`、`imageRef` 被剔除，**且不在页内的旧行一次读都不产生**；
+  没有水合器时页面照常应答（退回文件 chip，不崩）。
+- 实时推送：承载图片的那一帧里就有 base64；水合器抛错时消息照发（未水合）。
+
 ## [Unreleased]
 
 ### 文档与注释（无行为变化）

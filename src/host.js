@@ -1007,8 +1007,30 @@ export async function startHost(initialSource, settings = DEFAULT_HOST_SETTINGS,
    * The payload is exactly what the controller's `local-db:messages:created`
    * handler reads — `{ sessionId, message }` — so a live append and a transcript
    * read produce identical rows.
+   *
+   * "Identical rows" includes the images: a row is only renderable once its handles are inlined,
+   * and this is the live half of that rule. It used to be the *only* half missing — the two read
+   * paths hydrated, this one did not, so a photo the user had just sent arrived as a file entry
+   * whose `imageRef` means nothing to the phone, and stayed that way until something re-read a
+   * hydrated page (measured: 「我发给你的照片我在信息流里看不到」, with
+   * `attachmentReads.attempted = 0`).
+   *
+   * Hydration failure must never cost the message: the row goes regardless, it just shows a file
+   * chip instead of the picture.
    */
-  function pushSessionMessage(sessionId, message) {
+  async function pushSessionMessage(sessionId, message) {
+    try {
+      // `options.resolveCapabilities` is the plugin's provider — the only source of the hydrator.
+      // (Reading it through the router's own `resolveCapabilities` is not possible from here: that
+      // name exists only as a property of the router's options object, and calling it as a bare
+      // function threw a ReferenceError this `catch` then swallowed — hydration silently did
+      // nothing, which is the same class of failure as the bug being fixed.)
+      const provider = typeof options.resolveCapabilities === 'function' ? options.resolveCapabilities() : undefined;
+      const hydrate = provider?.hydrateImages;
+      if (typeof hydrate === 'function') await hydrate([message]);
+    } catch {
+      // Un-hydrated is still worth sending.
+    }
     pushSessionUpdate(sessionId, 'local-db:messages:created', { sessionId, message });
     // …and tell the history view to re-read, coalesced. The two are not the same message: the
     // row above feeds the controller's message store, while this one is the only signal the
@@ -1090,6 +1112,11 @@ export async function startHost(initialSource, settings = DEFAULT_HOST_SETTINGS,
         // what lets the controller keep a projection across re-entries instead of
         // re-deriving continuity from 20-row pages and dropping what it cannot prove.
         historyView: provided.historyView ?? null,
+        // The live push path's hydrator. It is not a controller capability — it never reaches a
+        // channel — but it crosses this boundary for the same reason `historyView` does: the
+        // plugin owns the attachment reader, and a row must be renderable in the frame that
+        // carries it (see `pushSessionMessage`).
+        hydrateImages: provided.hydrateImages,
       inputProjection: (sessionId, pending) => inputQueue.projectionFor(sessionId, sessionRowFor(sessionId), pending ?? null),
       queuedRow: ({ clientId, text, sessionId }) => queuedRowFromController({ clientId, text, session: sessionRowFor(sessionId) }),
       goalStatus: (sessionId) => toGoalStatusPayload(sessionId, projections.goalOf(sessionId)),

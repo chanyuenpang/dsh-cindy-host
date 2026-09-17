@@ -11,6 +11,7 @@ import { createAttachmentMaterializer } from './host-attachments.js';
 import { createGoalWriter } from './host-goals.js';
 import { startHost } from './host.js';
 import { refusalError } from './cindy-channels.js';
+import { hydrateImageAttachments } from './cindy-message-row.js';
 import { API_PREFIX, createHostRoutes } from './host-routes.js';
 
 export const name = 'dsh-cindy-host';
@@ -479,6 +480,17 @@ export function buildDshSource(ctx, serviceName, options = {}) {
       ? undefined
       : createMessageReader({ readSessionLog: (sessionId) => sessionQuery.readSession(sessionId), readImageAttachment });
     /**
+     * Turn image handles into bytes for **whatever is about to reach the phone**.
+     *
+     * One hydrator, three call sites (`messages:list` pages, history-view pages, and the live
+     * `messages:created` push), because "the user's photo does not render" has already happened
+     * once by hydration living on a single path: it was wired into `messages:list`, the
+     * controller moved onto the history view, and every photo went back to a path-less chip.
+     * A row is only renderable after this runs, so every path that hands a row to a controller
+     * has to run it.
+     */
+    const hydrateRows = (rows) => hydrateImageAttachments(rows, { readImage: readImageAttachment });
+    /**
      * How many rows one session's transcript holds.
      *
      * The controller only lights its "load earlier" entry point when it knows the
@@ -511,6 +523,9 @@ export function buildDshSource(ctx, serviceName, options = {}) {
         // the "running card is last" rule had nothing to detect, so the user's own messages stayed
         // below their own conversation.
         sessionRunning: (sessionId) => options.isSessionRunning?.(sessionId) === true,
+        // …and so does this: the view is what the controller actually reads, so without it a
+        // photo arrives as a file entry whose `imageRef` means nothing to the phone.
+        hydrate: hydrateRows,
       });
     // Bound once, not inline: the rename path has to be able to invalidate this source's
     // cached title, and a property of the object literal below is not in scope here.
@@ -528,6 +543,11 @@ export function buildDshSource(ctx, serviceName, options = {}) {
       // Reported through the status route: "the photo does not render" has three
       // indistinguishable causes from the outside, and this separates them.
       attachmentReads,
+      // Internal plumbing rather than a controller capability: the live push path has to inline a
+      // message's images before the row leaves, exactly like the two read paths do. It rides the
+      // seam so there is **one** hydrator (`hydrateRows`) instead of one per caller — a second
+      // copy is how the history view ended up serving un-hydrated rows.
+      hydrateImages: hydrateRows,
       /**
        * Create one session **the way the desk's own UI creates it**.
        *
@@ -1136,6 +1156,11 @@ export function capabilityProvider(sources) {
     // NOT_AVAILABLE while the controller sat right here (the `queueControl` failure).
     historyView: sources.historyView,
     attachmentReads: sources.attachmentReads,
+    // Internal (the live push path), but it crosses the same seam, so it is forwarded here: the
+    // invariant test in `test/dsh-plugin.test.js` requires every seam key to be reachable, and a
+    // key that exists but is reachable from nowhere is exactly the bug class this repo keeps
+    // closing.
+    hydrateImages: sources.hydrateImages,
     createSession: sources.createSession,
     sendMessage: sources.sendMessage,
     renameSession: sources.renameSession,
@@ -1441,17 +1466,17 @@ export function apply(ctx) {
   // The live session stream. `session/event` fires for every appended event, so
   // it is the push path's source: fold the event into the controller's message
   // rows and hand them to whoever is watching that session.
-  ctx.effect(() => ctx.on('session/event', guarded('session-event', (session, event) => {
+  ctx.effect(() => ctx.on('session/event', guarded('session-event', async (session, event) => {
     // This handler runs inside Cordis's own dispatch, which has no `try`/`catch`: a throw
     // from here does not fail this plugin, it fails the process — DSH's boot installs an
     // unhandled-rejection handler that writes `fatal load failure` and calls `exit(1)`. The
     // work below reads DSH's session events and folds them, so it is exactly where an
     // unexpected event shape surfaces; it must never be able to take the desktop down.
-    handleSessionEvent(session, event);
+    await handleSessionEvent(session, event);
   })), 'dsh-cindy-host: live session stream');
 
   /** Fold one DSH session event into the push path and the transcript cache. */
-  function handleSessionEvent(session, event) {
+  async function handleSessionEvent(session, event) {
     if (!runtime || typeof runtime.pushSessionMessage !== 'function') return;
     const sessionId = session?.header?.id;
     if (typeof sessionId !== 'string' || sessionId === '') return;
@@ -1497,7 +1522,9 @@ export function apply(ctx) {
     if (isHarnessNotice(event) && typeof runtime.noteSuppressedNotice === 'function') runtime.noteSuppressedNotice();
     // Nothing to do unless a controller is watching; the fold is not free.
     if (runtime.watchersFor(sessionId) === 0) return;
-    for (const row of foldSessionEvent(event, { sessionId })) runtime.pushSessionMessage(sessionId, row);
+    // Awaited, because `pushSessionMessage` inlines the row's images first: a photo has to be
+    // renderable in the frame that carries it, not one read later.
+    for (const row of foldSessionEvent(event, { sessionId })) await runtime.pushSessionMessage(sessionId, row);
     // A durable message is a second witness that something happened, so it also
     // schedules the one check that makes sure the spinner cannot outlive the
     // turn it was watching — unless this event *was* the boundary.

@@ -333,3 +333,58 @@ test('expand intent replaces the set wholesale and refuses a shapeless request',
   assert.equal((await view.intent('s1', 'nope')).code, 'BAD_REQUEST');
   assert.equal((await view.intent('s1', new Array(101).fill({ key: 'work-a' }))).code, 'BAD_REQUEST');
 });
+
+test('a view page hydrates the pictures of the rows it serves — and only those', async () => {
+  // The regression this pins: image hydration was wired into `local-db:messages:list` alone, so
+  // when the controller moved onto this view every photo the user sent went back to a file entry
+  // whose `imageRef` means nothing to the phone — 「我发给你的照片我在信息流里看不到」, with
+  // `attachmentReads.attempted = 0` on a live Host. A page is a read path, so it hydrates.
+  const handle = (name) => ({ name, size: 1000, mimeType: 'image/jpeg', imageRef: { attachmentId: `sha256:${name}`, mediaType: 'image/jpeg' } });
+  // Four turns, so the oldest user row is far outside the newest page.
+  const rows = transcript(4);
+  const newestUser = rows.find((entry) => entry.role === 'user' && entry.id === 's1:u3:0');
+  const olderUser = rows.find((entry) => entry.role === 'user' && entry.id === 's1:u0:0');
+  assert.ok(newestUser !== undefined && olderUser !== undefined, 'the fixture must name the two user rows');
+  newestUser.content = { text: 'newest', files: [handle('new.jpg')] };
+  olderUser.content = { text: 'oldest', files: [handle('old.jpg')] };
+
+  const hydrated = [];
+  const view = controller(rows, {
+    // A page smaller than the transcript, so the oldest user row is genuinely outside it.
+    pageItems: 6,
+    hydrate: async (servedRows) => {
+      hydrated.push(...servedRows);
+      for (const entry of servedRows) {
+        const files = Array.isArray(entry.content?.files) ? entry.content.files : [];
+        const images = files.filter((file) => file.imageRef !== undefined)
+          .map((file) => ({ base64: 'AAAA', mimeType: file.mimeType, originalName: file.name }));
+        if (images.length === 0) continue;
+        entry.content = { ...entry.content, images, files: undefined };
+      }
+    },
+  });
+
+  const page = await view.page('s1');
+  const served = page.result.items.flatMap((item) => (item.type === 'messages' ? item.messages : []));
+  const rendered = served.find((entry) => Array.isArray(entry.content?.images));
+
+  assert.ok(rendered !== undefined, 'the served photo must come back renderable');
+  assert.equal(rendered.content.images[0].originalName, 'new.jpg');
+  assert.equal(rendered.content.files, undefined, 'the handle must not survive into the page');
+  assert.ok(hydrated.length > 0, 'the hook must actually be called');
+  for (const entry of hydrated) {
+    assert.ok(served.includes(entry), 'hydrate must never be handed a row outside the page');
+  }
+  assert.equal(hydrated.some((entry) => entry.id === olderUser.id), false, 'an unserved row costs no read');
+});
+
+test('a page with no hydrator still answers — the picture just stays a chip', async () => {
+  const rows = transcript(1);
+  const user = rows.find((entry) => entry.role === 'user');
+  user.content = { text: 'hi', files: [{ name: 'p.jpg', size: 10, imageRef: { attachmentId: 'sha256:x' } }] };
+  const page = await controller(rows).page('s1');
+  assert.equal(page.ok, true);
+  const served = page.result.items.flatMap((item) => (item.type === 'messages' ? item.messages : []));
+  const carried = served.find((entry) => Array.isArray(entry.content?.files));
+  assert.equal(carried?.content?.images, undefined, 'no hydrator means no inlined bytes, never a crash');
+});

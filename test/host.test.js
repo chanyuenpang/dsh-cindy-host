@@ -1380,3 +1380,56 @@ test('a controller speaking about a session repairs it, at most once per window'
     await runtime.stop();
   }
 });
+
+test('a live message push inlines its picture before the frame leaves', async () => {
+  // The live half of the rule the two read paths already followed. This path shipped without it,
+  // so a photo the user had just sent arrived as a file entry the phone cannot render — and
+  // nothing re-reads a hydrated page for a message that arrives while the user is looking at it:
+  // 「刚才我发给你的照片我在信息流里看不到」.
+  const hydrated = [];
+  const { runtime, socket } = await runtimeWithSocket({
+    resolveCapabilities: () => ({
+      hydrateImages: async (rows) => {
+        hydrated.push(...rows);
+        for (const row of rows) {
+          row.content = { ...row.content, images: [{ base64: 'AAAA', mimeType: 'image/jpeg', originalName: 'p.jpg' }], files: undefined };
+        }
+      },
+    }),
+  });
+  try {
+    socket.emit('open');
+    socket.frame({ v: 1, kind: 'hello-ack', payload: { serverProtocolVersion: 1, deviceId: 'dev-host', userId: 'user-1' } });
+    socket.frame({ v: 1, kind: 'invoke', id: 'sub-1', src: 'phone-2', payload: { channel: 'device-link:subscribe', args: [{ topics: ['sessions', 'session:s1'] }] } });
+    await new Promise((resolve) => setImmediate(resolve));
+    assert.equal(runtime.watchersFor('s1'), 1);
+
+    await runtime.pushSessionMessage('s1', { id: 'm1', role: 'user', content: { text: '你看', files: [{ name: 'p.jpg', imageRef: { attachmentId: 'sha256:x' } }] } });
+
+    const pushed = socket.sent.filter((frame) => frame.kind === 'push' && frame.payload?.channel === 'local-db:messages:created').pop();
+    assert.ok(pushed !== undefined, 'the message must be pushed');
+    assert.equal(pushed.payload.payload.message.content.images[0].base64, 'AAAA', 'the picture rides the same frame');
+    assert.equal(pushed.payload.payload.message.content.files, undefined, 'the handle must not reach the phone');
+    assert.deepEqual(hydrated.map((row) => row.id), ['m1'], 'hydrated once, before the push');
+  } finally {
+    await runtime.stop();
+  }
+});
+
+test('a hydrator that throws costs the picture, never the message', async () => {
+  const { runtime, socket } = await runtimeWithSocket({
+    resolveCapabilities: () => ({ hydrateImages: async () => { throw new Error('the attachment store is down'); } }),
+  });
+  try {
+    socket.emit('open');
+    socket.frame({ v: 1, kind: 'hello-ack', payload: { serverProtocolVersion: 1, deviceId: 'dev-host', userId: 'user-1' } });
+    socket.frame({ v: 1, kind: 'invoke', id: 'sub-1', src: 'phone-2', payload: { channel: 'device-link:subscribe', args: [{ topics: ['sessions', 'session:s1'] }] } });
+    await new Promise((resolve) => setImmediate(resolve));
+
+    await runtime.pushSessionMessage('s1', { id: 'm2', role: 'user', content: { text: 'hi' } });
+    const pushed = socket.sent.filter((frame) => frame.kind === 'push' && frame.payload?.channel === 'local-db:messages:created').pop();
+    assert.equal(pushed?.payload?.payload?.message?.id, 'm2', 'the row still goes, un-hydrated');
+  } finally {
+    await runtime.stop();
+  }
+});
