@@ -30,7 +30,7 @@ const logFile = join(repoRoot, '.sandbox', 'host-restart.log');
 
 /** Parse `--flag value` pairs, with a dry run as the default. */
 export function parseArgs(argv) {
-  const options = { apply: false, graceSeconds: 20, port: 3080, retries: 3 };
+  const options = { apply: false, graceSeconds: 20, port: 3080, retries: 3, dshHome: null };
   for (let index = 0; index < argv.length; index += 1) {
     const flag = argv[index];
     const value = argv[index + 1];
@@ -39,6 +39,7 @@ export function parseArgs(argv) {
     else if (flag === '--grace') { options.graceSeconds = Number(value); index += 1; }
     else if (flag === '--port') { options.port = Number(value); index += 1; }
     else if (flag === '--retries') { options.retries = Number(value); index += 1; }
+    else if (flag === '--dsh-home') { options.dshHome = value; index += 1; }
   }
   return options;
 }
@@ -118,10 +119,13 @@ async function probe(port, timeoutMs = 1500) {
 }
 
 /** The detached half: kill, start, wait, report. */
-async function supervise({ port, graceSeconds, retries }) {
+async function supervise({ port, graceSeconds, retries, dshHome }) {
   log(`supervise: start (port ${port}, grace ${graceSeconds}s)`);
   const oldPid = listenerPid(port);
   log(`supervise: target pid=${oldPid ?? 'none'}`);
+  const before = await probe(port);
+  const beforeDeviceId = before?.status?.host?.deviceId ?? null;
+  log(`supervise: identity before = ${beforeDeviceId ?? 'unknown'}`);
   if (oldPid !== null) {
     const args = launchArgsFrom(commandLineOf(oldPid));
     log(`supervise: relaunch args = ${JSON.stringify(args)}`);
@@ -150,7 +154,7 @@ async function supervise({ port, graceSeconds, retries }) {
       }
       const child = spawn(process.execPath, [globalBin, ...args], {
         cwd: repoRoot,
-        env: process.env,
+        env: dshHome === null || dshHome === undefined ? process.env : { ...process.env, DSH_HOME: dshHome },
         stdio: ['ignore', 'pipe', 'pipe'],
         detached: false,
       });
@@ -169,22 +173,55 @@ async function supervise({ port, graceSeconds, retries }) {
       if (up !== null) {
         log(`supervise: up after attempt ${attempt + 1}`);
         log(`supervise: reopen ${tokenUrlFrom(output, port) ?? '(token not captured — check the terminal)'}`);
-        log(`supervise: state=${up.status?.state ?? '?'} deviceId=${up.status?.host?.deviceId ?? '?'}`);
+        // The identity check needs the relay handshake, and the status route answers before it:
+        // the first probe of a fresh instance says `state=authenticating deviceId=?`. Reporting
+        // that as IDENTITY CHANGED is a false accusation, and a check that cries wolf is worse
+        // than no check — so wait for a device id, and say "inconclusive" if it never comes.
+        let afterDeviceId = up.status?.host?.deviceId ?? null;
+        for (let poll = 0; poll < 60 && (afterDeviceId === null || afterDeviceId === ''); poll += 1) {
+          await new Promise((done) => setTimeout(done, 500));
+          up = (await probe(port)) ?? up;
+          afterDeviceId = up.status?.host?.deviceId ?? null;
+        }
+        log(`supervise: state=${up.status?.state ?? '?'} deviceId=${afterDeviceId ?? '?'}`);
+        if (afterDeviceId === null || afterDeviceId === '') {
+          log('supervise: identity inconclusive — the instance is up but has not reached the relay yet');
+        } else if (beforeDeviceId === null || beforeDeviceId === '') {
+          log(`supervise: identity ${afterDeviceId} (the old instance never reported one)`);
+        } else {
+          log(afterDeviceId === beforeDeviceId
+            ? `supervise: identity preserved (${afterDeviceId})`
+            : `supervise: IDENTITY CHANGED ${beforeDeviceId} -> ${afterDeviceId} — this relaunched against a different DSH_HOME`);
+        }
         log(`supervise: boundaries=${JSON.stringify(up.diagnostics?.boundaries ?? null)}`);
         log(`supervise: handlerErrors=${up.diagnostics?.handlerErrors?.length ?? 'n/a'}`);
         log(`supervise: launch output tail: ${output.trim().split(/\r?\n/).slice(-3).join(' | ').slice(0, 600)}`);
-        return;
+        // Let go of the new instance and go away. The pipes were only held to read the token URL,
+        // and leaving them attached keeps this process alive for as long as the server runs —
+        // measured: two supervisors from two tests were still resident minutes later. One stray
+        // process per restart is exactly the kind of leak a restart loop accumulates.
+        child.stdout.destroy();
+        child.stderr.destroy();
+        child.unref();
+        log('supervise: done, supervisor exiting');
+        process.exit(0);
       }
       log(`supervise: attempt ${attempt + 1} did not answer; output tail: ${output.trim().slice(-600)}`);
     }
     log('supervise: every attempt failed — the instance is DOWN and needs a hand');
-    return;
+    process.exit(1);
   }
   log('supervise: no listener found; nothing to restart');
+  process.exit(0);
 }
 
+// Importing this file for its pure helpers must not run the CLI — and with process.exit calls
+// below, an unguarded block would exit a test process that only wanted parseArgs.
+const isMain = process.argv[1] !== undefined && resolve(process.argv[1]) === fileURLToPath(import.meta.url);
 const options = parseArgs(process.argv.slice(2));
-if (options.supervise) {
+if (!isMain) {
+  // imported, not run
+} else if (options.supervise) {
   await supervise(options);
 } else {
   const pid = listenerPid(options.port);
@@ -194,7 +231,7 @@ if (options.supervise) {
     targetPid: pid,
     targetCommandLine: commandLine.slice(0, 300),
     relaunchArgs: launchArgsFrom(commandLine),
-    dshHome: process.env.DSH_HOME ?? '(inherited default)',
+    dshHome: options.dshHome ?? process.env.DSH_HOME ?? '(inherited default)',
     graceSeconds: options.graceSeconds,
     logFile,
     mode: options.apply ? 'APPLY' : 'DRY RUN',
@@ -213,7 +250,7 @@ if (options.supervise) {
     console.log('note: a fresh dsh web prints a NEW token URL — read it from the log above after the restart.');
   } else {
     // Detached and unref'd: this process is a child of the very pid that is about to die.
-    const helper = spawn(process.execPath, [fileURLToPath(import.meta.url), '--supervise', '--port', String(options.port), '--grace', String(options.graceSeconds), '--retries', String(options.retries)], {
+    const helper = spawn(process.execPath, [fileURLToPath(import.meta.url), '--supervise', '--port', String(options.port), '--grace', String(options.graceSeconds), '--retries', String(options.retries), ...(options.dshHome === null ? [] : ['--dsh-home', options.dshHome])], {
       cwd: repoRoot,
       env: process.env,
       stdio: 'ignore',

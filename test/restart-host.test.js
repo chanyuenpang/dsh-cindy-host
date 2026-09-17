@@ -13,10 +13,14 @@ import { launchArgsFrom, parseArgs, tokenUrlFrom } from '../tools/restart-host.m
 const LIVE = '"D:\\Program Files\\nodejs\\node.exe" C:\\Users\\chany\\AppData\\Roaming\\npm/node_modules/@deepseek-ai/dsh/lib/bin.js web';
 
 test('a dry run is the default, and flags parse with or without values', () => {
-  assert.deepEqual(parseArgs([]), { apply: false, graceSeconds: 20, port: 3080, retries: 3 });
+  assert.deepEqual(parseArgs([]), { apply: false, graceSeconds: 20, port: 3080, retries: 3, dshHome: null });
   assert.equal(parseArgs(['--apply']).apply, true);
   assert.equal(parseArgs(['--apply', '--grace', '45', '--port', '3081', '--retries', '5']).graceSeconds, 45);
   assert.equal(parseArgs(['--port', '3081']).port, 3081);
+  // The home is explicit when given, and inherited (null) otherwise: guessing it wrong restarts
+  // the instance against someone else's credentials, which the identity check then reports.
+  assert.equal(parseArgs(['--dsh-home', 'G:\\sandbox\\dsh-home']).dshHome, 'G:\\sandbox\\dsh-home');
+  assert.equal(parseArgs(['--port', '3081']).dshHome, null);
 });
 
 test('the relaunch copies the subcommand, not just the flags', () => {
