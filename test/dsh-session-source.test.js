@@ -56,6 +56,34 @@ test('maps the host session list into conversation rows', async () => {
   ]);
 });
 
+test('folds the session’s model, source and effort out of the same projection', async () => {
+  // 三个值同源:同一个 `modelSelection` 投影。少带 providerId,控制端为下一个对话推导的
+  // runtime 就会有模型没来源。
+  const source = createSessionControllerSource({
+    sessionController: makeController([{
+      sessionId: 's1',
+      updatedAt: 1_700_000_001_000,
+      running: false,
+      projections: { values: { modelSelection: { lastUsed: { provider: 'openai-codex', model: 'gpt-5.6-sol', reasoningEffort: 'high' }, next: null } } },
+    }]),
+    subscribe: makeSubscribe(),
+  });
+  const [row] = await source.listSessions();
+  assert.equal(row.model, 'gpt-5.6-sol');
+  assert.equal(row.providerId, 'openai-codex', 'the source rides the same projection as the model');
+  assert.equal(row.effort, 'high');
+
+  // A session that never chose: none of the three appears, and the row contract fills
+  // its own fallbacks rather than this fold inventing them.
+  const bare = createSessionControllerSource({
+    sessionController: makeController([{ sessionId: 's2', updatedAt: 1_700_000_002_000, running: false }]),
+    subscribe: makeSubscribe(),
+  });
+  const [plain] = await bare.listSessions();
+  assert.equal('providerId' in plain, false);
+  assert.equal('model' in plain, false);
+});
+
 test('carries the working directory and a real creation time when available', async () => {
   const source = createSessionControllerSource({
     sessionController: makeController([{ sessionId: 's1', updatedAt: 1_700_000_001_000, running: false, cwd: 'G:\\work' }]),

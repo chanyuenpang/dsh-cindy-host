@@ -24,7 +24,9 @@
   没有水合器时页面照常应答（退回文件 chip，不崩）。
 - 实时推送：承载图片的那一帧里就有 base64；水合器抛错时消息照发（未水合）。
 
-## [Unreleased]
+## [0.1.4] - 2026-09-18
+
+验证于 **DSH `0.1.5-rc.2`**（Web profile，Windows）。
 
 ### Fixed
 
@@ -42,6 +44,17 @@
 - 同一条路径上 `maker:set-effort` 与 create 现在共用同一个 `applyModelSelection`，避免第二份 provider 解析；
   并把 DSH 自己的 `session/model-unavailable`（来源在挑选与创建之间掉线等）翻成 `NOT_AVAILABLE`——原样抛出去，
   控制器读到的 `THREW` 是「Host 崩了」，而不是「这个模型在这里不可用」。
+- **同一个 create 还丢掉了权限档，这一处更危险**：手机的权限选项**就是**本 Host 广告的
+  `capabilities.permissionModes`（DSH 预设表里的 `read-only` / `workspace-write` / `danger-full-access`），
+  草稿里不在表内的值还会被手机的协调器改写成表内第一项。于是用户选 `read-only` 新建对话，会话照样跑 profile
+  默认的 `danger-full-access`——**他以为被限制住了，实际是最高权限**。现在 create 会在建会话后用与
+  `maker:set-permission-mode` 同一个写入（`installPermissionMode`）安装它，但**只安装本 Host 广告过的
+  名字**：控制端自己的词表（`ask`/`auto`/`acceptEdits`/`bypassPermissions`…，只在能力读取失败时才发）
+  既不翻译（等于替用户决定权限级别），也不拒绝（那会让那台手机建不出任何会话），而是保留 profile 档位、
+  记一条 `ctx.logger` 告警，并由权威会话行如实回报。
+- **会话行补上模型的来源**：`providerId` 与 `model`/`effort` 同在 `modelSelection` 投影里，本 Host 的行
+  却从不带它，于是手机「跟随最近会话」推导出的是「有模型没来源」的下一个对话草稿。现在两个折叠点读同一个
+  投影（`next ?? lastUsed`），没有选择过的会话则**不带这个字段**（缺失 = 走被控端默认路由，正是它实际跑的）。
 
 ### 文档与注释（无行为变化）
 

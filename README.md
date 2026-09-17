@@ -144,7 +144,7 @@ dsh plugin --profile <profile> add dsh-cindy-host-demo@0.1.2
 **验证入口**：
 
 ```bash
-npm test                                                              # 单测（457 项）
+npm test                                                              # 单测（463 项）
 npm run audit:channels                                                # 通道判定表（served 52 / declined 140 / unclassified 0）
 node tools/acceptance.mjs --base http://127.0.0.1:3080 --with-prompts # 端到端（105 项）
 npm run verify                                                        # 上面三者的串行组合

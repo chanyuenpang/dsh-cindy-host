@@ -914,9 +914,18 @@ export function createChannelRouter({
       // (`buildRemoteCreateSessionOptions`) and the desktop (`buildDeviceLinkCreateArgs`)
       // both send `model`, an optional `providerId` (absent/blank = follow this Host's
       // default route) and `effort`.
+      //
+      // `permissionMode` is the same class of field and the same class of loss, with a
+      // worse failure: the handset's permission options **are** this Host's own
+      // advertised `permissionModes` (read-only / workspace-write / danger-full-access,
+      // read from the `permissions` presets), so a user who picks read-only and gets the
+      // profile default of danger-full-access believes the agent is restricted while it
+      // holds full access. Whatever reaches the seam here is whatever the controller
+      // chose; the seam decides whether this Host can actually install it.
       const model = typeof options.model === 'string' ? options.model.trim() : '';
       const provider = typeof options.providerId === 'string' ? options.providerId.trim() : '';
       const effort = typeof options.effort === 'string' ? options.effort.trim() : '';
+      const permission = typeof options.permissionMode === 'string' ? options.permissionMode.trim() : '';
       try {
         // The controller may pre-allocate the session id so its optimistic row and
         // route use the final id from the start; DSH's create is idempotent on a
@@ -927,6 +936,7 @@ export function createChannelRouter({
           ...(model === '' ? {} : { model }),
           ...(provider === '' ? {} : { provider }),
           ...(effort === '' ? {} : { reasoningEffort: effort }),
+          ...(permission === '' ? {} : { permissionMode: permission }),
         });
         // What the session is actually on, never what was asked for: DSH resolves and
         // normalizes the selection, so echoing the request would claim a route the
@@ -946,6 +956,13 @@ export function createChannelRouter({
               ? { effort: applied.reasoningEffort }
               : {}),
           }),
+          // Present only when the preset was really installed. A mode this Host does
+          // not advertise keeps the profile's preset, and saying nothing about it is
+          // the honest answer — the authoritative session row reports what is in force,
+          // and the seam logs the request it could not honor.
+          ...(typeof created?.permissionMode === 'string' && created.permissionMode !== ''
+            ? { permissionMode: created.permissionMode }
+            : {}),
         });
       } catch (error) {
         // A session that was created but whose model cannot be routed must not be

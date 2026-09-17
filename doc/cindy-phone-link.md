@@ -922,11 +922,13 @@ the channel layer may see. Two of the three capabilities that live outside the
 seam — `files` and `goalWrite` — are named explicitly because they come from
 their own injections.
 
-## A new conversation's model arrived, and this Host dropped it
+## A new conversation's runtime arrived, and this Host dropped it
 
 Reported from the handset: 「新对话选择了 gpt 模型，一运行又变成了 deepseek」. The picker is
 not the defect, and neither is DSH: this Host's `maker:create-session` read two fields out of
-the controller's argument and ignored the rest of the runtime it was handed.
+the controller's argument and ignored the rest of the runtime it was handed. The model was the
+half the user could see; `permissionMode` and the row's `providerId` were the same defect, and
+the permission half is the one with teeth (the two subsections at the end of this section).
 
 A **new** conversation has nowhere else to put that runtime. Measured in the handset's own
 pipeline (`apps/mobile/src/session/newSessionCreation.ts`), the order is create → getSession →
@@ -999,6 +1001,9 @@ control  (no model asked)             -> created, row.model = deepseek-flash   (
 picked   (deepseek-v4-pro, low)       -> created, row.model = deepseek-v4-pro, row.effort = low
 bogus    (gpt-9-nope)                 -> NOT_AVAILABLE  no provider in this Host's catalog serves gpt-9-nope
 unrouted (openai-codex, unconfigured) -> NOT_AVAILABLE  no adapter registered for provider "openai-codex"
+permissionMode=read-only              -> created, reply and row both read-only, row.providerId=deepseek-official
+permissionMode=auto (unadvertised)    -> created, the reply names no preset, the row keeps the profile preset
+no model and no permission            -> created, row.model = the profile default, no providerId on the row
 ```
 
 The control line is what makes the probe worth running: the path with no pick is untouched. The
@@ -1010,11 +1015,54 @@ acceptance run that followed set the model back to `deepseek-flash`, which is wh
 reads that way now.) `node tools/acceptance.mjs --base http://127.0.0.1:3081` passes 81/81 on the
 same instance.
 
+### The permission preset, where the silent drop was dangerous
+
+`permissionMode` rides the same create args, and the handset's permission options **are this
+Host's own advertised list**: `maker:get-capabilities` answers `permissionModes` from DSH's
+preset table (`read-only` / `workspace-write` / `danger-full-access`) and the mobile picker is
+rendered straight from it (`buildSessionRuntimeOptions` → `permissionOptions`), with the draft
+reconciler coercing any value outside the list onto its first entry
+(`packages/maker-shared/src/agentCapabilities.ts`). So the phone offered three real levels, the
+draft carried one of them, and the session ran the profile's preset instead: a user who chose
+read-only received `danger-full-access` while believing the agent was restricted.
+
+The fix installs the preset right after the create, through the same write the explicit
+`maker:set-permission-mode` channel uses (`installPermissionMode`), so the two paths cannot
+drift — but only when the name is one this Host advertises. That "only" is the decision:
+
+- **No translation between the two vocabularies.** The controller has a vocabulary of its own
+  (`ask`, `default`, `acceptEdits`, `plan`, `auto`, `bypassPermissions`), which it sends when its
+  capability read failed and it fell back to its legacy list. Mapping `auto` onto
+  `workspace-write`, or `bypassPermissions` onto `danger-full-access`, would be this Host
+  choosing a privilege level for the user out of a word that means something else on each side.
+- **And no refusal either.** Refusing would leave a phone whose capability read failed unable to
+  start any conversation at all — worse than running the profile's preset, which the
+  authoritative row then reports honestly.
+- So an unadvertised name is **ignored, logged and left alone**: `create-session: this Host
+  advertises [...] but the controller asked for permission mode "auto"; keeping the profile
+  preset` goes to `ctx.logger` — cordis's built-in logging service, so it lands in the host's own
+  log — and the reply simply never names a preset it did not install.
+
+### The session row lost the model's source
+
+`RemoteSession.providerId` is what the controller keeps beside the model, and it derives its
+new-chat draft runtime from the most recent session (`pickRecentSessionRuntime` →
+`{ model, providerId }`). These rows never carried it, even though the same `modelSelection`
+projection that answers `model` and `effort` carries `provider` — so "跟随最近会话" reproduced
+the model and dropped its source.
+
+Both folds now read that one projection (`next ?? lastUsed`) and the wire row **omits** the field
+when the session never chose one: a missing `providerId` is what the controller reads as "follow
+the Host's default route", which is exactly what such a session runs. Absent, not `null` — the
+controller distinguishes the two.
+
 Every shape is pinned by a test: the runtime is forwarded to the seam, a blank picker installs
 nothing, an unroutable model is refused with the code the controller reads, DSH's own refusal is
-translated, and a genuine failure is not dressed up as one. The assertion that used to say
-*"the picker is ignored; DSH creates the session"* was this defect written down as a contract;
-it now asserts the opposite.
+translated, a genuine failure is not dressed up as one, an advertised permission preset is
+installed onto the session (and an unadvertised one is logged and left at the profile preset),
+and the row carries its source when it has one. The assertion that used to say *"the picker is
+ignored; DSH creates the session"* was this defect written down as a contract; it now asserts the
+opposite.
 
 ## Record what was asked, not just what was answered
 

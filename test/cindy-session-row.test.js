@@ -62,6 +62,17 @@ test('reports the session’s own effort, falling back only when it has none', (
   assert.equal(toCindySessionListRow(ROW, { device: DEVICE }).effort, 'default', 'a session that never chose keeps the honest placeholder');
 });
 
+test('carries the session’s source beside its model, absent when none was recorded', () => {
+  // 控制端把 providerId 与 model 一起存,并用「最近会话」推导新对话草稿的 runtime
+  // (`pickRecentSessionRuntime`)。丢掉它 = 下一个对话有模型却没有来源。
+  const row = toCindySessionListRow({ ...ROW, model: 'gpt-5.6-sol', providerId: 'openai-codex' }, { device: DEVICE });
+  assert.equal(row.model, 'gpt-5.6-sol');
+  assert.equal(row.providerId, 'openai-codex');
+  // 没有记录来源的会话:字段**缺失**(而不是 null)——控制端把缺失读成「走被控端默认
+  // 路由」,而那正是这种会话实际跑的东西。
+  assert.equal('providerId' in toCindySessionListRow(ROW, { device: DEVICE }), false);
+});
+
 test('a session with no working directory becomes a dialogue, not a broken project', () => {
   const row = toCindySessionListRow({ ...ROW, cwd: undefined }, { device: DEVICE });
   assert.equal(row.workingDir, null);

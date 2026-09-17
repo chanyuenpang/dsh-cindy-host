@@ -78,6 +78,13 @@ export function toCindySessionListRow(item, { now = () => new Date(), device, de
     model: typeof item.model === 'string' && item.model !== ''
       ? item.model
       : (typeof defaultModel === 'string' && defaultModel !== '' ? defaultModel : DSH_MODEL),
+    // The source that serves that model, when the session recorded one. The
+    // controller keeps `providerId` beside the model and derives its new-chat draft
+    // runtime from the most recent session (`pickRecentSessionRuntime`), so a row that
+    // drops it hands the next conversation a model with no source. Absent — not null —
+    // when nothing recorded one: the controller reads a missing field as "the Host's
+    // default route", which is exactly what such a session runs.
+    ...(typeof item.providerId === 'string' && item.providerId !== '' ? { providerId: item.providerId } : {}),
     // The session's own effort, which DSH carries as part of its model
     // selection. The placeholder is only for a session that has not chosen yet:
     // answering "default" after a successful `maker:set-effort` would make the

@@ -107,6 +107,9 @@ function makeCtx(services = {}) {
   const record = { injected: [], effects: [], settingsSchemas: [], eventSubscriptions: [], listenerOptions: [] };
   const ctx = {
     record,
+    // Optional: the seam logs an absorbed, unhonoured request, and a test that asserts
+    // that log has to supply somewhere for it to land.
+    logger: services.logger,
     get: (serviceName) => services[serviceName],
     on: (eventName, listener, options) => {
       record.eventSubscriptions.push(eventName);
@@ -347,6 +350,82 @@ test('a route DSH itself refuses is reported as NOT_AVAILABLE, not as a Host cra
   const otherRefusal = await rejectionOf(buildDshSource(other, 'sessionController').createSession({ sessionId: 'session-new', model: 'gpt-5.6-sol', provider: 'openai-codex' }));
   assert.equal(otherRefusal.message, 'socket hang up');
   assert.equal(otherRefusal.refusalCode, undefined, 'a genuine failure must not be dressed up as a refusal');
+});
+
+test('a new conversation created with a permission preset this Host advertises installs it', async () => {
+  // 同一类字段丢失里最危险的一个:手机上的权限选项**就是**本 Host 广告的 preset 名,
+  // 用户选了 read-only 却拿到 profile 默认的 danger-full-access —— 他以为被限制住了,
+  // 实际是最高权限。
+  const installed = [];
+  const session = { header: { id: 'session-new' } };
+  const ctx = makeCtx({
+    sessionController: {
+      async create(request) { return { sessionId: request.sessionId ?? 'session-new' }; },
+      async resolveAgent() { return { agent: { session } }; },
+    },
+    permissionPresets: {
+      names: ['read-only', 'workspace-write', 'danger-full-access'],
+      set: (target, mode) => { installed.push({ target, mode }); },
+    },
+  });
+  const built = buildDshSource(ctx, 'sessionController');
+
+  const created = await built.createSession({ sessionId: 'session-new', permissionMode: 'read-only' });
+  assert.deepEqual(installed, [{ target: session, mode: 'read-only' }], 'the preset is written onto the session, the way set-permission-mode writes it');
+  assert.equal(created.permissionMode, 'read-only', 'and the reply names what was installed');
+});
+
+test('a permission mode this Host does not advertise is logged, never guessed and never fatal', async () => {
+  // `auto` 是手机在能力读取失败时的遗留词表值。替它猜一个 DSH preset 等于替用户决定
+  // 权限级别;拒绝它等于让那台手机再也建不出会话。所以既不动会话,也不静默:留一条日志。
+  const warnings = [];
+  const installed = [];
+  const ctx = makeCtx({
+    sessionController: {
+      async create() { return { sessionId: 'session-new' }; },
+      async resolveAgent() { return { agent: { session: {} } }; },
+    },
+    permissionPresets: { names: ['read-only', 'workspace-write', 'danger-full-access'], set: (...args) => installed.push(args) },
+    logger: { warn: (message) => warnings.push(message) },
+  });
+  const built = buildDshSource(ctx, 'sessionController');
+
+  const created = await built.createSession({ sessionId: 'session-new', permissionMode: 'auto' });
+  assert.equal(created.sessionId, 'session-new', 'the conversation is still created');
+  assert.equal(created.permissionMode, undefined, 'and the reply claims no preset');
+  assert.deepEqual(installed, [], 'nothing is written onto the session');
+  assert.equal(warnings.length, 1, 'an unhonoured request is visible, not silent');
+  assert.match(warnings[0], /"auto"/);
+  assert.match(warnings[0], /read-only/, 'the log names the list that would have been accepted');
+});
+
+test('a permission preset this Host cannot write is refused, not reported as installed', async () => {
+  const ctx = makeCtx({
+    sessionController: {
+      async create() { return { sessionId: 'session-new' }; },
+      async resolveAgent() { return { agent: { session: {} } }; },
+    },
+    permissionPresets: { names: ['read-only'], set: () => { throw new Error('preset write failed'); } },
+  });
+  const built = buildDshSource(ctx, 'sessionController');
+
+  const refusal = await rejectionOf(built.createSession({ sessionId: 'session-new', permissionMode: 'read-only' }));
+  assert.match(refusal.message, /preset write failed/);
+});
+
+test('the explicit permission channel still installs whatever the controller names', async () => {
+  // 写入通道与 create 共用同一个安装函数,但**决定权不同**:显式通道按控制器给的写
+  // (超出广告表的值由 DSH 自己判),create 只安装广告表里的值。
+  const installed = [];
+  const session = { header: { id: 's1' } };
+  const ctx = makeCtx({
+    sessionController: { async resolveAgent() { return { agent: { session } }; } },
+    permissionPresets: { names: ['read-only'], set: (target, mode) => installed.push({ target, mode }) },
+  });
+  const controls = buildDshSource(ctx, 'sessionController').sessionControls;
+  assert.deepEqual(controls.permissionNames(), ['read-only'], 'the capability list is the preset table');
+  await controls.setPermissionMode({ sessionId: 's1', mode: 'anything-the-controller-names' });
+  assert.deepEqual(installed, [{ target: session, mode: 'anything-the-controller-names' }]);
 });
 
 test('a create that names no model touches no selection', async () => {

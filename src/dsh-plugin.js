@@ -456,6 +456,62 @@ export function buildDshSource(ctx, serviceName, options = {}) {
       }
     }
 
+    /** The permission preset names this Host advertises, in the preset table's order. */
+    function advertisedPermissionNames() {
+      const presets = controls.permissionPresets;
+      return Array.isArray(presets?.names) ? [...presets.names] : [];
+    }
+
+    /**
+     * Write one permission preset onto one session.
+     *
+     * The preset is written onto the **session**; the service then drives the
+     * sandbox-mode and approval-policy knobs that execution reads. Shared by the
+     * explicit `maker:set-permission-mode` channel and the create path, so both
+     * install a preset the same way.
+     * @param request - the session to write and the preset name to install.
+     */
+    async function installPermissionMode({ sessionId, mode }) {
+      const presets = controls.permissionPresets;
+      if (typeof presets?.set !== 'function') throw new Error('permission presets are not composed on this Host');
+      const resolved = await sessionController.resolveAgent(sessionId);
+      if (resolved?.error !== undefined) throw resolved.error;
+      presets.set(resolved.agent.session, mode);
+    }
+
+    /**
+     * Install the permission preset a **new** conversation asked for, when this Host
+     * advertises it.
+     *
+     * The controller's permission vocabulary is not this Host's. `maker:get-capabilities`
+     * answers `permissionModes` from DSH's own preset table, and the handset coerces its
+     * draft into that list (`reconcileRuntimeDraftWithCapabilities`), so an advertised
+     * name is the ordinary case and it is installed verbatim. That matters more here than
+     * anywhere else on this seam: a user who picks `read-only` and silently receives the
+     * profile default of `danger-full-access` believes the agent is restricted while it
+     * holds full access.
+     *
+     * An unadvertised name — the handset's legacy fallback list (`ask`, `acceptEdits`,
+     * `plan`, `bypassPermissions`) when its capability read failed — is deliberately
+     * **not** translated and deliberately **not** refused. Translating would guess a
+     * privilege level on the user's behalf, and refusing would leave a phone whose
+     * capability read failed unable to start any conversation at all. It stays at the
+     * profile's preset, is logged, and the session row reports what is in force.
+     * @param request - the session and the preset name the controller asked for.
+     * @returns the installed name, or null when this Host does not advertise it.
+     */
+    async function applyPermissionMode({ sessionId, mode }) {
+      const advertised = advertisedPermissionNames();
+      if (!advertised.includes(mode)) {
+        // Loud rather than silent: the log is where an absorbed, unhonoured request is
+        // visible, and the advertised list is what makes it actionable.
+        ctx.logger?.warn?.(`create-session: this Host advertises ${JSON.stringify(advertised)} but the controller asked for permission mode "${mode}"; keeping the profile preset`);
+        return null;
+      }
+      await installPermissionMode({ sessionId, mode });
+      return mode;
+    }
+
     /**
      * The routed model's context window, when the provider discloses one.
      *
@@ -624,6 +680,13 @@ export function buildDshSource(ctx, serviceName, options = {}) {
        * default: without it the first prompt runs on `agent-default-model` and the
        * handset reports 「新对话选了 gpt，一运行又变成 deepseek」.
        *
+       * The permission preset rides the same options for the same reason, and it is the
+       * one where a wrong answer is dangerous rather than merely annoying: a session that
+       * keeps `danger-full-access` after the user asked for `read-only` reads as a
+       * restriction the agent does not have. Only a name this Host advertises is
+       * installed — see `applyPermissionMode` — and the reply names it only when it was
+       * really installed.
+       *
        * A model this Host cannot route **throws** rather than being swallowed. The
        * session exists either way, and the controller's create retry is idempotent
        * and probes for the session before rebuilding, so the honest refusal costs one
@@ -636,14 +699,22 @@ export function buildDshSource(ctx, serviceName, options = {}) {
           ...(options.sessionId === undefined ? {} : { sessionId: options.sessionId }),
           ...(workspace === undefined ? (cwd === undefined ? {} : { cwd }) : { workspaceId: workspace.id }),
         });
-        if (typeof options?.model !== 'string' || options.model === '') return created;
-        const applied = await applyModelSelection({
-          sessionId: created.sessionId,
-          provider: options.provider,
-          model: options.model,
-          reasoningEffort: options.reasoningEffort,
-        });
-        return { ...created, selection: applied?.selected ?? null };
+        const installed = {};
+        if (typeof options?.model === 'string' && options.model !== '') {
+          const applied = await applyModelSelection({
+            sessionId: created.sessionId,
+            provider: options.provider,
+            model: options.model,
+            reasoningEffort: options.reasoningEffort,
+          });
+          installed.selection = applied?.selected ?? null;
+        }
+        const mode = typeof options?.permissionMode === 'string' ? options.permissionMode.trim() : '';
+        if (mode !== '') {
+          const permissionMode = await applyPermissionMode({ sessionId: created.sessionId, mode });
+          if (permissionMode !== null) installed.permissionMode = permissionMode;
+        }
+        return Object.keys(installed).length === 0 ? created : { ...created, ...installed };
       },
       /**
        * Send one prompt, carrying whatever attachments this Host can serve.
@@ -1009,19 +1080,8 @@ export function buildDshSource(ctx, serviceName, options = {}) {
           };
         },
         /** The advertised preset names, in the preset table's order. */
-        permissionNames: () => {
-          const presets = controls.permissionPresets;
-          return Array.isArray(presets?.names) ? [...presets.names] : [];
-        },
-        async setPermissionMode({ sessionId, mode }) {
-          const presets = controls.permissionPresets;
-          if (typeof presets?.set !== 'function') throw new Error('permission presets are not composed on this Host');
-          const resolved = await sessionController.resolveAgent(sessionId);
-          if (resolved?.error !== undefined) throw resolved.error;
-          // The preset is written onto the **session**; the service then drives
-          // the sandbox-mode and approval-policy knobs that execution reads.
-          presets.set(resolved.agent.session, mode);
-        },
+        permissionNames: advertisedPermissionNames,
+        setPermissionMode: installPermissionMode,
       },
       /**
        * The aggregated remote file browser the controller's file screen uses.

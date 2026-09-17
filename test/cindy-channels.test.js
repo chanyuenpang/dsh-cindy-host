@@ -1095,7 +1095,12 @@ test('the runtime the controller picked for a new conversation reaches the Host'
     createSession: async (options) => {
       seen.push(options);
       // 被控端（DSH）会把选择规范化后回话，回帧必须以它为准。
-      return { sessionId: 'session-1', selection: { provider: 'openai-codex', model: 'gpt-5.6-sol', reasoningEffort: 'high' } };
+      return {
+        sessionId: 'session-1',
+        selection: { provider: 'openai-codex', model: 'gpt-5.6-sol', reasoningEffort: 'high' },
+        // 只有真的写进会话时 seam 才会带这个字段。
+        ...(options.permissionMode === 'read-only' ? { permissionMode: 'read-only' } : {}),
+      };
     },
     subscribers: new Set(),
   });
@@ -1108,7 +1113,7 @@ test('the runtime the controller picked for a new conversation reaches the Host'
     model: 'gpt-5.6-sol',
     providerId: 'openai-codex',
     effort: 'high',
-    permissionMode: 'auto',
+    permissionMode: 'read-only',
     fastMode: false,
   }]));
 
@@ -1118,11 +1123,13 @@ test('the runtime the controller picked for a new conversation reaches the Host'
     model: 'gpt-5.6-sol',
     provider: 'openai-codex',
     reasoningEffort: 'high',
-  }]);
+    permissionMode: 'read-only',
+  }], 'model, source, effort and permission mode all travel with the create');
   assert.equal(result.payload.ok, true);
   assert.equal(result.payload.result.model, 'gpt-5.6-sol', 'the reply names what the session is actually on');
   assert.equal(result.payload.result.providerId, 'openai-codex');
   assert.equal(result.payload.result.effort, 'high');
+  assert.equal(result.payload.result.permissionMode, 'read-only');
 });
 
 test('a blank picker is not a selection, and one the Host cannot route is refused', async () => {
@@ -1140,6 +1147,12 @@ test('a blank picker is not a selection, and one the Host cannot route is refuse
   const blank = await router(request('maker:create-session', [{ id: 'session-3', agentKind: 'pi', model: '   ', providerId: '', effort: '' }]));
   assert.deepEqual(seen, [{ sessionId: 'session-3', cwd: undefined }], 'blank fields must not be forwarded as a selection');
   assert.equal(blank.payload.result.providerId, undefined, 'nothing was selected, so the reply names nothing');
+
+  // 一个本 Host 不广告的权限档（手机在能力读取失败时的遗留词表值）：seam 不安装它，
+  // 回帧就不能声称安装了 —— 权威会话行说的才是真相。
+  const ignored = await router(request('maker:create-session', [{ id: 'session-5', permissionMode: 'auto' }]));
+  assert.equal(ignored.payload.ok, true);
+  assert.equal(ignored.payload.result.permissionMode, undefined, 'an uninstalled preset is not reported as installed');
 
   const unroutable = await router(request('maker:create-session', [{ id: 'session-4', model: 'gpt-9' }]));
   assert.equal(unroutable.payload.ok, false, 'a created session whose model cannot be routed is not a clean success');

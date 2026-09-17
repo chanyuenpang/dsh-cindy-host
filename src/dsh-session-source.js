@@ -258,6 +258,12 @@ export function createSessionControllerSource({
         // shows it in its model control, and a Host that always answers "default"
         // makes a real `maker:set-effort` look like it did nothing.
         const selectedEffort = selection?.next?.reasoningEffort ?? selection?.lastUsed?.reasoningEffort;
+        // The provider that serves that selection, from the same projection. The
+        // controller stores the source beside the model (`RemoteSession.providerId`)
+        // and its new-chat draft follows the most recent session's runtime, so a row
+        // that omits it loses the source the user picked while the model still looks
+        // right — and the next conversation is created without one.
+        const selectedProvider = selection?.next?.provider ?? selection?.lastUsed?.provider;
         // The current permission preset, when the list already carries the
         // `permissions` projection. Its absence means no permission service is
         // composed, which DSH documents as "clients hide the control".
@@ -275,6 +281,7 @@ export function createSessionControllerSource({
           createdAt: meta?.createdAt ?? updatedAt,
           cwd: typeof item.cwd === 'string' && item.cwd !== '' ? item.cwd : (meta?.cwd ?? null),
           ...(typeof selectedModel === 'string' && selectedModel !== '' ? { model: selectedModel } : {}),
+          ...(typeof selectedProvider === 'string' && selectedProvider !== '' ? { providerId: selectedProvider } : {}),
           ...(typeof selectedEffort === 'string' && selectedEffort !== '' ? { effort: selectedEffort } : {}),
           ...(currentPermission === undefined ? {} : { permissionMode: currentPermission }),
           blank: item.blank === true,

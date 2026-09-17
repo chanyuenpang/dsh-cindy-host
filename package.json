@@ -1,6 +1,6 @@
 {
   "name": "dsh-cindy-host-demo",
-  "version": "0.1.3",
+  "version": "0.1.4",
   "private": false,
   "description": "Cindy 手机客户端连接 DSH 的 Host 侧插件：会话/消息/审批/todo/goal 的手机通道，以及配套的设置卡片",
   "license": "MIT",
