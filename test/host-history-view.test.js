@@ -151,6 +151,34 @@ test('a plan card is a top-level item, never buried in an activity run', () => {
   assert.deepEqual(work.map((item) => item.summary.firstMessageId), ['s1:t0:0', 's1:c0:0']);
 });
 
+test('the live group carries a preview, so a long turn is visibly working', () => {
+  // 报「一直在思考中转圈」 while this Host pushed 100+ rows: every one of them was inside a
+  // collapsed group, so the phone had a spinner and no evidence of progress. The contract
+  // has a field for exactly this — `HistoryWorkSummary.preview` — and the reference fills it
+  // for the streaming group.
+  const rows = [row('u0', 'user', 0)];
+  for (let index = 0; index < 12; index += 1) rows.push(row(`c${index}`, 'thinking', index + 1));
+  const open = [...rows].reverse(); // an open turn does not end in an answer
+  const items = groupHistoryItems(open);
+  const live = items[items.length - 1];
+  assert.equal(live.type, 'work');
+  assert.equal(live.summary.isStreaming, true);
+  assert.notEqual(live.summary.preview, undefined, 'the streaming group is previewable');
+  assert.equal(live.summary.preview.key, `preview-${live.summary.key}`);
+  assert.equal(live.summary.preview.isStreaming, true);
+  assert.equal(live.summary.preview.messageCount, 5, 'the tail, not the whole run');
+  assert.equal(live.summary.preview.lastMessageId, live.summary.lastMessageId, 'the preview ends where the group does');
+  assert.equal(live.summary.preview.firstMessageId, 's1:c7:0');
+
+  // A finished group has no preview: there is nothing live to show.
+  const answered = groupHistoryItems([...rows, row('a0', 'assistant', 99)].reverse(), { running: false });
+  const finished = answered.filter((item) => item.type === 'work');
+  assert.deepEqual(finished.map((item) => item.summary.preview), [undefined], 'only the streaming group previews');
+  // ...and a session reported as running keeps previewing its trailing run.
+  const told = groupHistoryItems(open, { running: true });
+  assert.equal(told[told.length - 1].summary.preview.messageCount, 5);
+});
+
 test('a page is chronological, capped, and its cursor walks back without repeats', async () => {
   const rows = transcript(25); // 75 items, one page holds 20
   const view = controller(rows);

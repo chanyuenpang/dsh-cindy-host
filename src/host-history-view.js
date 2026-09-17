@@ -156,26 +156,57 @@ export function groupHistoryItems(rows, { running = null, maxWorkRows = WORK_ITE
   return items;
 }
 
-/** One work item for a run of activity rows. */
+/** Rows of the live tail a streaming work item shows without being expanded. */
+export const WORK_PREVIEW_ROWS = 5;
+
+/**
+ * One work item for a run of activity rows.
+ *
+ * @param run - the run's rows, in log order.
+ * @param streaming - whether this run is the one still being written.
+ * @returns the item the controller renders.
+ */
 function workItem(run, streaming) {
   const first = run[0];
   const last = run[run.length - 1];
-  return {
-    type: 'work',
+  const summary = {
     key: `work-${keyOf(first)}`,
-    summary: {
-      key: `work-${keyOf(first)}`,
-      anchorClientId: keyOf(first),
-      firstMessageId: first.id,
-      lastMessageId: last.id,
-      startedAtMs: Date.parse(first.createdAt) || 0,
-      endedAtMs: Date.parse(last.createdAt) || 0,
-      isStreaming: streaming,
-      messageCount: run.length,
-      toolCount: run.filter((row) => row.role === 'tool_use').length,
-      revision: `${last.id}:${run.length}:${revisionOf(run)}`,
-    },
+    anchorClientId: keyOf(first),
+    firstMessageId: first.id,
+    lastMessageId: last.id,
+    startedAtMs: Date.parse(first.createdAt) || 0,
+    endedAtMs: Date.parse(last.createdAt) || 0,
+    isStreaming: streaming,
+    messageCount: run.length,
+    toolCount: run.filter((row) => row.role === 'tool_use').length,
+    revision: `${last.id}:${run.length}:${revisionOf(run)}`,
   };
+  // A running group gets a **preview**: the tail the controller can show inside the
+  // collapsed row, which is the difference between 「正在干活」 and 「卡住了」.
+  //
+  // This is the contract's own field (`HistoryWorkSummary.preview`, "Existing detail
+  // endpoint can read just the visible desktop tail") and the reference sets it for every
+  // streaming group. Without it, folding activity into work items meant a long turn showed
+  // nothing but a spinner: measured, the phone sat on 「一直在思考中转圈」 for minutes while
+  // this Host pushed 100+ rows that were all inside a collapsed group.
+  if (streaming && run.length > 0) {
+    const tail = run.slice(Math.max(0, run.length - WORK_PREVIEW_ROWS));
+    const previewFirst = tail[0];
+    const previewLast = tail[tail.length - 1];
+    summary.preview = {
+      key: `preview-${summary.key}`,
+      anchorClientId: keyOf(previewFirst),
+      firstMessageId: previewFirst.id,
+      lastMessageId: previewLast.id,
+      startedAtMs: Date.parse(previewFirst.createdAt) || 0,
+      endedAtMs: Date.parse(previewLast.createdAt) || 0,
+      isStreaming: true,
+      messageCount: tail.length,
+      toolCount: tail.filter((row) => row.role === 'tool_use').length,
+      revision: `${previewLast.id}:${tail.length}:${revisionOf(tail)}`,
+    };
+  }
+  return { type: 'work', key: summary.key, summary };
 }
 
 /** UTF-8 size of one item, which is what the page budgets count. */
