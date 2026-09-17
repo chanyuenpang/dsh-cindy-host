@@ -487,6 +487,52 @@ test('a re-link does not repeat a terminal state the device was already told', a
   }
 });
 
+test('an error on the invoke path answers the controller and is recorded, never escapes', async () => {
+  // Why this is not ordinary hygiene: DSH's boot registers an unhandled-rejection handler
+  // that writes `fatal load failure` to stderr and calls `process.exit(1)`
+  // (`@deepseek-ai/dsh-app-boot`), and Cordis dispatches listeners with no try/catch. So an
+  // exception that leaves this Host does not degrade this Host — it ends the desktop's whole
+  // `dsh web`. Measured once: the process disappeared mid-turn at 17:30:23 with
+  // `turn/end reason=interrupted`, no Windows crash record, and a two-minute gap before the
+  // user brought it back by hand. The controller still has to get an answer, and the fact
+  // that something threw has to be readable afterwards.
+  const socket = new FakeSocket();
+  const source = new FixtureDshSource();
+  const healthy = source.listSessions.bind(source);
+  // Failing only *after* startup: the projection baselines itself from the same reader, and a
+  // corpus that is unavailable at boot is a different (and deliberately fatal-at-activation)
+  // case than a channel that breaks while the Host is up.
+  let failing = false;
+  source.listSessions = async () => {
+    if (failing) throw new Error('session corpus is unavailable');
+    return healthy();
+  };
+  const runtime = await startHost(source, ON, {
+    resolveSession: async () => ({ ok: true, session: { deviceId: 'host-handle', kind: 'phone', identifier: '13800000000' } }),
+    openSocket: () => socket,
+    heartbeatMs: 0,
+  });
+  try {
+    socket.emit('open');
+    socket.frame({ v: 1, kind: 'hello-ack', payload: { serverProtocolVersion: 1, deviceId: 'dev-host', userId: 'user-1' } });
+    failing = true;
+    socket.frame({ v: 1, kind: 'invoke', id: 'list-1', src: 'phone-2', payload: { channel: 'local-db:sessions:list', args: [] } });
+    await new Promise((resolve) => setImmediate(resolve));
+
+    const results = socket.sent.filter((frame) => frame.kind === 'invoke-result' && frame.id === 'list-1');
+    assert.equal(results.length, 1, 'a failing channel is still answered');
+    assert.equal(results[0].payload.ok, false);
+    assert.equal(results[0].payload.error.code, 'INTERNAL');
+
+    const errors = runtime.getHandlerErrors().filter((entry) => entry.where === 'invoke');
+    assert.equal(errors.length, 1, 'and what it caught is recorded');
+    assert.match(errors[0].message, /unavailable/);
+    assert.match(errors[0].stack, /listSessions/);
+  } finally {
+    await runtime.stop();
+  }
+});
+
 test('a finished turn patches the row for a controller that is only holding the list', async () => {
   // The reported bug, in the shape the phone actually has it: the session list
   // spin. A controller holding only `sessions` never receives the session-scoped

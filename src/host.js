@@ -356,9 +356,41 @@ export async function startHost(initialSource, settings = DEFAULT_HOST_SETTINGS,
   /** Replies that had to be degraded (or refused) to fit one frame, newest last. */
   const frameDegradations = [];
 
+  /**
+   * Errors this Host caught at its own boundaries, newest last.
+   *
+   * This is not bookkeeping for its own sake: **an unhandled rejection is fatal to the whole
+   * `dsh web` process.** DSH installs a fail-loud handler
+   * (`@deepseek-ai/dsh-app-boot`: `proc.on('unhandledRejection', …)` → stderr
+   * `fatal load failure` → `proc.exit(1)`), and Cordis dispatches listeners with no
+   * `try`/`catch` of its own (`events.emit` → `this.dispatch(...).map(cb => cb(...))`). So a
+   * single throw from our code does not degrade this Host — it takes the desktop's DSH down
+   * with it. Measured once: the process vanished mid-turn at 17:30:23 with `turn/end
+   * reason=interrupted`, no Windows crash record, and a two-minute gap before the user
+   * restarted it. Every boundary below therefore catches, and what it caught is readable
+   * here instead of only in a terminal scrollback.
+   */
+  const handlerErrors = [];
+  const HANDLER_ERROR_LIMIT = 20;
+
+  /** Record one error caught at a Host boundary (bounded, never throws). */
+  function recordHandlerError(where, error) {
+    try {
+      const message = error instanceof Error ? error.message : String(error);
+      handlerErrors.push({
+        at: now().toISOString(),
+        where,
+        message: message.slice(0, 400),
+        stack: (error instanceof Error && typeof error.stack === 'string' ? error.stack : '').split('\n').slice(0, 6).join('\n').slice(0, 1200),
+      });
+      if (handlerErrors.length > HANDLER_ERROR_LIMIT) handlerErrors.splice(0, handlerErrors.length - HANDLER_ERROR_LIMIT);
+    } catch {
+      // A recorder that can throw is worse than no recorder.
+    }
+  }
+
   function send(frame) {
     if (ws === null || typeof ws.send !== 'function') return;
-    if (typeof ws.readyState === 'number' && ws.readyState !== 1) return;
     // The relay **rejects** a frame over `MAX_FRAME_BYTES` outright — it does not
     // truncate it, and the controller waiting on that frame is left until its own
     // deadline. So an oversized frame is refused here, where it is observable, rather
@@ -389,7 +421,7 @@ export async function startHost(initialSource, settings = DEFAULT_HOST_SETTINGS,
         // Consecutive missed pongs mean a socket that looks open and routes nothing.
         // Drop it and retry with backoff — the card's manual reconnect stays available,
         // but a person at the desk must never be the mechanism that brings the Host back.
-        void dropAndRetry('与 Cindy relay 的心跳已丢失');
+        void dropAndRetry('与 Cindy relay 的心跳已丢失').catch((error) => recordHandlerError('heartbeat-drop', error));
         return;
       }
       send({ v: PROTOCOL_VERSION, kind: 'ping' });
@@ -499,7 +531,7 @@ export async function startHost(initialSource, settings = DEFAULT_HOST_SETTINGS,
     status.setState('connecting', `${reason}，${Math.ceil(delay / 1_000)}s 后自动重连（第 ${reconnectAttempt} 次）`);
     reconnectTimer = setTimeoutImpl(() => {
       reconnectTimer = null;
-      void connect();
+      void connect().catch((error) => recordHandlerError('reconnect', error));
     }, delay);
     if (typeof reconnectTimer?.unref === 'function') reconnectTimer.unref();
   }
@@ -635,7 +667,7 @@ export async function startHost(initialSource, settings = DEFAULT_HOST_SETTINGS,
     // device the directory cannot name does not cost a request per link-open.
     if ((known === undefined || known.platform === null) && !directoryAsked.has(deviceId)) {
       directoryAsked.add(deviceId);
-      void refreshDeviceDirectory();
+      void refreshDeviceDirectory().catch((error) => recordHandlerError('device-directory', error));
     }
   }
 
@@ -1570,7 +1602,7 @@ export async function startHost(initialSource, settings = DEFAULT_HOST_SETTINGS,
         // so this is where the reconnect ladder starts forgetting failed attempts.
         markConnectionStable();
         // Devices already online for this account never re-announce themselves.
-        void refreshDeviceDirectory();
+        void refreshDeviceDirectory().catch((error) => recordHandlerError('device-directory', error));
         return;
       }
       case 'pong':
@@ -1624,7 +1656,7 @@ export async function startHost(initialSource, settings = DEFAULT_HOST_SETTINGS,
         // Tell the controller directly which sessions are running right now; the set is
         // bounded by the sessions actually in a turn, and the frame is session-scoped, so
         // it lands on the row the controller already holds.
-        void announceRunningSessions(frame.src);
+        void announceRunningSessions(frame.src).catch((error) => recordHandlerError('announce-running', error));
         // …and the *terminal* truth for the sessions it was watching before the relay
         // dropped it. `announceRunningSessions` covers a turn still in flight; a turn that
         // ended while the device was away would otherwise be announced by nothing, and the
@@ -1675,9 +1707,28 @@ export async function startHost(initialSource, settings = DEFAULT_HOST_SETTINGS,
           (reply) => {
             // `null` means the request was unaddressable; the relay guard above
             // already rejects those, so this only defends the invariant.
-            if (reply !== null) send(fitReplyToFrame(reply, frame));
+            if (reply === null) return;
+            // Fitting and sending are Host code on a reply that ultimately came from DSH, so
+            // they are exactly where an unexpected shape would surface — and a throw from
+            // inside a `.then` callback is an unhandled rejection, which this process treats
+            // as fatal. The controller still needs an answer, so it gets one.
+            try {
+              send(fitReplyToFrame(reply, frame));
+            } catch (error) {
+              recordHandlerError('invoke-reply', error);
+              send({
+                v: PROTOCOL_VERSION,
+                kind: 'invoke-result',
+                id: frame.id,
+                dst: frame.src,
+                payload: { ok: false, error: { code: 'INTERNAL', message: 'DSH Host failed to serve this channel' } },
+              });
+            }
           },
-          () => send({ v: PROTOCOL_VERSION, kind: 'invoke-result', id: frame.id, dst: frame.src, payload: { ok: false, error: { code: 'INTERNAL', message: 'DSH Host failed to serve this channel' } } }),
+          (error) => {
+            recordHandlerError('invoke', error);
+            send({ v: PROTOCOL_VERSION, kind: 'invoke-result', id: frame.id, dst: frame.src, payload: { ok: false, error: { code: 'INTERNAL', message: 'DSH Host failed to serve this channel' } } });
+          },
         );
         return;
       }
@@ -1726,7 +1777,14 @@ export async function startHost(initialSource, settings = DEFAULT_HOST_SETTINGS,
       } catch {
         return;
       }
-      handleFrame(frame);
+      // A relay frame is outside input, and a synchronous throw here would leave this
+      // listener and become an uncaught exception — fatal to the whole DSH process, not just
+      // to this Host. Contain it and record what it was.
+      try {
+        handleFrame(frame);
+      } catch (error) {
+        recordHandlerError('frame', error);
+      }
     });
     socket.on('error', () => {
       if (myGeneration !== generation) return;
@@ -1944,6 +2002,24 @@ export async function startHost(initialSource, settings = DEFAULT_HOST_SETTINGS,
       recentRefusals: frameRefusals.slice(),
       degradations: frameDegradations.slice(),
     }),
+    /**
+     * Errors caught at this Host's own boundaries.
+     *
+     * Empty is the only healthy value. A populated entry means some frame, reply or
+     * background chain would otherwise have escaped as an unhandled rejection — which DSH
+     * answers with `fatal load failure` and `exit(1)` for the entire desktop process, so
+     * this list is the record of an outage that was prevented rather than survived.
+     */
+    getHandlerErrors: () => handlerErrors.slice(),
+    /**
+     * Record an error caught in the plugin layer.
+     *
+     * Cordis dispatches listeners with no `try`/`catch` of its own, so a throw from a
+     * `session/event` handler leaves DSH's event dispatch as an unhandled rejection — which
+     * this process treats as fatal. The plugin's own boundaries have nowhere else to put
+     * what they caught, so they hand it here.
+     */
+    noteHandlerError: (where, error) => recordHandlerError(where, error),
     /** The topics controllers currently hold, for the status route's diagnostics. */
     getSubscriptions: () => ({
       devices: [...subscribers],

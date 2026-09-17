@@ -1188,6 +1188,20 @@ export function apply(ctx) {
   // it is the push path's source: fold the event into the controller's message
   // rows and hand them to whoever is watching that session.
   ctx.effect(() => ctx.on('session/event', (session, event) => {
+    // This handler runs inside Cordis's own dispatch, which has no `try`/`catch`: a throw
+    // from here does not fail this plugin, it fails the process — DSH's boot installs an
+    // unhandled-rejection handler that writes `fatal load failure` and calls `exit(1)`. The
+    // work below reads DSH's session events and folds them, so it is exactly where an
+    // unexpected event shape surfaces; it must never be able to take the desktop down.
+    try {
+      handleSessionEvent(session, event);
+    } catch (error) {
+      if (typeof runtime?.noteHandlerError === 'function') runtime.noteHandlerError('session-event', error);
+    }
+  }), 'dsh-cindy-host: live session stream');
+
+  /** Fold one DSH session event into the push path and the transcript cache. */
+  function handleSessionEvent(session, event) {
     if (!runtime || typeof runtime.pushSessionMessage !== 'function') return;
     const sessionId = session?.header?.id;
     if (typeof sessionId !== 'string' || sessionId === '') return;
@@ -1234,7 +1248,7 @@ export function apply(ctx) {
     // schedules the one check that makes sure the spinner cannot outlive the
     // turn it was watching — unless this event *was* the boundary.
     if (!boundaryArrived && typeof runtime.reconcileTurnState === 'function') runtime.reconcileTurnState(sessionId);
-  }), 'dsh-cindy-host: live session stream');
+  }
 
   // DSH raises approvals as a waterfall and the chain's terminal answerer is
   // fail-closed. This answerer only serves questions for sessions a Cindy
@@ -1338,6 +1352,10 @@ export function apply(ctx) {
       frameBudget: runtime && typeof runtime.getFrameBudget === 'function'
         ? runtime.getFrameBudget()
         : { limitBytes: null, refusals: 0, recentRefusals: [], degradations: [] },
+      // Errors this Host caught at its own boundaries. Should stay empty: each entry is an
+      // exception that would otherwise have left the whole `dsh web` process through DSH's
+      // fail-loud unhandled-rejection handler.
+      handlerErrors: runtime && typeof runtime.getHandlerErrors === 'function' ? runtime.getHandlerErrors() : [],
       // The topics controllers currently hold. An empty set means the phone
       // never subscribed — the single most likely reason a live reply or a todo
       // card never reaches it.

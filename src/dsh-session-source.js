@@ -102,6 +102,9 @@ export function createSessionControllerSource({
     // The rest of the titles are warmed **after** the answer is on its way: the
     // controller gets its list in one batch's time, and by its next poll the rest are
     // cached, so a few hundred sessions never sit in front of a handset's timeout.
+    // `warmTitles` owns its own rejection path (`…catch(…).finally(…)`) and returns
+    // nothing, so this call is already incapable of becoming an unhandled rejection —
+    // which matters, because DSH's boot treats one of those as fatal to the whole process.
     if (stale.length > batch.length) void warmTitles(stale.slice(titleRefreshBudget));
     return out;
   }
