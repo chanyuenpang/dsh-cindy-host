@@ -44,6 +44,25 @@ replaying it:
 - identity is compared before and after (`status.host.deviceId`) and an inconclusive answer is
   reported as inconclusive rather than as a change.
 
+<!-- state: history -->
+## Decision evolution
+
+<!-- dated: 2026-09-17 -->
+### The tool got smaller twice, and the second time it stopped verifying
+
+The first version carried retries, an identity comparison, token scraping and a plan dump; the
+user's response was 「你的脚本很简单，就是关闭掉DSH再启动DSH就可以了」, and it was right — 327 lines
+became 198 with only the reasons above kept.
+
+Then the same user, after watching it work: 「重启脚本可以搞简单一点，我自己手动重启的话也是很简单，
+不会验证什么」. The `up: state=…` and `alive 20s later` lines were the last of the verification
+machinery, and they are gone: 173 lines, two log lines per restart (`restart: …`, then
+`started pid …`). The repeated probe those lines were built on earned its place once — it caught
+the instance that died because it had not been detached — but once that failure mode is understood
+and the spawn is detached, re-asserting it on every run buys nothing the next `/status` read does
+not already give. Whether the instance came up is a question for whoever looks next, which is how
+a by-hand restart works too.
+
 ## Alternatives
 
 - **"Just two statements in one command"** — kill, then start: rejected. The second statement's

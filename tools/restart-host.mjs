@@ -1,18 +1,19 @@
 /**
  * Restart the `dsh web` that owns a port — including the one hosting this conversation.
  *
- * The whole job is two statements: stop it, start it. Everything else here exists because of two
- * facts measured the hard way (the reasoning is in ADR-0009):
+ * The job is two statements: stop it, start it. Everything else here exists because of two
+ * measured facts (the reasoning is in ADR-0009), and nothing else is kept:
  *
- * 1. The process that runs those two statements is a **child of the process being stopped**, and
- *    it lives inside a Windows job object belonging to the command that started it. So the kill
- *    is done by a supervisor started through **WMI**, which no job of ours owns.
- * 2. The instance it starts must be **detached with its output on a file**. Non-detached, it dies
- *    with the supervisor; piped, a destroyed pipe is an EPIPE that DSH's fail-loud handler turns
- *    into `exit(1)` — both measured, and both killed the instance that had just come up.
+ * 1. The process running those statements is a **child of the process being stopped**, inside a
+ *    Windows job object belonging to the command that started it — so the kill is done by a
+ *    supervisor started through **WMI**, which no job of ours owns.
+ * 2. The instance it starts must be **detached with its output on a file**: non-detached it dies
+ *    with the supervisor, and piped output is an EPIPE that DSH's fail-loud handler turns into
+ *    `exit(1)`. Both killed the instance that had just come up.
  *
- * What this deliberately does not do: retries, identity checks, token scraping. A fresh instance
- * opens its own browser tab, and the log is enough to tell success from failure afterwards.
+ * It does not verify anything. Whether the new instance came up is a question for whoever looks
+ * next (`/status`, or the log this writes), and a restart a person performs by hand does not
+ * verify either.
  *
  * Usage:
  *   node tools/restart-host.mjs                      # dry run: what would happen
@@ -96,16 +97,7 @@ function commandLineOf(pid) {
   }
 }
 
-async function probe(port, timeoutMs = 5_000) {
-  try {
-    const response = await fetch(`http://127.0.0.1:${port}/api/dsh-cindy-host/status`, { signal: AbortSignal.timeout(timeoutMs) });
-    return await response.json();
-  } catch {
-    return null;
-  }
-}
-
-/** The detached half: stop, start, confirm it is alive, and log one line per fact. */
+/** The detached half: stop, then start. Two statements, and a line for each. */
 async function supervise({ port, graceSeconds, dshHome }) {
   const oldPid = listenerPid(port);
   const args = oldPid === null ? [] : launchArgsFrom(commandLineOf(oldPid));
@@ -139,23 +131,6 @@ async function supervise({ port, graceSeconds, dshHome }) {
   closeSync(sink);
   child.unref();
   log(`started pid ${child.pid}`);
-
-  // Its startup takes seconds, and nothing is a verdict until it has answered once.
-  let up = null;
-  for (let attempt = 0; attempt < 100 && up === null; attempt += 1) {
-    await settle(500);
-    up = await probe(port);
-  }
-  if (up === null) {
-    log('DOWN: nothing answered after 50s — start it by hand');
-    process.exit(1);
-  }
-  log(`up: state=${up.status?.state ?? '?'} deviceId=${up.status?.host?.deviceId ?? '?'}`);
-  // One confirmation, later: answering once is not the same as staying up, and the difference is
-  // what the user feels. Measured: a version that reported success on its first probe left an
-  // instance that died seconds afterwards.
-  await settle(20_000);
-  log((await probe(port)) === null ? 'DOWN 20s after it came up' : 'alive 20s later');
   process.exit(0);
 }
 
