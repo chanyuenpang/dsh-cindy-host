@@ -50,3 +50,36 @@ test('an entry with no readable time is treated as oldest, never dropped', () =>
   const merged = mergePendingByTime([viewItem('m', '2026-01-01T00:00:00.000Z')], [viewItem('p', undefined)]);
   assert.deepEqual(merged.map((item) => item.key), ['p', 'm'], 'unknown sorts first and is still there');
 });
+
+test('the running work card is always last, under what the user just said', () => {
+  // 「你一直在我的对话之上在工作…最好是我发完对话之后无论如何你都把正在工作这个信息调到最后」
+  // A queued prompt accepted *after* the running group's last row sorts after it by time, which is
+  // how the user's own words ended up above their own conversation. The running card is present
+  // tense and belongs underneath everything they have said.
+  const running = {
+    type: 'work',
+    key: 'run',
+    summary: { isStreaming: true, endedAtMs: Date.parse('2026-01-01T00:10:00.000Z') },
+  };
+  const durable = [viewItem('old', '2026-01-01T00:00:00.000Z'), running];
+  const justSent = [viewItem('mine', '2026-01-01T00:11:00.000Z')];
+  assert.deepEqual(
+    mergePendingByTime(durable, justSent).map((item) => item.key),
+    ['old', 'mine', 'run'],
+    'the user message above the card, the card last',
+  );
+
+  // A finished group is not pinned: it keeps its place in history.
+  const finished = { type: 'work', key: 'done', summary: { isStreaming: false, endedAtMs: Date.parse('2026-01-01T00:10:00.000Z') } };
+  assert.deepEqual(
+    mergePendingByTime([finished], justSent).map((item) => item.key),
+    ['done', 'mine'],
+    'a completed run sorts normally',
+  );
+
+  // The newest-first list has no running card to pin, and must not be reordered by this rule.
+  assert.deepEqual(
+    mergePendingByTime([row('new', '2026-01-01T00:02:00.000Z')], [row('mid', '2026-01-01T00:01:00.000Z')], { newestFirst: true }).map((entry) => entry.id),
+    ['new', 'mid'],
+  );
+});

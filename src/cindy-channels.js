@@ -124,6 +124,13 @@ export function occurredAtMs(entry) {
  * once, when they become durable. Delivery order is the transcript's; typing order is what the
  * user is looking at while nothing has been delivered yet.
  *
+ * **The streaming work item is pinned last.** 「你一直在我的对话之上在工作…最好是我发完对话之后
+ * 无论如何你都把正在工作这个信息调到最后」 — a running group is the present tense, so it belongs
+ * under everything the user has said, including a message still queued for the next turn (which
+ * sorts after the group's own rows by time). Without the pin, a prompt accepted a moment ago lands
+ * below the running card and the user's own words look pushed up into the middle of their
+ * conversation.
+ *
  * @param items - the page's own entries, already in the page's order.
  * @param pending - the pending entries, oldest acceptance first.
  * @param options - `newestFirst` for a descending page (`local-db:messages:list`).
@@ -131,6 +138,8 @@ export function occurredAtMs(entry) {
  */
 export function mergePendingByTime(items, pending, { newestFirst = false } = {}) {
   const merged = [...items];
+  const last = merged[merged.length - 1];
+  const runsNow = !newestFirst && last?.type === 'work' && last.summary?.isStreaming === true;
   for (const entry of pending) {
     const at = occurredAtMs(entry);
     const index = newestFirst
@@ -139,7 +148,11 @@ export function mergePendingByTime(items, pending, { newestFirst = false } = {})
     if (index === -1) merged.push(entry);
     else merged.splice(index, 0, entry);
   }
-  return merged;
+  if (!runsNow) return merged;
+  // Whatever sorted after the running group goes above it: the running card is the last thing shown.
+  const runningAt = merged.indexOf(last);
+  const running = merged.splice(runningAt, 1)[0];
+  return [...merged, running];
 }
 
 /**
