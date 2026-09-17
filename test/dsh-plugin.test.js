@@ -1,10 +1,67 @@
 import test from 'node:test';
 import assert from 'node:assert/strict';
-import { inject, name, apply, buildDshSource, buildGoalWrite, capabilityProvider, foldTitleSnapshots, sessionFlagsWriter } from '../src/dsh-plugin.js';
+import { inject, name, apply, buildDiagnostics, buildDshSource, buildGoalWrite, capabilityProvider, foldTitleSnapshots, sessionFlagsWriter } from '../src/dsh-plugin.js';
 
 test('exports the DSH Host bundle identity and only requires settings', () => {
   assert.equal(name, 'dsh-cindy-host');
   assert.deepEqual(inject, ['settings']);
+});
+
+test('the diagnostics block is complete, and one broken field cannot remove it', () => {
+  // Measured: the first version of the `listing` field read a variable that is out of scope
+  // where the block is assembled, so the producer threw — and the status route answers a
+  // throwing producer by **omitting `diagnostics` entirely** (its own test pins that, so a
+  // broken producer cannot take the settings page down). The result was a `/status` body that
+  // was simply shorter, with no error anywhere: every counter a bug hunt depends on, gone.
+  const runtime = {
+    projectionRunning: true,
+    model: { list: () => [{}, {}] },
+    getInvokeLog: () => [{ channel: 'local-db:sessions:list' }],
+    getRefusalLog: () => [],
+    getPushLog: () => [],
+    getPushTotals: () => ({ 'maker:event': 3 }),
+    getInvokeTotals: () => ({}),
+    getRefusalTotals: () => ({}),
+    getReconnectState: () => ({ attempts: 1, pending: false, lastReason: null }),
+    getFrameBudget: () => ({ limitBytes: 2 * 1024 * 1024, refusals: 0, recentRefusals: [], degradations: [] }),
+    getHandlerErrors: () => [],
+    getSubscriptions: () => ({ devices: [], sessions: [] }),
+  };
+  const diagnostics = buildDiagnostics({
+    runtime,
+    sourceKind: 'session-controller',
+    seam: { attachmentReads: { attempted: 2, served: 2, failed: 0 } },
+    listingDiagnostics: () => ({ staleServes: 1, lastStaleReason: 'timeout', lastListedAt: 5, lastListedCount: 9 }),
+  });
+  for (const key of [
+    'dataSource', 'projectionRunning', 'projectedSessions', 'recentInvokes', 'recentRefusals',
+    'recentPushes', 'pushTotals', 'invokeTotals', 'refusalTotals', 'attachmentReads', 'reconnect',
+    'frameBudget', 'handlerErrors', 'listing', 'subscriptions',
+  ]) {
+    assert.ok(key in diagnostics, `${key} must be present`);
+  }
+  assert.equal(diagnostics.projectedSessions, 2);
+  assert.deepEqual(diagnostics.listing, { staleServes: 1, lastStaleReason: 'timeout', lastListedAt: 5, lastListedCount: 9 });
+
+  // Every reader throwing is the worst case, and it still answers: the fields that can only be
+  // read from the live process degrade to their empty value, the block itself survives.
+  const throwing = new Proxy({}, {
+    get: () => () => {
+      throw new Error('producer exploded');
+    },
+  });
+  const degraded = buildDiagnostics({
+    runtime: throwing,
+    sourceKind: 'session-controller',
+    seam: undefined,
+    listingDiagnostics: () => {
+      throw new Error('producer exploded');
+    },
+  });
+  assert.equal(degraded.recentInvokes.length, 0);
+  assert.equal(degraded.listing, null);
+  assert.equal(degraded.attachmentReads.served, 0);
+  assert.equal(degraded.dataSource, 'session-controller', 'what does not depend on the process is still reported');
 });
 
 test('the flag store is written as a replacement, so un-archiving actually lands', async () => {

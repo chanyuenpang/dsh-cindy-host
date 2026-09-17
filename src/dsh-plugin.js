@@ -947,6 +947,89 @@ export function buildDshSource(ctx, serviceName) {
 }
 
 /**
+ * The diagnostics block the status route serves.
+ *
+ * Extracted from `apply` with explicit inputs for one measured reason: the first version read
+ * `sessionSource` from a scope it does not exist in, which threw a `ReferenceError`, and the
+ * status route answers a throwing producer by **omitting `diagnostics` entirely** (its own
+ * test pins that, because the settings page must still load). So a single stale reference
+ * silently removed every counter this Host's bug hunts depend on — no error, no gap in the
+ * JSON, just a shorter body. Here the inputs cannot be guessed wrong, a test calls it, and
+ * each volatile field is read through {@link field} so one broken producer degrades that field
+ * instead of the block.
+ *
+ * @param options - the runtime, the seam kind, the current source seam, and the listing reader.
+ * @returns the diagnostics object, with every key present.
+ */
+export function buildDiagnostics({ runtime, sourceKind, seam, listingDiagnostics }) {
+  const field = (read, fallback) => {
+    try {
+      return read();
+    } catch {
+      return fallback;
+    }
+  };
+  return {
+    dataSource: sourceKind,
+    projectionRunning: runtime?.projectionRunning === true,
+    projectedSessions: field(() => (runtime ? runtime.model.list().length : 0), 0),
+    // What a controller actually asked for and what it got back, with the
+    // asking device. Without attribution, polling from another linked
+    // computer reads as if it came from the phone the user is holding.
+    recentInvokes: field(() => (runtime ? runtime.getInvokeLog().slice(-20) : []), []),
+    // Refusals outlive the success ring: a controller polling a transcript
+    // evicts everything else within seconds, and the one refused channel is
+    // the only entry that explains "host failed to serve this channel".
+    recentRefusals: field(() => (runtime ? runtime.getRefusalLog().slice(-30) : []), []),
+    // What went out, and to how many controllers. A push to zero watchers and
+    // a push the controller dropped look identical from the desk, so the
+    // destination count is what makes "the phone never updated" attributable.
+    recentPushes: field(() => (runtime ? runtime.getPushLog().slice(-20) : []), []),
+    // Monotonic per-channel totals. The ring churns during a turn, so a count
+    // taken from it is not evidence that a push happened.
+    pushTotals: field(() => (runtime ? runtime.getPushTotals() : {}), {}),
+    // The same for the request direction: which channels have ever been asked
+    // for, and which of those answers were refusals. `recentInvokes` is a
+    // forty-entry ring and a polling controller evicts it within seconds, so
+    // without this "did the phone ever call X" is unanswerable.
+    invokeTotals: field(() => (runtime ? runtime.getInvokeTotals() : {}), {}),
+    refusalTotals: field(() => (runtime ? runtime.getRefusalTotals() : {}), {}),
+    // How the transcript's image inlining is actually doing: `attempted` counts the
+    // image handles the reader was handed, `served` the ones whose bytes came back.
+    // A photo that renders as a file chip is one of {no handle on the block, no
+    // attachment service on this profile, a failed read} and only these numbers tell
+    // them apart. `served: 0, attempted: 0` with a photo in the transcript means the
+    // handle never reached the reader at all.
+    attachmentReads: seam?.attachmentReads ?? { attempted: 0, served: 0, failed: 0 },
+    // How the automatic reconnection is doing. "The Host vanished from the phone" and
+    // "the Host was briefly offline and came back on its own" look identical from the
+    // handset, and only this tells them apart.
+    reconnect: field(() => (runtime ? runtime.getReconnectState() : { attempts: 0, pending: false, lastReason: null }), null),
+    // What had to be given up to fit one device-link frame. The relay drops an
+    // oversized frame outright, so a degraded page and a page that never arrived
+    // are indistinguishable from the handset — this is where they differ.
+    frameBudget: field(
+      () => (runtime && typeof runtime.getFrameBudget === 'function'
+        ? runtime.getFrameBudget()
+        : { limitBytes: null, refusals: 0, recentRefusals: [], degradations: [] }),
+      null,
+    ),
+    // Errors this Host caught at its own boundaries. Should stay empty: each entry is an
+    // exception that would otherwise have left the whole `dsh web` process through DSH's
+    // fail-loud unhandled-rejection handler.
+    handlerErrors: field(() => (runtime && typeof runtime.getHandlerErrors === 'function' ? runtime.getHandlerErrors() : []), []),
+    // How the session listing is doing. `staleServes > 0` means a controller was answered
+    // from the previous read because the live one missed its deadline — an absorbed
+    // degradation, and the difference between a rendered list and the reported spinner.
+    listing: field(() => (typeof listingDiagnostics === 'function' ? listingDiagnostics() : null), null),
+    // The topics controllers currently hold. An empty set means the phone
+    // never subscribed — the single most likely reason a live reply or a todo
+    // card never reaches it.
+    subscriptions: field(() => (runtime ? runtime.getSubscriptions() : { devices: [], sessions: [] }), { devices: [], sessions: [] }),
+  };
+}
+
+/**
  * The capability provider the channel layer reads.
  *
  * Written as explicit fields rather than a spread of the seam's output so that
@@ -1100,6 +1183,18 @@ export function apply(ctx) {
    * may see, so the seam output travels whole.
    */
   let currentSeam = {};
+  /**
+   * The current source's listing diagnostics, or a null answer.
+   *
+   * Held here rather than read from `currentSeam`: the first version reached for the
+   * session source by name from inside `getDiagnostics`, where it is out of scope, and the
+   * resulting `ReferenceError` made the status route drop **its whole diagnostics block**
+   * (that route answers a throwing producer by omitting the field, so the settings page still
+   * loads). One stale reference, and every counter a bug hunt needs was gone with no error to
+   * show for it. The seam output also travels whole into the channel layer, which is asserted
+   * by an invariant test — a diagnostics accessor is not a capability and does not belong there.
+   */
+  let currentListingDiagnostics = () => null;
   /** The controller's file reads, once a filesystem service is composed. */
   let currentFiles;
   /** The controller's goal writes, once a goal service is composed. */
@@ -1157,6 +1252,8 @@ export function apply(ctx) {
       // The seam output travels whole; see `currentSeam`.
       currentSeam = built;
       sourceKind = built.kind;
+      // Bound next to the source it describes, because this is the only scope that has it.
+      currentListingDiagnostics = () => (typeof built.source?.listDiagnostics === 'function' ? built.source.listDiagnostics() : null);
       // The runtime may not have resolved yet; it applies the pending source
       // after its own await, and picks up the readers at construction.
       void runtime?.setSource(currentSource);
@@ -1178,6 +1275,7 @@ export function apply(ctx) {
         if (sourceKind === built.kind) sourceKind = 'none';
         currentSource = undefined;
         currentSeam = {};
+        currentListingDiagnostics = () => null;
         currentFiles = undefined;
         void runtime?.setSource(undefined);
       }, `dsh-cindy-host: ${built.kind} source`);
@@ -1310,61 +1408,7 @@ export function apply(ctx) {
   // its settings still work, only the browser surface is missing.
   const routes = createHostRoutes({
     getRuntime: () => runtime,
-    getDiagnostics: () => ({
-      dataSource: sourceKind,
-      projectionRunning: runtime?.projectionRunning === true,
-      projectedSessions: runtime ? runtime.model.list().length : 0,
-      // What a controller actually asked for and what it got back, with the
-      // asking device. Without attribution, polling from another linked
-      // computer reads as if it came from the phone the user is holding.
-      recentInvokes: runtime ? runtime.getInvokeLog().slice(-20) : [],
-      // Refusals outlive the success ring: a controller polling a transcript
-      // evicts everything else within seconds, and the one refused channel is
-      // the only entry that explains "host failed to serve this channel".
-      recentRefusals: runtime ? runtime.getRefusalLog().slice(-30) : [],
-      // What went out, and to how many controllers. A push to zero watchers and
-      // a push the controller dropped look identical from the desk, so the
-      // destination count is what makes "the phone never updated" attributable.
-      recentPushes: runtime ? runtime.getPushLog().slice(-20) : [],
-      // Monotonic per-channel totals. The ring churns during a turn, so a count
-      // taken from it is not evidence that a push happened.
-      pushTotals: runtime ? runtime.getPushTotals() : {},
-      // The same for the request direction: which channels have ever been asked
-      // for, and which of those answers were refusals. `recentInvokes` is a
-      // forty-entry ring and a polling controller evicts it within seconds, so
-      // without this "did the phone ever call X" is unanswerable.
-      invokeTotals: runtime ? runtime.getInvokeTotals() : {},
-      refusalTotals: runtime ? runtime.getRefusalTotals() : {},
-      // How the transcript's image inlining is actually doing: `attempted` counts the
-      // image handles the reader was handed, `served` the ones whose bytes came back.
-      // A photo that renders as a file chip is one of {no handle on the block, no
-      // attachment service on this profile, a failed read} and only these numbers tell
-      // them apart. `served: 0, attempted: 0` with a photo in the transcript means the
-      // handle never reached the reader at all.
-      attachmentReads: currentSeam?.attachmentReads ?? { attempted: 0, served: 0, failed: 0 },
-      // How the automatic reconnection is doing. "The Host vanished from the phone" and
-      // "the Host was briefly offline and came back on its own" look identical from the
-      // handset, and only this tells them apart.
-      reconnect: runtime ? runtime.getReconnectState() : { attempts: 0, pending: false, lastReason: null },
-      // What had to be given up to fit one device-link frame. The relay drops an
-      // oversized frame outright, so a degraded page and a page that never arrived
-      // are indistinguishable from the handset — this is where they differ.
-      frameBudget: runtime && typeof runtime.getFrameBudget === 'function'
-        ? runtime.getFrameBudget()
-        : { limitBytes: null, refusals: 0, recentRefusals: [], degradations: [] },
-      // Errors this Host caught at its own boundaries. Should stay empty: each entry is an
-      // exception that would otherwise have left the whole `dsh web` process through DSH's
-      // fail-loud unhandled-rejection handler.
-      handlerErrors: runtime && typeof runtime.getHandlerErrors === 'function' ? runtime.getHandlerErrors() : [],
-      // How the session listing is doing. `staleServes > 0` means a controller was answered
-      // from the previous read because the live one missed its deadline — an absorbed
-      // degradation, and the difference between a rendered list and the reported spinner.
-      listing: typeof sessionSource?.listDiagnostics === 'function' ? sessionSource.listDiagnostics() : null,
-      // The topics controllers currently hold. An empty set means the phone
-      // never subscribed — the single most likely reason a live reply or a todo
-      // card never reaches it.
-      subscriptions: runtime ? runtime.getSubscriptions() : { devices: [], sessions: [] },
-    }),
+    getDiagnostics: () => buildDiagnostics({ runtime, sourceKind, seam: currentSeam, listingDiagnostics: currentListingDiagnostics }),
     // The Host's own relay identity outlives the credential: a phone links to the
     // *device id*, so it is remembered here and reused when the credential is gone.
     getSettings: () => scope.get(),
