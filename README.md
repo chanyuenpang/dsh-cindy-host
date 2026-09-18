@@ -2,6 +2,24 @@
 
 A DSH-to-Cindy host adapter. The console demo projects a DSH conversation list and safe lifecycle/status activity to a replaceable sink; the DSH bundle additionally carries the Cindy session, the DeviceLink relay, and the 「Cindy 手机连接」 settings card that lets the Cindy mobile client reach this Host.
 
+## Quick Start
+
+1. Install the Cindy Host plugin into the DSH profile you use. The following example uses the `web` profile:
+
+```bash
+npx -y @deepseek-ai/dsh plugin --profile web add dsh-cindy-host-demo@latest
+```
+
+2. Approve the plugin's post-install script (`keytar`):
+
+```bash
+npx -y @deepseek-ai/dsh plugin --profile web approve-builds
+```
+
+3. Start DSH, then go to: Settings → Cindy Mobile Connection.
+Sign in with your Cindy phone number and verification code,
+then enable the mobile connection.
+
 ## Console demo scope
 
 - Conversation list: opaque session ID, title, phase, update time.
