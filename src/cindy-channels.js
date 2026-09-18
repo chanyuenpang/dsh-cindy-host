@@ -500,13 +500,60 @@ export function createChannelRouter({
    * `local-db:sessions:list` is also the phone's device-responsiveness probe, so
    * it has to stay a single cheap read — which is why the row is folded from the
    * source's one listing rather than from a per-session fetch.
+   *
+   * **And it may not block on that read at all.** Measured on a live Host (2026-09-18,
+   * 19:08–19:15): eighteen `invoke:local-db:sessions:list` calls aborted with
+   * `TimeoutError` in seven minutes while a build saturated the machine — the abort is at
+   * the **invoke** level (list read + title folding + row building together overran the
+   * deadline), so the source's own stale-serve guard never saw it, and the phone read a
+   * failed list as "the device is offline". The list a controller renders is satisfied by a
+   * few seconds' staleness, so the rows are cached and the read happens behind the answer:
+   * a warm cache answers instantly, and a refresh that fails leaves the previous page
+   * standing rather than turning a slow machine into a disconnected phone.
    */
+  let rowsCache = null;
+  let rowsRefresh = null;
+  /** How long a served page stays fresh enough to answer with before a refresh is kicked. */
+  const SESSION_ROWS_TTL_MS = 5_000;
+
+  /**
+   * Void the cached page because this Host just changed a row.
+   *
+   * Called from every write path that changes what a list read must say — the reply a
+   * controller applies is folded from the same rows, so a stale page there is not a small
+   * lag but an instruction to revert the user's edit.
+   */
+  function invalidateSessionRows() {
+    rowsCache = null;
+  }
+
+  /** Read + fold once, sharing one flight between concurrent callers. */
+  function refreshSessionRows() {
+    if (rowsRefresh !== null) return rowsRefresh;
+    const attempt = (async () => {
+      const items = await listSessions();
+      const rows = toCindySessionList(items, { now, device: deviceIdentity(), defaultModel: catalogDefaultModel });
+      rowsCache = { rows, at: now() };
+      return rows;
+    })();
+    rowsRefresh = attempt;
+    const settle = () => { if (rowsRefresh === attempt) rowsRefresh = null; };
+    attempt.then(settle, settle);
+    return attempt;
+  }
+
   async function sessionRows() {
-    const items = await listSessions();
-    // `local-db:sessions:list` is the controller's responsiveness probe, so this
-    // must not await a catalog read. The default is only a fallback for rows
-    // whose own selection is unknown, and the last read is good enough for it.
-    return toCindySessionList(items, { now, device: deviceIdentity(), defaultModel: catalogDefaultModel });
+    const cached = rowsCache;
+    if (cached !== null) {
+      if (now() - cached.at > SESSION_ROWS_TTL_MS) {
+        // Stale-while-revalidate: the controller gets a real page now and a fresher one on
+        // its next poll. A failed refresh is deliberately silent — the page above is durable.
+        refreshSessionRows().catch(() => {});
+      }
+      return cached.rows;
+    }
+    // Cold start: the only case where the probe must wait for a read.
+    return refreshSessionRows();
   }
 
   return async function handleInvoke(request) {
@@ -943,6 +990,8 @@ export function createChannelRouter({
         // session may not be running. Absent means the Host named no selection, which
         // is the only honest answer when the controller named none either.
         const applied = created?.selection ?? null;
+        // A new session must be in the next list read, not five seconds later.
+        invalidateSessionRows();
         return invokeResult(request, {
           sessionId: String(created?.sessionId ?? options.id ?? ''),
           // One harness, whatever the picker offered.
@@ -990,8 +1039,10 @@ export function createChannelRouter({
       // with the flags folded back on — the same fold every read path uses.
       const capabilities = capabilitiesNow();
       const rename = capabilities.renameSession;
+      let wrote = false;
       if (typeof rename === 'function' && typeof patch.title === 'string' && patch.title.trim() !== '') {
         await rename({ sessionId, title: patch.title.trim() });
+        wrote = true;
       }
 
       const writesMeta = patch.status !== undefined || patch.pinnedAt !== undefined;
@@ -999,6 +1050,7 @@ export function createChannelRouter({
         const applyFlags = capabilities.applySessionFlags;
         if (typeof applyFlags !== 'function') return invokeError(request, 'NOT_AVAILABLE', 'This DSH Host cannot archive, delete or pin sessions');
         const applied = await applyFlags(sessionId, { status: patch.status, pinnedAt: patch.pinnedAt });
+        wrote = true;
         // Echo only what was written, with this Host's effective value: that is the
         // same patch the controller applied optimistically, so other devices converge
         // on it too.
@@ -1008,6 +1060,10 @@ export function createChannelRouter({
         if (typeof capabilities.publishSessionMeta === 'function') capabilities.publishSessionMeta(sessionId, echoed);
       }
 
+      // The write just changed what a list read must say, so the cached page is void: without
+      // this the reply below would echo the pre-write row, and the controller reads an
+      // unchanged row as "revert my edit" (that is how these buttons looked dead once already).
+      if (wrote) invalidateSessionRows();
       const rows = await sessionRows();
       const row = rows.find((candidate) => candidate.id === sessionId);
       return row === undefined ? invokeError(request, 'NOT_FOUND', `No DSH session ${sessionId}`) : invokeResult(request, row);

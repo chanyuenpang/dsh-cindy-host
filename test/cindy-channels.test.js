@@ -22,6 +22,87 @@ function request(channel, args = [], src = 'phone-1') {
   return { v: 1, kind: 'invoke', id: 'req-1', src, payload: { channel, args } };
 }
 
+test('the list channel answers from its cache instead of blocking on a read', async () => {
+  // Measured live (2026-09-18 19:08–19:15): eighteen `local-db:sessions:list` invokes aborted
+  // with TimeoutError while a build saturated the machine, and the phone read a failed list as
+  // "the device is offline". The abort is at the invoke level, so the source's own stale-serve
+  // guard cannot see it — the channel itself must not block after the first read.
+  let clock = 1_000_000;
+  let reads = 0;
+  let gate = null;
+  const router = createChannelRouter({
+    listSessions: async () => {
+      reads += 1;
+      if (gate !== null) await gate;
+      return ROWS;
+    },
+    subscribers: new Set(),
+    getDevice: () => ({ deviceId: 'dev-host', deviceName: 'DSH Host' }),
+    now: () => clock,
+  });
+
+  // Cold start: the one read that must be awaited.
+  const first = await router(request('local-db:sessions:list'));
+  assert.equal(first.payload.ok, true);
+  assert.equal(first.payload.result.length, ROWS.length);
+  assert.equal(reads, 1);
+
+  // Within the freshness window nothing is re-read at all — a poll costs zero reads.
+  clock += 1_000;
+  const fresh = await router(request('local-db:sessions:list'));
+  assert.equal(fresh.payload.ok, true);
+  assert.equal(reads, 1, 'a fresh page is answered without any read');
+
+  // Past the window the answer still comes from the cache while one refresh runs behind it:
+  // a slow read must never become a slow probe.
+  clock += 10_000;
+  gate = new Promise((resolve) => { setTimeout(resolve, 50); });
+  const started = Date.now();
+  const stale = await router(request('local-db:sessions:list'));
+  const elapsed = Date.now() - started;
+  assert.equal(stale.payload.ok, true);
+  assert.equal(stale.payload.result.length, ROWS.length);
+  assert.ok(elapsed < 30, `a cached page must answer without waiting for the refresh (took ${elapsed}ms)`);
+  await gate;
+  await new Promise((resolve) => setImmediate(resolve));
+  assert.equal(reads, 2, 'exactly one refresh runs behind the answer');
+  gate = null;
+
+  // With no page to fall back on, a failed read still fails — and it fails the way the live Host
+  // recorded it (`handlerErrors: invoke:local-db:sessions:list … aborted`): the router lets the
+  // error out and the Host turns it into a refusal. The cache is a fallback for a slow machine,
+  // never a way to hide a Host that has never listed anything.
+  const cold = createChannelRouter({
+    listSessions: async () => { reads += 1; throw new Error('The operation was aborted due to timeout'); },
+    subscribers: new Set(),
+    getDevice: () => ({ deviceId: 'dev-host', deviceName: 'DSH Host' }),
+  });
+  await assert.rejects(() => cold(request('local-db:sessions:list')), /aborted due to timeout/);
+});
+
+test('a write voids the cached page, so the reply a controller applies is never pre-write', async () => {
+  // The patch-meta reply is folded from the same rows the list serves. With a cache in front of
+  // it, a stale page would echo the pre-write row — and the controller reads an unchanged row
+  // as "revert my edit", which is how archive/delete/pin once looked like dead buttons.
+  let flags = { status: 'active' };
+  const router = createChannelRouter({
+    listSessions: async () => [{ ...ROWS[0], status: flags.status }],
+    subscribers: new Set(),
+    getDevice: () => ({ deviceId: 'dev-host', deviceName: 'DSH Host' }),
+    resolveCapabilities: () => ({
+      applySessionFlags: async (_sessionId, patch) => {
+        if (patch.status !== undefined) flags = { status: patch.status };
+        return { status: flags.status, pinnedAt: null };
+      },
+    }),
+  });
+  const before = await router(request('local-db:sessions:list'));
+  assert.equal(before.payload.result[0].status, 'active');
+  const written = await router(request('local-db:sessions:patch-meta', ['a', { status: 'archived' }]));
+  assert.equal(written.payload.ok, true);
+  assert.equal(written.payload.result.status, 'archived', 'the reply reflects the write, not the cache');
+});
+
 test('the supported set is exactly what the router serves', () => {
   assert.deepEqual([...SUPPORTED_CHANNELS].sort(), [
     'device-link:subscribe',
