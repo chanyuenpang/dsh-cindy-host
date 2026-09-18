@@ -3,6 +3,21 @@
 本文件记录**用户可见**的变化与**每次发布验证过的 DSH 版本**。格式遵循
 [Keep a Changelog](https://keepachangelog.com/zh-CN/1.1.0/)，版本号遵循语义化版本。
 
+## [0.1.6] - 2026-09-18
+
+### Fixed
+
+- **手机端「导出/下载」安装包时秒失败**(实测不到 5 秒),而 Host 侧显示导出成功 —— 失败卡在最后一跳。
+  账号暂存区在阿里云 OSS 的**公网裸域名**,阿里云禁止该端点分发安装包:**key 后缀为 `.apk`/`.ipa`**,
+  或**对象 Content-Type 恰为 `application/vnd.android.package-archive`**,GET 一律
+  `400 ApkDownloadForbidden`(上传 PUT 与 `presign-get` 都成功,所以两边各自看着都对)。
+  现在 staging 会把这类对象按**不透明字节**发出(`ext → bin`、`Content-Type →
+  application/octet-stream`)—— 两个触发条件都要中性化,只改后缀仍会被拒(实测)。文件字节不动,
+  用户看到的文件名也不变:手机按浏览到的文件名自己命名、分享用的 mime 也取自文件名。
+  实测 77.2MB 安装包往返 sha256 一致。判因线索也补齐了:`download-failed` 现在带上对象存储的
+  错误码(如 `download-failed: ApkDownloadForbidden`)。证据与矩阵见
+  [`doc/cindy-android-verify.md`](doc/cindy-android-verify.md) 第九节。
+
 ## [0.1.5] - 2026-09-18
 
 ### Fixed

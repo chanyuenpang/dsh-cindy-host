@@ -41,3 +41,6 @@ Thumbs.db
 # npm pack 产物（构建物，不入库）
 *.tgz
 .gitnexus
+
+# 本地打出来的安装包与探针产物（77MB 级二进制，绝不入库）
+artifacts/

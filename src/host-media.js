@@ -122,10 +122,29 @@ function usableSession(getSession) {
 }
 
 /**
+ * The `<Code>` an object store put in its XML refusal, as `': Code'`, or `''`.
+ *
+ * Only the code is kept: the body can be a page of XML, and the code is the whole
+ * diagnosis (`ApkDownloadForbidden`, `SignatureDoesNotMatch`, `NoSuchKey`, …). Best-effort
+ * — a body that cannot be read costs nothing but the detail.
+ */
+async function ossRefusalCode(response) {
+  if (typeof response?.text !== 'function') return '';
+  try {
+    const body = await response.text();
+    const code = /<Code>([^<]{1,64})<\/Code>/.exec(String(body))?.[1];
+    return typeof code === 'string' && code !== '' ? `: ${code}` : '';
+  } catch {
+    return '';
+  }
+}
+
+/**
  * Build the resolver the attachment materializer calls for a transit reference.
  *
  * The failure vocabulary is closed and small (`no-credential`, `presign-failed`,
- * `download-failed`, `oversize`, `size-mismatch`, `sha256-mismatch`, `aborted`): the
+ * `download-failed[: <object-store code>]`, `oversize`, `size-mismatch`,
+ * `sha256-mismatch`, `aborted`): the
  * controller is told *why* an attachment did not arrive, and the Host never guesses.
  *
  * @param options - `apiBaseUrl`, `getSession` (the live account session), plus
@@ -158,7 +177,10 @@ export function createMediaRefResolver({ apiBaseUrl, getSession, fetchImpl = fet
     try {
       const url = await presignGet(ref.ossKey, session, bound);
       const response = await fetchImpl(url, { method: 'GET', signal: bound });
-      if (response.ok !== true) return { ok: false, reason: 'download-failed' };
+      // A refusal names itself: OSS answers XML with `<Code>ApkDownloadForbidden</Code>`
+      // and nothing else on the wire carries that. A bare `download-failed` cost an
+      // afternoon of probing; the code costs a glance.
+      if (response.ok !== true) return { ok: false, reason: `download-failed${await ossRefusalCode(response)}` };
       // The staged length, when the object store states one, is checked before the
       // bytes are pulled into memory rather than after.
       const stated = Number(response.headers?.get?.('content-length'));
@@ -194,6 +216,61 @@ export function createMediaRefResolver({ apiBaseUrl, getSession, fetchImpl = fet
  * @returns `remove(ossKey)` → `true` when the server confirmed it.
  */
 /**
+ * Extension and Content-Type the account's OSS endpoint refuses to serve over the public
+ * `*.aliyuncs.com` host, whatever the signature or object ACL says.
+ *
+ * Measured against the live staging bucket (`tools/probe-oss-ext.mjs`,
+ * `tools/probe-apk-export-roundtrip.mjs`): **either** trigger alone makes an object
+ * undownloadable by anyone — the staging **PUT still succeeds**, `presign-get` still
+ * answers 200 with a valid url, and then the controller's GET meets
+ *
+ *   400 <Code>ApkDownloadForbidden</Code>
+ *   <Message>The APK file is not allowed to be distributed in a public network using
+ *            the OSS endpoint, please use CNAME instead.</Message>
+ *
+ * within ~100 ms:
+ *
+ *   key suffix `.apk` / `.ipa` (any casing — the server lower-cases it)  → refused
+ *   object Content-Type exactly `application/vnd.android.package-archive` → refused
+ *   `application/octet-stream` / `zip` / `x-itunes-ipa` / the same mime with
+ *   `; charset=binary`                                                   → served
+ *
+ * This is why an exported `.apk` arrived as 下载失败 in under five seconds while every
+ * test looked green: the export really did finish, and only the last hop was refused.
+ *
+ * The staging descriptor is not user-visible. The controller names its own copy from the
+ * name of the file it browsed (`apps/mobile/app/files/[sessionId].tsx`:
+ * `downloadRemoteMediaShareTemp(url, mime, item.name)`), and mime for the share sheet
+ * comes from that same name — so an app package staged as opaque bytes still arrives as
+ * `Cindy-Verify-…apk` and installs normally.
+ */
+const UNSTAGEABLE_EXTS = new Set(['apk', 'ipa']);
+const UNSTAGEABLE_CONTENT_TYPES = new Set(['application/vnd.android.package-archive']);
+
+/**
+ * What the staging PUT should declare for this object.
+ *
+ * An app package — by suffix or by declared mime — is staged as opaque bytes: a neutral
+ * extension *and* `application/octet-stream`, because neutralizing only the suffix leaves
+ * the Content-Type trigger armed (measured).
+ *
+ * @param ext - Caller-declared extension, with or without a leading dot.
+ * @param contentType - Caller-declared mime, or empty.
+ * @returns `{ ext, contentType }` the object store will serve, with the mime never empty.
+ */
+export function stageableStaging(ext, contentType) {
+  const cleanedExt = typeof ext === 'string' ? ext.trim().replace(/^\.+/, '').toLowerCase() : '';
+  const declared = typeof contentType === 'string' && contentType.trim() !== '' ? contentType : 'application/octet-stream';
+  const bare = declared.split(';')[0].trim().toLowerCase();
+  const blockedExt = UNSTAGEABLE_EXTS.has(cleanedExt);
+  const appPackage = blockedExt || UNSTAGEABLE_CONTENT_TYPES.has(bare);
+  return {
+    ext: blockedExt ? 'bin' : cleanedExt,
+    contentType: appPackage ? 'application/octet-stream' : declared,
+  };
+}
+
+/**
  * Build the staging-object uploader.
  *
  * The other half of the same staging area: an image the **agent** produced lives on this
@@ -215,11 +292,14 @@ export function createMediaUploader({ apiBaseUrl, getSession, fetchImpl = fetch,
     if (session === null) return { ok: false, reason: 'no-credential' };
     if (!Buffer.isBuffer(bytes) || bytes.length === 0) return { ok: false, reason: 'empty' };
     const bound = typeof AbortSignal?.timeout === 'function' ? AbortSignal.timeout(timeoutMs) : undefined;
+    // What is declared here is what the object store stores and later judges; see
+    // `stageableStaging` for why an app package must be staged as opaque bytes.
+    const staging = stageableStaging(ext, contentType);
     try {
       const presign = await fetchImpl(`${apiBaseUrl}/media/presign-put`, {
         method: 'POST',
         headers: mediaHeaders(session),
-        body: JSON.stringify({ size: bytes.length, ext: typeof ext === 'string' ? ext : '', contentType }),
+        body: JSON.stringify({ size: bytes.length, ext: staging.ext, contentType: staging.contentType }),
         signal: bound,
       });
       if (presign.ok !== true) return { ok: false, reason: `presign-put answered ${presign.status}` };
@@ -229,7 +309,8 @@ export function createMediaUploader({ apiBaseUrl, getSession, fetchImpl = fetch,
       if (putUrl === '' || key === '') return { ok: false, reason: 'presign-put answered no putUrl/key' };
       const put = await fetchImpl(putUrl, {
         method: 'PUT',
-        headers: { 'Content-Type': contentType, 'x-oss-object-acl': 'private' },
+        // The stored Content-Type comes from this header, and OSS judges it later.
+        headers: { 'Content-Type': staging.contentType, 'x-oss-object-acl': 'private' },
         body: bytes,
         signal: bound,
       });

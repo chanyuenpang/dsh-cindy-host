@@ -17,6 +17,8 @@ import {
   mediaApiBaseUrl,
   createMediaRefResolver,
   createMediaReleaser,
+  createMediaUploader,
+  stageableStaging,
 } from '../src/host-media.js';
 import { buildOssRef } from './support/oss-ref.js';
 
@@ -161,6 +163,75 @@ test('no account session means no media, and the ref is not attempted', async ()
   const withoutToken = createMediaRefResolver({ apiBaseUrl: BASE, getSession: () => ({ accessToken: '' }), fetchImpl });
   assert.deepEqual(await withoutToken(ref, {}), { ok: false, reason: 'no-credential' });
   assert.deepEqual(fetchImpl.calls, []);
+});
+
+test('an app package is staged as opaque bytes, because the object store refuses the alternative', () => {
+  // Measured against the live bucket (`tools/probe-oss-ext.mjs`): either the `.apk`/`.ipa`
+  // suffix or the `application/vnd.android.package-archive` Content-Type makes the object
+  // undownloadable by anyone, while the PUT itself succeeds. An exported `.apk` was
+  // therefore unreachable while every host-side check passed.
+  assert.deepEqual(stageableStaging('apk', 'application/vnd.android.package-archive'), { ext: 'bin', contentType: 'application/octet-stream' });
+  assert.deepEqual(stageableStaging('.apk', 'application/vnd.android.package-archive'), { ext: 'bin', contentType: 'application/octet-stream' });
+  assert.deepEqual(stageableStaging('APK', ''), { ext: 'bin', contentType: 'application/octet-stream' });
+  assert.deepEqual(stageableStaging('ipa', 'application/octet-stream'), { ext: 'bin', contentType: 'application/octet-stream' });
+  // The mime alone is enough to poison an otherwise fine key.
+  assert.deepEqual(stageableStaging('zip', 'application/vnd.android.package-archive'), { ext: 'zip', contentType: 'application/octet-stream' });
+  // Everything else keeps what it was given, with a mime always declared.
+  assert.deepEqual(stageableStaging('png', 'image/png'), { ext: 'png', contentType: 'image/png' });
+  assert.deepEqual(stageableStaging('.PNG', 'image/png'), { ext: 'png', contentType: 'image/png' });
+  assert.deepEqual(stageableStaging('', ''), { ext: '', contentType: 'application/octet-stream' });
+  assert.deepEqual(stageableStaging(undefined, undefined), { ext: '', contentType: 'application/octet-stream' });
+});
+
+test('the uploader declares the staged extension and mime on both hops', async () => {
+  const fetchImpl = fakeFetch({
+    [`${BASE}/media/presign-put`]: () => ({
+      ok: true, status: 200,
+      headers: { get: () => null },
+      json: async () => ({ putUrl: 'https://oss.example/put', key: 'media/u/k.bin' }),
+      text: async () => '',
+    }),
+    'https://oss.example/put': () => ({ ok: true, status: 200, headers: { get: () => null } }),
+  });
+  const upload = createMediaUploader({ apiBaseUrl: BASE, getSession: () => ({ accessToken: 'tok-1' }), fetchImpl });
+  const staged = await upload(Buffer.from('apk bytes'), { ext: 'apk', contentType: 'application/vnd.android.package-archive' });
+
+  assert.deepEqual(staged, { ok: true, key: 'media/u/k.bin', size: 9 });
+  assert.deepEqual(JSON.parse(fetchImpl.calls[0].body), { size: 9, ext: 'bin', contentType: 'application/octet-stream' });
+  // The PUT header is what the store keeps, so it carries the same neutralization.
+  assert.equal(fetchImpl.calls[1].headers['Content-Type'], 'application/octet-stream');
+  assert.equal(fetchImpl.calls[1].headers['x-oss-object-acl'], 'private');
+  // The bytes are untouched: only the label changes.
+  assert.deepEqual(fetchImpl.calls[1].body, Buffer.from('apk bytes'));
+});
+
+test('a refused download carries the object store code that explains it', async () => {
+  const fetchImpl = fakeFetch({
+    [`${BASE}/media/presign-get`]: () => ({
+      ok: true, status: 200,
+      headers: { get: () => null },
+      json: async () => ({ getUrl: 'https://oss.example/signed' }),
+    }),
+    'https://oss.example/signed': () => ({
+      ok: false, status: 400,
+      headers: { get: () => null },
+      text: async () => '<?xml version="1.0" encoding="UTF-8"?><Error><Code>ApkDownloadForbidden</Code><Message>The APK file is not allowed…</Message></Error>',
+    }),
+  });
+  const resolve = createMediaRefResolver({ apiBaseUrl: BASE, getSession: () => ({ accessToken: 'tok-1' }), fetchImpl });
+  const refused = await resolve(parseAttachmentOssRef(buildOssRef({ ossKey: 'media/u/k.apk' })), {});
+  assert.deepEqual(refused, { ok: false, reason: 'download-failed: ApkDownloadForbidden' });
+
+  // A refusal with no readable body is still a named failure, just less detailed.
+  const opaque = createMediaRefResolver({
+    apiBaseUrl: BASE,
+    getSession: () => ({ accessToken: 'tok-1' }),
+    fetchImpl: fakeFetch({
+      [`${BASE}/media/presign-get`]: () => ({ ok: true, status: 200, headers: { get: () => null }, json: async () => ({ getUrl: 'https://oss.example/signed' }) }),
+      'https://oss.example/signed': () => ({ ok: false, status: 403, headers: { get: () => null } }),
+    }),
+  });
+  assert.deepEqual(await opaque(parseAttachmentOssRef(buildOssRef({ ossKey: 'media/u/k.png' })), {}), { ok: false, reason: 'download-failed' });
 });
 
 test('the staging object is released with the same credential, best-effort', async () => {
