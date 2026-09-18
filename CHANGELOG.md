@@ -3,6 +3,17 @@
 本文件记录**用户可见**的变化与**每次发布验证过的 DSH 版本**。格式遵循
 [Keep a Changelog](https://keepachangelog.com/zh-CN/1.1.0/)，版本号遵循语义化版本。
 
+## [0.1.5] - 2026-09-18
+
+### Fixed
+
+- **手机端「导出/下载本机文件」对大文件直接失败** —— 手机点文件时先要 `exportFileStart`，Host 把文件
+  交给账号的暂存区（OSS），手机再自己 presign 下载；但 `resolveInsideWorkdir` 复用了
+  `device-link:media:fetch` 的 **25MB** 上限，一个 77MB 的安装包被判 `OVERSIZE`，App 只好退回预览
+  （1MB 上限），用户看到「超出大小」（线上实测 `file-browser:remote-op / OVERSIZE` ×4）。
+  导出现在有独立额度与时限:**512MB / 10 分钟**（媒体取件仍保持 25MB / 30 秒）。导出会把文件整体读进
+  内存，注释里写明了这一点；新增测试覆盖「26MB 的文件必须能开始并完成导出」。
+
 ## [0.1.3] - 2026-09-17
 
 ### Fixed
