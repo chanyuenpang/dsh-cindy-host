@@ -325,6 +325,32 @@ push → `historyView.invalidate()` → **`setTimeout(500ms)`** → 重读
 - 只有 `stall`、没有 `recover` → 计时器无法从 JS 侧复活,下一步把 App 的实时循环改成
   push 事件直接驱动(不再依赖 `setInterval`)。
 
+> **这条判据已被真机实测修正**:2026-09-18 19:34 的实测里 `recover` 一次都没来(间隙单调增长
+> 81→103→109→114→125,`reviveCount` 停在 1),证明 **JS 侧无法复活 RN 的计时器驱动**。
+> 所以 `tdiag.recover.*` 不再是验收条件;能判定的三条见 `.claw/truth/dsh-cindy-host-mobile-resume-limitation.md`
+> 的「验收判据(修正版)」:① 用户看到思考时间自己在走;② 停摆窗口内手机仍在持续读取;
+> ③ 手机自报停摆 + 随后一次重新订阅(层 4 换代生效)。
+
+## 十一、交接:装包与验证(我不在场也能做)
+
+**装哪一版**:`artifacts` 里取**最新时间戳**的那个(`Cindy-Verify-0.1.0-arm64-v8a-<commit>.apk`),
+覆盖安装即可(同包名同签名,不用卸载)。文件名里的 `<commit>` 就是 Cindy 仓的 HEAD 短哈希,
+可用 `git -C G:\Projects\Cindy log --oneline -1` 对照它包含哪些层。
+
+**做什么**:打开 App 进任意会话 → 按 Home 切后台 **1–2 分钟** → 回前台 → **停在会话页盯着**。
+
+**看到什么算什么**:
+
+| 现象 | 结论 |
+|---|---|
+| 思考时间自己在走、新内容自己进来 | ✅ 修好了(层 2/3/4 生效) |
+| 要退出去再进来才更新 | ❌ 层 3 没兜住,把这一句原话带回来即可 |
+| 界面完全不动 | ❌ 层 2/4 也没兜住,带原话回来 |
+
+**取证不用你操作**:`dsh web` 那台机器上跑着守望(`.sandbox/watch-phone.mjs`,每 10 秒把手机
+自报与调用时间线落盘到 `.sandbox/phone-diagnostics*.log`),App 一触发就会自动记下。
+事后用 `node tools/verify-timer-stall.mjs` 一次读完(它会把自报、调用空档、连接层与判读一起打印)。
+
 **当前产物(层 1 + 层 2 在同一个包里)**:
 
 | 项 | 值 |
@@ -332,5 +358,5 @@ push → `historyView.invalidate()` → **`setTimeout(500ms)`** → 重读
 | 项目内路径 | `artifacts\Cindy-Verify-0.1.0-arm64-v8a-d4969890c.apk` |
 | 大小 / sha256 | 77.2 MB / `A2147D4822A3B06813EEED6D086EC2FA896B3CB5032B0104736108ED496CFDDC` |
 | 包内已核对 | 层 1:`tdiag.stall.s` `tdiag.recover.after` `timer-stall`;层 2:`lastDirectInvalidateAt` `timersHealthy` `setTimerHealthProbe` |
-| 出包踩坑 | 上一次构建失败于 `Unable to delete file …bundleLibCompileToJarRelease\classes.jar`:残留 Gradle 守护进程攥着文件。`gradlew --stop` + 删 `node_modules\expo-modules-core\android\build` 后重跑即成功(脚本把 Gradle 输出过滤成 5 个关键词,**原因行会丢**,排查时要手工跑一次 gradlew 留完整日志) |
+| 出包踩坑 | 上一次构建失败于 `Unable to delete file …bundleLibCompileToJarRelease\classes.jar`:残留 Gradle 守护进程攥着文件。脚本现在会自动 `gradlew --stop` + 清库产物,并在失败时打出 Gradle 的原因行(见第六节坑 14) |
 
