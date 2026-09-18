@@ -292,6 +292,13 @@ Host 同时刻:推送一直在发(watchers=1)、订阅在、reconnect=0、handle
 入站帧与回前台这两个**不经过计时器**的事件当检查点,心跳间隙 ≥3 秒判定停摆 → 重建心跳 +
 重连/rehydrate,并上报 `tdiag.stall.s<秒>.r<次数>.<来源>` / `tdiag.recover.after<秒>s.r<次数>.<来源>`。
 
+**第二层(commit `HEAD`,即使重建救不回来界面也能恢复)**:取证精确到了那一跳 ——
+push → `historyView.invalidate()` → **`setTimeout(500ms)`** → 重读
+(`packages/maker-shared/src/historyViewController.ts:116-122`)。计时器停摆时这一跳永不执行,
+所以「推送一直在到、界面永不刷新、手机一次 `messages:view` 都不再发」。现在:
+`HistoryViewController` 接受注入的 `timersHealthy` 判定,判定为停摆时改用**挂钟节流
+300ms + 立即重读**(不依赖任何定时器);「思考时间」的显示值也改为渲染时按真实时间算。
+
 **判据(不靠肉眼)**:
 
 ```powershell
@@ -303,4 +310,13 @@ Host 同时刻:推送一直在发(watchers=1)、订阅在、reconnect=0、handle
 - **紧接着出现 `tdiag.recover.after*s`** → 心跳重建生效,界面应在 10 秒内恢复实时刷新(修复成功);
 - 只有 `stall`、没有 `recover` → 计时器无法从 JS 侧复活,下一步把 App 的实时循环改成
   push 事件直接驱动(不再依赖 `setInterval`)。
+
+**当前产物(层 1 + 层 2 在同一个包里)**:
+
+| 项 | 值 |
+|---|---|
+| 项目内路径 | `artifacts\Cindy-Verify-0.1.0-arm64-v8a-d4969890c.apk` |
+| 大小 / sha256 | 77.2 MB / `A2147D4822A3B06813EEED6D086EC2FA896B3CB5032B0104736108ED496CFDDC` |
+| 包内已核对 | 层 1:`tdiag.stall.s` `tdiag.recover.after` `timer-stall`;层 2:`lastDirectInvalidateAt` `timersHealthy` `setTimerHealthProbe` |
+| 出包踩坑 | 上一次构建失败于 `Unable to delete file …bundleLibCompileToJarRelease\classes.jar`:残留 Gradle 守护进程攥着文件。`gradlew --stop` + 删 `node_modules\expo-modules-core\android\build` 后重跑即成功(脚本把 Gradle 输出过滤成 5 个关键词,**原因行会丢**,排查时要手工跑一次 gradlew 留完整日志) |
 

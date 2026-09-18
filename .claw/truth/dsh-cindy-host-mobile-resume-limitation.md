@@ -154,11 +154,18 @@ React 实例级的,所以换屏/回列表都不恢复,只有整进程重开。
 | A(本文件上半部分,12:18 那次) | **在问,而且重复问同一个读** | 答复到不了它:读方向死 | 客户端判据缺陷(已有修复,待真机确认) |
 | B(本次 18:37) | **完全不问了** | 计时器整体停摆:它不再产生请求 | 客户端生命周期缺陷 |
 
-**B 的修复(commit `04d36977f`,新包待验证)**:`apps/mobile/src/device-link/timerLiveness.ts` ——
+**B 的修复(commit `04d36977f` + 第二层,新包待验证)**:`apps/mobile/src/device-link/timerLiveness.ts` ——
 入站帧与回前台这两个**不经过计时器**的事件当检查点,心跳间隙 ≥3s 判定停摆 → 重建心跳 +
 重连/rehydrate,并把停摆与恢复经「未知通道名」上报(`tdiag.stall.s<秒>.r<次数>.<来源>` /
 `tdiag.recover.after<秒>s.r<次数>.<来源>`)。**上报即判据**:手机端没有落盘日志,Host 侧新增的
 `diagnostics.phoneDiagnostics`(带到达时刻、只被更多自报挤掉、不被普通轮询冲掉)是唯一时间线。
+
+**第二层(即使重建救不回来界面也能恢复)**:停在 `setTimeout` 上的那一跳已定位 ——
+push → `HistoryViewController.invalidate()` → **`setTimeout(500ms)`** → 重读
+(`packages/maker-shared/src/historyViewController.ts`)。计时器停摆时它永不执行,
+这正是「推送一直在到、界面永不刷新、一次 `messages:view` 都不再发」的直接原因。
+现在该控制器接受注入的 `timersHealthy`;停摆时改用**挂钟节流 300ms + 立即重读**,
+不依赖任何定时器;「思考时间」也改成渲染时按真实时间算。
 
 **下次复现按这条读**:`phoneDiagnostics` 里出现 `tdiag.stall.*` → 证实 B;**紧跟着出现
 `tdiag.recover.after*s`** → 重建生效(界面应在 10 秒内恢复实时刷新);只有 `stall` 没有 `recover`
