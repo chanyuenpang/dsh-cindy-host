@@ -130,6 +130,10 @@ async function supervise({ port, graceSeconds, dshHome }) {
     env: dshHome === null || dshHome === undefined ? process.env : { ...process.env, DSH_HOME: dshHome },
     stdio: ['ignore', sink, sink],
     detached: true,
+    // Never give the relaunched instance a window: it is a background service, and a stray
+    // console on the user's desktop both distracts them and invites a fatal mis-click
+    // (closing that window kills the Host).
+    windowsHide: true,
   });
   closeSync(sink);
   child.unref();
@@ -163,10 +167,16 @@ if (!isMain) {
     const commandLine = [process.execPath, ...superviseArgs].map((part) => `"${part}"`).join(' ');
     let via = 'wmi';
     try {
-      execFileSync('powershell', ['-NoProfile', '-Command', `Invoke-CimMethod -ClassName Win32_Process -MethodName Create -Arguments @{ CommandLine = '${commandLine.replace(/'/g, "''")}' } | Out-Null`], { encoding: 'utf8' });
+      // Launch the supervisor **hidden**. A WMI-created console program gets a console window,
+      // and the supervisor lives for the whole grace period — so the user watches a black box
+      // appear on their desktop for a minute, every restart (reported 2026-09-18). The wrapper
+      // keeps it off-screen; the supervisor still runs outside this job object, which is the
+      // only property WMI is load-bearing for.
+      const hidden = `powershell.exe -NoProfile -WindowStyle Hidden -Command "& ${commandLine.replace(/"/g, '\\"')}"`;
+      execFileSync('powershell', ['-NoProfile', '-Command', `Invoke-CimMethod -ClassName Win32_Process -MethodName Create -Arguments @{ CommandLine = '${hidden.replace(/'/g, "''")}' } | Out-Null`], { encoding: 'utf8' });
     } catch {
       via = 'spawn';
-      const helper = spawn(process.execPath, superviseArgs, { cwd: repoRoot, env: process.env, stdio: 'ignore', detached: true });
+      const helper = spawn(process.execPath, superviseArgs, { cwd: repoRoot, env: process.env, stdio: 'ignore', detached: true, windowsHide: true });
       helper.unref();
     }
     log(`requested: port ${options.port}, grace ${options.graceSeconds}s, via ${via}`);
