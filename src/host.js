@@ -131,7 +131,50 @@ export async function startHost(initialSource, settings = DEFAULT_HOST_SETTINGS,
    * token is picked up for free.
    */
   const mediaBase = mediaApiBaseUrl(relayUrl);
-  const mediaOptions = { apiBaseUrl: mediaBase, getSession: () => session, fetchImpl, maxBytes: maxAttachmentBytes };
+
+  /**
+   * Refresh this runtime's account session because a media call was refused with 401.
+   *
+   * The session above is read **once** at startup (and again when the relay reconnects), so a
+   * credential refreshed outside this process — the settings card, a tool, another Host — is
+   * invisible here and every signed request keeps failing. Measured 2026-09-18: after the
+   * stored session was refreshed, the in-app 导出 path still answered `presign-put answered 401`
+   * while the same stored token worked from a fresh process.
+   *
+   * Two deliberate constraints, both learned the hard way:
+   *  - **One refresh at a time.** Concurrent `restoreSession()` calls rotate the same refresh
+   *    token; that race is what once cost a real login (see the comment on `mediaOptions`).
+   *  - **A cooldown.** A stream of 401s must not turn into a stream of refreshes: the second
+   *    failure within `SESSION_REFRESH_COOLDOWN_MS` is reported, not retried.
+   * @returns whether the in-memory session is now a refreshed one.
+   */
+  let sessionRefreshInFlight = null;
+  let sessionRefreshedAt = 0;
+  const SESSION_REFRESH_COOLDOWN_MS = 30_000;
+  function refreshSessionForMedia() {
+    if (sessionRefreshInFlight !== null) return sessionRefreshInFlight;
+    if (Date.now() - sessionRefreshedAt < SESSION_REFRESH_COOLDOWN_MS) return Promise.resolve(false);
+    const attempt = (async () => {
+      const result = await restoreSession();
+      sessionRefreshedAt = Date.now();
+      if (result?.ok === true && result.session !== undefined) {
+        session = result.session;
+        return true;
+      }
+      return false;
+    })().catch(() => { sessionRefreshedAt = Date.now(); return false; });
+    sessionRefreshInFlight = attempt;
+    void attempt.then(() => { if (sessionRefreshInFlight === attempt) sessionRefreshInFlight = null; });
+    return attempt;
+  }
+
+  const mediaOptions = {
+    apiBaseUrl: mediaBase,
+    getSession: () => session,
+    fetchImpl,
+    maxBytes: maxAttachmentBytes,
+    onUnauthorized: refreshSessionForMedia,
+  };
   const resolveAttachmentRef = createMediaRefResolver(mediaOptions);
   const releaseAttachmentRef = createMediaReleaser(mediaOptions);
   /**

@@ -205,6 +205,89 @@ test('the uploader declares the staged extension and mime on both hops', async (
   assert.deepEqual(fetchImpl.calls[1].body, Buffer.from('apk bytes'));
 });
 
+test('a refused credential is refreshed once and the call retried with the new session', async () => {
+  // Measured 2026-09-18: after the stored session had been refreshed, the in-app 导出 path still
+  // answered `presign-put answered 401` while the same stored token worked from a fresh process —
+  // this runtime reads the session once at startup. So a 401 refreshes the session and retries
+  // exactly once; a refusal that survives the refresh is reported as-is.
+  let credentials = 'stale-token';
+  let refreshes = 0;
+  const recording = async (url, init = {}) => {
+    if (url.endsWith('/media/presign-put')) {
+      const auth = String(init.headers?.Authorization ?? '');
+      if (auth === 'Bearer stale-token') {
+        return { ok: false, status: 401, headers: { get: () => null }, json: async () => ({}), text: async () => '{"message":"unauthorized"}' };
+      }
+      return {
+        ok: true, status: 200, headers: { get: () => null },
+        json: async () => ({ putUrl: 'https://oss.example/put', key: 'media/u/k.bin' }),
+        text: async () => '',
+      };
+    }
+    return { ok: true, status: 200, headers: { get: () => null } };
+  };
+  const upload = createMediaUploader({
+    apiBaseUrl: BASE,
+    getSession: () => ({ accessToken: credentials }),
+    fetchImpl: recording,
+    onUnauthorized: async () => { refreshes += 1; credentials = 'fresh-token'; return true; },
+  });
+  assert.deepEqual(await upload(Buffer.from('bytes'), { ext: 'bin', contentType: 'application/octet-stream' }), { ok: true, key: 'media/u/k.bin', size: 5 });
+  assert.equal(refreshes, 1, 'exactly one refresh for one 401');
+
+  // Two attempts at most: a second 401 after a successful refresh is reported, not retried again.
+  let refreshes2 = 0;
+  const never = createMediaUploader({
+    apiBaseUrl: BASE,
+    getSession: () => ({ accessToken: 'stale-token' }),
+    fetchImpl: async () => ({ ok: false, status: 401, headers: { get: () => null }, json: async () => ({}), text: async () => '' }),
+    onUnauthorized: async () => { refreshes2 += 1; return true; },
+  });
+  assert.deepEqual(await never(Buffer.from('x'), { ext: 'bin' }), { ok: false, reason: 'presign-put answered 401' });
+  assert.equal(refreshes2, 1, 'one refresh total: the second 401 is reported, not refreshed again');
+
+  // A refresh that declines (cooldown, or no credential left) also ends the call after one retry.
+  let refreshes3 = 0;
+  const declined = createMediaUploader({
+    apiBaseUrl: BASE,
+    getSession: () => ({ accessToken: 'stale-token' }),
+    fetchImpl: async () => ({ ok: false, status: 401, headers: { get: () => null }, json: async () => ({}), text: async () => '' }),
+    onUnauthorized: async () => { refreshes3 += 1; return false; },
+  });
+  assert.deepEqual(await declined(Buffer.from('x'), { ext: 'bin' }), { ok: false, reason: 'presign-put answered 401' });
+  assert.equal(refreshes3, 1, 'a declined refresh is not attempted again');
+});
+
+test('the download half retries once after a 401 presign, with the refreshed session', async () => {
+  const png = Buffer.from([9, 9, 9]);
+  let credentials = 'stale-token';
+  let refreshes = 0;
+  const fetchImpl = async (url, init = {}) => {
+    if (url.endsWith('/media/presign-get')) {
+      const auth = String(init.headers?.Authorization ?? '');
+      if (auth === 'Bearer stale-token') {
+        return { ok: false, status: 401, headers: { get: () => null }, text: async () => '{"message":"unauthorized"}' };
+      }
+      return { ok: true, status: 200, headers: { get: () => null }, json: async () => ({ getUrl: 'https://oss.example/signed' }) };
+    }
+    return {
+      ok: true, status: 200,
+      headers: { get: (name) => (name.toLowerCase() === 'content-length' ? String(png.length) : null) },
+      arrayBuffer: async () => png.buffer.slice(png.byteOffset, png.byteOffset + png.byteLength),
+    };
+  };
+  const resolve = createMediaRefResolver({
+    apiBaseUrl: BASE,
+    getSession: () => ({ accessToken: credentials }),
+    fetchImpl,
+    onUnauthorized: async () => { refreshes += 1; credentials = 'fresh-token'; return true; },
+  });
+  const fetched = await resolve(parseAttachmentOssRef(buildOssRef({ ossKey: 'media/u/k.png' })), {});
+  assert.equal(fetched.ok, true);
+  assert.deepEqual(fetched.buffer, png);
+  assert.equal(refreshes, 1);
+});
+
 test('a refused download carries the object store code that explains it', async () => {
   const fetchImpl = fakeFetch({
     [`${BASE}/media/presign-get`]: () => ({
