@@ -1008,6 +1008,28 @@ test('a file on this machine can be exported to a controller, and nothing outsid
     // 403, which is how the first version of the probe failed.
     assert.equal(staged[1].headers['x-oss-object-acl'], 'private');
 
+    // The export budget is **not** the media budget: the controller's file browser hands
+    // over installers, not just pictures. A 26 MB body (above the 25 MB
+    // `device-link:media:fetch` ceiling) must start and finish an export — before this
+    // change it was refused with `OVERSIZE … over the 26214400 byte limit`, which is
+    // exactly what a 77 MB APK hit on a real phone (2026-09-18).
+    const bigPath = join(workdir, 'big.apk');
+    const bigBytes = 26 * 1024 * 1024;
+    await writeFile(bigPath, Buffer.alloc(bigBytes, 7));
+    const bigStarted = await invoke('exp-big-1', 'file-browser:remote-op', [{ op: 'exportFileStart', workdir, relPath: 'big.apk' }]);
+    assert.equal(bigStarted.payload.ok, true, JSON.stringify(bigStarted.payload.error ?? null));
+    assert.equal(bigStarted.payload.result.size, bigBytes);
+    let bigStatus = null;
+    for (let attempt = 0; attempt < 200; attempt += 1) {
+      await settle();
+      const polled = await invoke(`exp-big-s-${attempt}`, 'file-browser:remote-op', [{ op: 'exportFileStatus', workdir, transferId: bigStarted.payload.result.transferId }]);
+      bigStatus = polled.payload.result;
+      if (bigStatus?.state !== 'uploading') break;
+    }
+    assert.equal(bigStatus.state, 'done', `staging said: ${String(bigStatus.message ?? '')}`);
+    assert.equal(bigStatus.size, bigBytes);
+    assert.equal(staged.at(-2).body.size, bigBytes);
+
     // Reading *out* of the workdir is refused, by `..` and by absolute path alike.
     const escaped = await invoke('exp-2', 'file-browser:remote-op', [{ op: 'exportFileStart', workdir, relPath: `../${outside.split(/[\\/]/).pop()}` }]);
     assert.equal(escaped.payload.ok, false);

@@ -37,7 +37,7 @@ import { DEFAULT_HOST_SETTINGS } from './host-settings.js';
 import { createSessionFlags } from './session-flags.js';
 import { MAX_ATTACHMENT_BYTES } from './host-attachments.js';
 import { createMediaRefResolver, createMediaReleaser, createMediaUploader, mediaApiBaseUrl, isAttachmentOssRef } from './host-media.js';
-import { MEDIA_FETCH_MAX_BYTES, createLocalMediaFetcher, isBlockedMediaPath, isInsideDirectory, mimeForMediaPath } from './host-media-fetch.js';
+import { createLocalMediaFetcher, isBlockedMediaPath, isInsideDirectory, mimeForMediaPath } from './host-media-fetch.js';
 import { RECONNECT_STABLE_RESET_MS, computeReconnectDelayMs } from './host-reconnect.js';
 import { MAX_FRAME_BYTES, fitInvokeResultToFrame, frameByteLength } from './host-frame-budget.js';
 
@@ -146,6 +146,25 @@ export async function startHost(initialSource, settings = DEFAULT_HOST_SETTINGS,
    */
   const uploadMedia = createMediaUploader(mediaOptions);
   /**
+   * The export path's own budget: same staging area, much wider limits.
+   *
+   * `device-link:media:fetch` shows one picture and is capped at 25 MB / 30 s, which is
+   * right for a picture. A file export is "hand me the file that is on that machine":
+   * an APK or an installer is a hundred times that, and at a home upload rate a 77 MB
+   * body needs minutes — the media budget refuses it before it starts (measured
+   * 2026-09-18: `OVERSIZE … over the 26214400 byte limit`) and would abort the PUT
+   * halfway even if it did (`AbortSignal.timeout(30s)`).
+   *
+   * The file is read into memory, so this ceiling is also a memory ceiling: raise it
+   * only with that in mind.
+   */
+  const FILE_EXPORT_MAX_BYTES = 512 * 1024 * 1024;
+  const FILE_EXPORT_UPLOAD_TIMEOUT_MS = 10 * 60_000;
+  const uploadMediaForExport = createMediaUploader({
+    ...mediaOptions,
+    timeoutMs: FILE_EXPORT_UPLOAD_TIMEOUT_MS,
+  });
+  /**
    * The controller asking this machine to hand over one of its files.
    *
    * The chat-image path: a picture the agent produced is referenced by path in the
@@ -214,8 +233,8 @@ export async function startHost(initialSource, settings = DEFAULT_HOST_SETTINGS,
     if (typeof info?.isDirectory === 'function' && info.isDirectory()) {
       return { ok: false, code: 'BAD_REQUEST', message: 'the requested path is a directory' };
     }
-    if (Number.isFinite(info?.size) && info.size > MEDIA_FETCH_MAX_BYTES) {
-      return { ok: false, code: 'OVERSIZE', message: `the file is ${info.size} bytes, over the ${MEDIA_FETCH_MAX_BYTES} byte limit` };
+    if (Number.isFinite(info?.size) && info.size > FILE_EXPORT_MAX_BYTES) {
+      return { ok: false, code: 'OVERSIZE', message: `the file is ${info.size} bytes, over the ${FILE_EXPORT_MAX_BYTES} byte export limit` };
     }
     return { ok: true, real, info };
   }
@@ -235,7 +254,7 @@ export async function startHost(initialSource, settings = DEFAULT_HOST_SETTINGS,
     void (async () => {
       try {
         const bytes = await readFileImpl(resolved.real);
-        const staged = await uploadMedia(bytes, { ext: extnameImpl(resolved.real).slice(1), contentType: mimeForMediaPath(resolved.real) });
+        const staged = await uploadMediaForExport(bytes, { ext: extnameImpl(resolved.real).slice(1), contentType: mimeForMediaPath(resolved.real) });
         if (staged?.ok === true) Object.assign(job, { state: 'done', key: staged.key, size: bytes.length, uploaded: bytes.length });
         else Object.assign(job, { state: 'error', message: String(staged?.reason ?? 'staging failed'), uploaded: 0 });
       } catch (error) {

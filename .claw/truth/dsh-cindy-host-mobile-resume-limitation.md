@@ -8,8 +8,19 @@
 客户端。表现是——发送后气泡一直转圈、看不到 agent 的工作进度、顶部没有重连提示、设备仍显示“已连接”；
 **退出会话再进（或重启 App）重建连接后一切恢复**。
 
-**归属：不是 Cindy 客户端逻辑缺陷，也不是本 Host 缺陷，而是操作系统的应用恢复行为。** 因此**本 Host
-不再为它投入**；对偶发丢帧有效的两处缓解保留（见下）。
+**归属（2026-09-18 收窄）：触发点是操作系统的应用恢复行为，但「它永远不自愈」是客户端判据缺陷。**
+手机端**所有**活性判据量的都是「手机↔relay」：`pong` 由 relay 自己应答（`scripts/device-link/relayFixture.ts:85-86`，
+且全仓没有任何一端发 `pong`），而手机的心跳判死条件是「20 秒内没有任何入站帧」
+（`packages/device-link/src/client.ts:1913-1945`，其中 `:1918-1919` 是「任意入站帧即清零」），
+于是 relay 每 10s 一次的 pong **让半开检测永久失明**；唯一会主动探测并 `restartConnection` 的
+`notifyNetworkChanged` 又被 `:860` 的「任意入站帧即证明可达」早退挡住。手机端 timing 见
+`apps/mobile/src/device-link/DeviceLinkContext.tsx:831-841`（`pingIntervalMs: 10_000` / `pongMissLimit: 1`）。
+
+Host 侧的边界不变：**我们发出去的任何东西都走那条死掉的方向**，所以 Host 无法自救（包括无法「踢」对端——
+`transport-timeout` 也是 routed 帧，且要求先有可靠层，我们只 advertise 了 `history-view-v1`）；
+唯一不经该方向的通道是 `notify`（APNs/FCM），而它只能提示**人**去重开 App。
+
+修复已实现，**待真机验证**：见下方「2026-09-18 更新」。
 
 ## 依据
 
@@ -38,6 +49,7 @@
   这条值得写下来，因为“重启后才看到”很容易被误读成“消息丢了”。
 - 若将来客户端愿意改：判据它手上就有——**“发出的请求超过 N 秒没有回复”就该主动重连**（而不是只看发送
   是否成功）。这一点与 Host 无关，是客户端/OS 侧的修复路径。
+  **→ 2026-09-18 这条已经实现**（`peerSilenceProbeMs`，见下方「2026-09-18 更新」）。
 
 ## 它看起来像“照片的 bug”，其实触发条件是“挑照片”（2026-09-17 复现并定性）
 
@@ -57,6 +69,47 @@
 结论：**不是本插件缺陷，也不是之前那个 `carried no text` 的拒绝**（那条早已修掉，且本次 Host 侧数据完整）。
 Host 侧无法补救（推送走的就是死掉的方向），能做的只是把“触发条件”写清楚：**选图/拍照这类必然
 后台→前台的操作之后，紧接着发的消息可能看不到，需等约 1 分钟或退出会话再进。**
+
+## 2026-09-18 更新：根因收窄 + 客户端修复（待真机验证）
+
+**定位过程**：本 Host 是否重启都不能让手机重连（手机的 pong 来自 relay，重启 host 动不到它那条链路；
+relay 的断连契约只会广播 `presence-changed{online:false}`，客户端不据此重建自己的 socket）。
+更硬的一条：按 relay 的路由模型（`relayFixture.ts:83-84` 校验发送方、`:107` 投递给目标用的是**同一条**
+peer entry），手机帧能到我们 ⇒ 那条 entry 指向的正是手机的活 socket ⇒ 我们回给手机的帧也发到了同一个活
+socket ⇒ **丢帧发生在手机进程内部**，不在 relay。结论：这不是 Host 能修的，必须是客户端加判据。
+
+**已实现**（分支 `fix/mobile-peer-silence-probe`，commit `eadedb8d5`；仓库 `G:\Projects\Cindy`，未 push）：
+
+- `packages/device-link/src/client.ts`：新增 opt-in `peerSilenceProbeMs`（默认 0 = 关闭，桌面端曲线不变）。
+  开启后：只有带 `src` 的 routed 帧算「对端还在说话」；同一 peer **连续两次**请求超时且对端持续静默 →
+  `restartConnection`（自带 link 状态复位）；relay 已判 `DEVICE_OFFLINE` 时不介入；同窗口限速一次。
+- 回前台探针改以**对端活性**作为「relay 可达」的证据，并要求已存在超时证据——避免把长执行通道
+  （`desktop-cmd:run` 等，运行期间被控端本来就不发帧）在跑的命令打成失败。
+- `apps/mobile/src/device-link/DeviceLinkContext.tsx`：手机端显式开启 `20_000ms`。
+- 单测 5 条（默认关闭 / 连续两次超时触发 / 对端有帧不触发 / relay 判离线不触发 / 探针闸门）；本包 **414/414**。
+
+**上游**：[makecindy/cindy#4634](https://github.com/makecindy/cindy/issues/4634)（含本次补充的证据评论：
+修正了 issue 标题里「所有入站帧丢失」的表述——relay 自己产生的 pong 仍在到达，丢的是设备到设备的路由帧）。
+
+**真机验证交接**：[`doc/cindy-android-verify.md`](../../doc/cindy-android-verify.md)——环境已装好（JDK 17 +
+Android SDK，区域 cn、测试包名 `com.xd.cindycn.verify` 可与商店版共存），出包/安装/复现/判定标准、以及
+实测跑通的构建配方与 10 个坑都在里面。
+
+**APK 已构建完成（2026-09-18 16:32）**：
+`C:\Users\chany\Downloads\Cindy-Verify-0.1.0-arm64-v8a-308b4badc.apk`
+（77.2 MB，仅 arm64，JS 已内联所以真机不需要 Metro；SHA256 `8F1B73D9…CA5A`；桌面名 **Cindy Verify**）。
+
+**第一版为什么"装了也没用"（2026-09-18 现场修正，commit `308b4badc`）**：`eadedb8d5` 那版的触发条件
+要求「同一 peer **连续两次**请求超时」——而切后台再回前台时，App 往往**只发一轮请求**（每个只超时
+一次），连续计数永远到不了 2；回前台探针那条路又额外要求「已存在一次超时证据」。于是**两条路都永远
+不会重建**，装了带修复的包也不会恢复。本版改为：**探针超时本身即证据**（前台提示之后一个对端帧都
+没来）+「有**短超时**业务请求在等回包」就重建；长执行通道（`desktop-cmd:run` 等分钟级超时）用请求
+自身的生效超时排除。已从包内回读确认新逻辑在场（Hermes 字符串表 + sourcemap）。
+
+**只剩真机复现这一步。**
+
+判定标准：日志出现 `peer silence detected, forcing reconnect (peer=…, silentForMs=…, pending=…, timeouts=2)`
+且 ~30 秒内自愈（修复前必须杀 App）。
 
 ## Host 侧保留的两处缓解（针对偶发丢帧，不针对本条）
 
