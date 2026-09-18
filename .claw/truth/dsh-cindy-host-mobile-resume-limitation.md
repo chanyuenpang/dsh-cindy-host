@@ -127,3 +127,40 @@ Android SDK，区域 cn、测试包名 `com.xd.cindycn.verify` 可与商店版�
 3. 看 `pushTotals` 是否仍在自增：在 → Host 有目标可推且在推，问题在通道而不在 Host。
    **不要用 `recentPushes[].watchers` 判断这一条**：它是「算不算已送达」的计数，中继把手机标成离线
    时它就是 0，而那正是这种故障的常态（`recordPush` 收到的是过滤掉 `offlineDevices` 之后的数量）。
+
+## 2026-09-18 18:37 二次真机取证：**另一种卡死，机制完全不同**
+
+用新包（`94f083331`，带对端活性看门狗）复现后，Host 侧的逐 5 秒时间线显示的是**另一回事**：
+
+```
+10:37:03–06  一串调用(回前台:重新订阅 + sessions:get + messages:view + list-active)
+10:37:06 → 10:37:28   22 秒里「一次调用都没有」        ← 不是"答复没到",是它根本不再问
+10:37:28 / :33 / :55  只有用户操作触发的 input:enqueue / steer
+同时刻 Host 侧:推送一直在发(watchers=1)、订阅一直在、reconnect=0、handlerErrors 空、
+               帧预算 0 抑制、手机 online=True
+用户侧: 「思考时间一直不动」;导航、发消息可用;退到会话列表再回来不行;**只有重启 App 才行**
+```
+
+**机制**:后台驻留后 RN(Android)的计时器驱动不再装上,而这个 App 的实时行为**全建立在
+`setInterval`/防抖上** —— 轮询(`messages:view`/`view-intent`,由 push 到达后的防抖重载驱动)、
+对端探针、以及「思考时间」(`app/sessions/[sessionId].tsx` 的 `setInterval(updateElapsed, 1000)`)
+一起停;而 AppState 回调、socket 事件、导航、发送这些**事件驱动**的路径照常工作。计时器是
+React 实例级的,所以换屏/回列表都不恢复,只有整进程重开。
+
+**两种卡死的区分方法(用户看到的一样,Host 看到的完全不同)**:
+
+| | 手机还在问吗 | 机制 | 归属 |
+|---|---|---|---|
+| A(本文件上半部分,12:18 那次) | **在问,而且重复问同一个读** | 答复到不了它:读方向死 | 客户端判据缺陷(已有修复,待真机确认) |
+| B(本次 18:37) | **完全不问了** | 计时器整体停摆:它不再产生请求 | 客户端生命周期缺陷 |
+
+**B 的修复(commit `04d36977f`,新包待验证)**:`apps/mobile/src/device-link/timerLiveness.ts` ——
+入站帧与回前台这两个**不经过计时器**的事件当检查点,心跳间隙 ≥3s 判定停摆 → 重建心跳 +
+重连/rehydrate,并把停摆与恢复经「未知通道名」上报(`tdiag.stall.s<秒>.r<次数>.<来源>` /
+`tdiag.recover.after<秒>s.r<次数>.<来源>`)。**上报即判据**:手机端没有落盘日志,Host 侧新增的
+`diagnostics.phoneDiagnostics`(带到达时刻、只被更多自报挤掉、不被普通轮询冲掉)是唯一时间线。
+
+**下次复现按这条读**:`phoneDiagnostics` 里出现 `tdiag.stall.*` → 证实 B;**紧跟着出现
+`tdiag.recover.after*s`** → 重建生效(界面应在 10 秒内恢复实时刷新);只有 `stall` 没有 `recover`
+→ 计时器无法从 JS 侧复活,下一步要把 App 的实时循环改成不依赖 `setInterval`(push 事件直接驱动)。
+

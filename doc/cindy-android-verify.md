@@ -265,3 +265,42 @@ node tools/probe-apk-export-roundtrip.mjs                     # 真实的 77MB �
 **仍未覆盖(已知)**:手机→Host 方向若传 `.apk` 附件,key 由手机侧申请,同样会被 OSS 拒;
 要修得在客户端上传处做同样的中性化(本仓 `uploadMedia` 管不到那条路径)。
 
+## 十、真机复现:卡死其实有两种,机制完全不同(2026-09-18 18:37 取证)
+
+用带对端活性看门狗的包(`94f083331`)复现后,Host 侧的逐 5 秒时间线显示的是**另一种卡死**:
+
+```
+10:37:03–06   一串调用(回前台:重新订阅 + sessions:get + messages:view + list-active)
+10:37:06 → 28 22 秒里一次调用都没有          ← 不是"答复没到",是它不再问了
+10:37:28/33/55 只有用户操作触发的 input:enqueue / steer
+Host 同时刻:推送一直在发(watchers=1)、订阅在、reconnect=0、handlerErrors 空、帧预算 0 抑制
+用户侧:「思考时间一直不动」;导航/发消息可用;退到列表再回来不行;**只有重启 App 才行**
+```
+
+| | 手机还在问吗 | 机制 | 归属 |
+|---|---|---|---|
+| A(第三节那类,12:18 现场) | **在问,且重复问同一个读** | 答复到不了它(读方向死) | 客户端判据缺陷 |
+| B(本次) | **完全不问** | 计时器整体停摆,不再产生请求 | 客户端生命周期缺陷 |
+
+**B 的机制**:后台驻留后 RN(Android)计时器驱动没重新装上,而 App 的实时行为全建立在
+`setInterval`/防抖上 —— 轮询(`messages:view`/`view-intent`,由 push 后的防抖重载驱动)、
+对端探针、以及「思考时间」(`app/sessions/[sessionId].tsx` 的 `setInterval(updateElapsed, 1000)`)
+一起停;AppState 回调、socket 事件、导航、发送这些**事件驱动**的路径照常工作。计时器是 React
+实例级的,所以换屏不恢复,只有整进程重开。
+
+**B 的修复**:`apps/mobile/src/device-link/timerLiveness.ts`(commit `04d36977f`)——
+入站帧与回前台这两个**不经过计时器**的事件当检查点,心跳间隙 ≥3 秒判定停摆 → 重建心跳 +
+重连/rehydrate,并上报 `tdiag.stall.s<秒>.r<次数>.<来源>` / `tdiag.recover.after<秒>s.r<次数>.<来源>`。
+
+**判据(不靠肉眼)**:
+
+```powershell
+# 手机自报的时间线(带到达时刻;不被普通轮询冲掉,只被更多自报挤掉)
+(Invoke-RestMethod 'http://127.0.0.1:3080/api/dsh-cindy-host/status').diagnostics.phoneDiagnostics
+```
+
+- 出现 `tdiag.stall.*` → 证实 B;
+- **紧接着出现 `tdiag.recover.after*s`** → 心跳重建生效,界面应在 10 秒内恢复实时刷新(修复成功);
+- 只有 `stall`、没有 `recover` → 计时器无法从 JS 侧复活,下一步把 App 的实时循环改成
+  push 事件直接驱动(不再依赖 `setInterval`)。
+

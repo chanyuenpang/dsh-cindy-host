@@ -168,6 +168,44 @@ test('serves an allowlisted invoke and links a listing-only controller', async (
   }
 });
 
+test('a controller self-report is kept with its arrival time, apart from ordinary refusals', async () => {
+  const { runtime, socket } = await runtimeWithSocket();
+  try {
+    socket.emit('open');
+    socket.frame({ v: 1, kind: 'hello-ack', payload: { serverProtocolVersion: 1, deviceId: 'dev-host', userId: 'user-1' } });
+    assert.deepEqual(runtime.getPhoneDiagnostics(), []);
+
+    // A controller with no log of its own reports by invoking an unknown channel whose name
+    // carries the reading. Every one of them is refused — the refusal is the mailbox.
+    const reports = [
+      'psdiag.s10.p0.a0.c0.o0',
+      'tdiag.stall.s96.r1.active',
+      'tdiag.recover.after31s.r1.frame',
+    ];
+    for (const [index, channel] of reports.entries()) {
+      socket.frame({ v: 1, kind: 'invoke', id: `diag-${index}`, src: 'phone-2', payload: { channel, args: [] } });
+      await new Promise((resolve) => setImmediate(resolve));
+      assert.equal(socket.last('invoke-result').payload.ok, false);
+    }
+
+    const kept = runtime.getPhoneDiagnostics();
+    assert.deepEqual(kept.map((entry) => entry.channel), reports);
+    assert.deepEqual(kept.map((entry) => entry.src), ['phone-2', 'phone-2', 'phone-2']);
+    for (const entry of kept) {
+      assert.equal(typeof entry.at, 'string', 'each report keeps the time it arrived at');
+      assert.equal(Number.isNaN(Date.parse(entry.at)), false);
+    }
+
+    // An ordinary capability refusal is not a self-report and must not pollute the timeline.
+    socket.frame({ v: 1, kind: 'invoke', id: 'denied', src: 'phone-2', payload: { channel: 'fs:read', args: [] } });
+    await new Promise((resolve) => setImmediate(resolve));
+    assert.equal(runtime.getRefusalTotals()['fs:read'], 1);
+    assert.equal(runtime.getPhoneDiagnostics().length, reports.length);
+  } finally {
+    await runtime.stop();
+  }
+});
+
 test('answers NOT_AVAILABLE, not a crash, when no session source is attached', async () => {
   const socket = new FakeSocket();
   const runtime = await startHost(undefined, ON, {

@@ -1190,6 +1190,12 @@ export function buildDiagnostics({ runtime, sourceKind, seam, listingDiagnostics
     // without this "did the phone ever call X" is unanswerable.
     invokeTotals: field(() => (runtime ? runtime.getInvokeTotals() : {}), {}),
     refusalTotals: field(() => (runtime ? runtime.getRefusalTotals() : {}), {}),
+    // The phone's own reading of itself, with arrival times. A controller has no log of its
+    // own: it reports by invoking an unknown channel whose name carries the reading, so every
+    // entry here is a refusal **by design**. Kept apart from the rings above because ordinary
+    // polling evicts them within seconds, and "the app was stuck for 96s starting at 10:37:06"
+    // is exactly the finding that must survive until someone looks.
+    phoneDiagnostics: field(() => (runtime ? runtime.getPhoneDiagnostics() : []), []),
     // How the transcript's image inlining is actually doing: `attempted` counts the
     // image handles the reader was handed, `served` the ones whose bytes came back.
     // A photo that renders as a file chip is one of {no handle on the block, no

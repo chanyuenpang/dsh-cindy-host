@@ -1574,6 +1574,21 @@ export async function startHost(initialSource, settings = DEFAULT_HOST_SETTINGS,
    */
   const refusalLog = [];
   const REFUSAL_LOG_LIMIT = 60;
+  /**
+   * The phone's own diagnostics, kept apart from everything else and with their timestamps.
+   *
+   * A controller with no log of its own reports by invoking an unknown channel whose **name
+   * carries the reading** — `psdiag.s10.p0.a0.c0.o0` from device-link's peer-silence probe,
+   * `tdiag.stall.s96.r1.frame` / `tdiag.recover.after31s.r1.frame` from the mobile timer
+   * liveness guard. Every one of them is refused here, which is the point: refusal is the
+   * mailbox. Ordinary polling churns the rings above within seconds, so a stall that happened
+   * two minutes ago is unreadable by the time anyone asks. This ring is evicted only by more
+   * diagnostics, and each entry keeps the `at` the phone's report arrived at — the only
+   * timeline that exists for a stalled app.
+   */
+  const phoneDiagnostics = [];
+  const PHONE_DIAGNOSTIC_LIMIT = 40;
+  const PHONE_DIAGNOSTIC_PREFIXES = ['psdiag.', 'tdiag.'];
   /** Longest reply excerpt kept for a corpus read; enough to compare fields, not a data dump. */
   const INVOKE_PREVIEW_CHARS = 1200;
   const PREVIEW_CHANNELS = new Set([
@@ -1628,6 +1643,14 @@ export async function startHost(initialSource, settings = DEFAULT_HOST_SETTINGS,
       refusalTotals.set(served, (refusalTotals.get(served) ?? 0) + 1);
       refusalLog.push(entry);
       if (refusalLog.length > REFUSAL_LOG_LIMIT) refusalLog.splice(0, refusalLog.length - REFUSAL_LOG_LIMIT);
+      // A controller's self-report is the one refusal that carries evidence rather than a
+      // capability gap, and it is worthless without its arrival time.
+      if (PHONE_DIAGNOSTIC_PREFIXES.some((prefix) => served.startsWith(prefix))) {
+        phoneDiagnostics.push({ at: entry.at, channel: served, src: entry.src ?? null });
+        if (phoneDiagnostics.length > PHONE_DIAGNOSTIC_LIMIT) {
+          phoneDiagnostics.splice(0, phoneDiagnostics.length - PHONE_DIAGNOSTIC_LIMIT);
+        }
+      }
     }
   }
 
@@ -2183,6 +2206,8 @@ export async function startHost(initialSource, settings = DEFAULT_HOST_SETTINGS,
      */
     getInvokeTotals: () => Object.fromEntries(invokeTotals),
     getRefusalTotals: () => Object.fromEntries(refusalTotals),
+    /** The phone's own reports, oldest first, each with the time it arrived. */
+    getPhoneDiagnostics: () => phoneDiagnostics.slice(),
     /**
      * How the automatic reconnection is doing.
      *
