@@ -227,14 +227,60 @@ foreach ($bo in $bundleOutputs) {
   if (Test-Path $bo) { Remove-Item $bo -Recurse -Force -ErrorAction SilentlyContinue; Say "已删旧的 JS bundle 产物: $($bo.Replace($androidDir, 'android'))" }
 }
 
+# 上一次构建留下的 Gradle / Kotlin 守护进程会攥着 `node_modules` 里各库的 build 产物不放,
+# 下一次构建在 `bundleLibCompileToJarRelease` 上以
+#   Unable to delete file '...bundleLibCompileToJarRelease\classes.jar'
+# 失败(实测遇到两次,每次都要手工救火)。守护进程是 **必须** 先停的:文件句柄在它们手里,
+# 光删目录不行。这里做成前置步骤,失败也让 Gradle 自己给出原因而不是先删出错。
+Push-Location $androidDir
+try {
+  $daemons = Get-Process java -ErrorAction SilentlyContinue
+  if ($daemons) {
+    Say ("停止 Gradle 守护进程({0} 个 java 进程)后清理库构建产物" -f @($daemons).Count)
+    & .\gradlew.bat --stop 2>&1 | ForEach-Object { "    " + $_.ToString().Trim() }
+    # 句柄释放是异步的:等它们真的退出,再删目录。
+    for ($wait = 0; $wait -lt 20; $wait++) {
+      if (-not (Get-Process java -ErrorAction SilentlyContinue)) { break }
+      Start-Sleep -Milliseconds 500
+    }
+  }
+  $libraryBuilds = @(
+    (Join-Path $RepoPath 'node_modules\expo-modules-core\android\build'),
+    (Join-Path $RepoPath 'node_modules\expo-updates\android\build')
+  )
+  foreach ($lb in $libraryBuilds) {
+    if (-not (Test-Path $lb)) { continue }
+    for ($try = 0; $try -lt 3; $try++) {
+      Remove-Item $lb -Recurse -Force -ErrorAction SilentlyContinue
+      if (-not (Test-Path $lb)) { break }
+      Start-Sleep -Milliseconds 800
+    }
+    if (Test-Path $lb) { Say ("警告: 清不掉 $lb(仍有进程占用),构建可能会失败") }
+    else { Say ("已清库构建产物: " + $lb.Replace($RepoPath, '<repo>')) }
+  }
+} finally { Pop-Location }
+
 Push-Location $androidDir
 $sw = [System.Diagnostics.Stopwatch]::StartNew()
+# 完整 Gradle 输出落在这里(不在仓库目录里:`$RepoPath` 是 **Cindy 仓**,它没有 `.sandbox`,
+# 上一版补丁就因为这个写日志失败、把一次成功的构建误判成失败)。
+$gradleLog = Join-Path $env:TEMP 'cindy-verify-gradle.log'
 try {
   Say "gradlew assembleRelease -PreactNativeArchitectures=$Abi"
   & .\gradlew.bat assembleRelease "-PreactNativeArchitectures=$Abi" --max-workers=2 2>&1 |
+    Tee-Object -FilePath $gradleLog |
     Select-String -Pattern 'BUILD SUCCESSFUL|BUILD FAILED|FAILURE|actionable tasks|What went wrong' |
     ForEach-Object { "    " + $_.Line.Trim() }
-  if ($LASTEXITCODE -ne 0) { throw "构建失败;逐条原因见 doc/cindy-android-verify.md 第六节的坑清单" }
+  if ($LASTEXITCODE -ne 0) {
+    # 上一次失败时**看不到原因**(脚本只留 5 个关键词,原因行被丢掉),所以失败时把上下文打出来。
+    Say "Gradle 失败,原因行(完整输出见 $gradleLog):"
+    if (Test-Path $gradleLog) {
+      $lines = Get-Content $gradleLog
+      $at = ($lines | Select-String -Pattern 'What went wrong' | Select-Object -First 1).LineNumber
+      if ($at) { $lines[($at-1)..([Math]::Min($at + 12, $lines.Count - 1))] | ForEach-Object { "    " + $_ } }
+    }
+    throw "构建失败;逐条原因见 doc/cindy-android-verify.md 第六节的坑清单"
+  }
 } finally { Pop-Location }
 Say ("构建耗时 {0:N0} 秒" -f $sw.Elapsed.TotalSeconds)
 
