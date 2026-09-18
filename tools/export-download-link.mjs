@@ -14,7 +14,9 @@
  * Usage:
  *   node tools/export-download-link.mjs <relPath> [--workdir <dir>] [--host http://127.0.0.1:3080]
  */
-import { mediaApiBaseUrl } from '../src/host-media.js';
+import { readFile } from 'node:fs/promises';
+import { basename, extname } from 'node:path';
+import { createMediaUploader, mediaApiBaseUrl } from '../src/host-media.js';
 import { loadSession } from '../src/credential-store.js';
 
 const RELAY_WS_URL = 'wss://device-link.cindy.com.cn/api/device-link/ws';
@@ -43,25 +45,47 @@ const call = (payload) => fetch(`${hostUrl}/api/dsh-cindy-host/selftest`, {
   body: JSON.stringify(payload),
 }).then((response) => response.json());
 
-const start = await call({ channel: 'file-browser:remote-op', args: [{ op: 'exportFileStart', workdir, relPath }] });
-const startResult = start?.reply?.payload?.result;
-if (startResult?.ok !== true) {
-  console.error(`导出没能开始: ${JSON.stringify(startResult ?? start).slice(0, 300)}`);
-  process.exit(1);
-}
-console.log(`导出已开始: transferId=${startResult.transferId} size=${startResult.size}`);
-
 let key;
-let size = startResult.size;
-for (let attempt = 0; attempt < 90; attempt += 1) {
-  await new Promise((done) => setTimeout(done, 1_000));
-  const status = await call({ channel: 'file-browser:remote-op', args: [{ op: 'exportFileStatus', workdir, transferId: startResult.transferId }] });
-  const result = status?.reply?.payload?.result;
-  if (result?.state === 'done' && typeof result.key === 'string') { key = result.key; size = result.size ?? size; break; }
-  if (result?.state === 'error') { console.error(`导出失败: ${String(result.message)}`); process.exit(1); }
+let size;
+if (args.includes('--direct')) {
+  // 不经过运行中的 Host:它内存里可能还攥着一个已过期的会话(实测:存储里刷新过之后,
+  // Host 仍然 401 —— 它只在启动时读一次存储)。这条路直接用存储里的会话上传并签名。
+  const bytes = await readFile(relPath);
+  const upload = createMediaUploader({
+    apiBaseUrl: mediaApiBaseUrl(RELAY_WS_URL),
+    getSession: () => session,
+    timeoutMs: 10 * 60_000,
+  });
+  const staged = await upload(bytes, {
+    ext: extname(relPath).replace(/^\.+/, ''),
+    contentType: 'application/octet-stream',
+  });
+  if (staged.ok !== true) {
+    console.error(`直接上传失败: ${staged.reason}`);
+    process.exit(1);
+  }
+  key = staged.key;
+  size = bytes.length;
+  console.log(`已直接上传(${basename(relPath)}, ${bytes.length} 字节): ${key}`);
+} else {
+  const start = await call({ channel: 'file-browser:remote-op', args: [{ op: 'exportFileStart', workdir, relPath }] });
+  const startResult = start?.reply?.payload?.result;
+  if (startResult?.ok !== true) {
+    console.error(`导出没能开始: ${JSON.stringify(startResult ?? start).slice(0, 300)}`);
+    process.exit(1);
+  }
+  console.log(`导出已开始: transferId=${startResult.transferId} size=${startResult.size}`);
+  size = startResult.size;
+  for (let attempt = 0; attempt < 90; attempt += 1) {
+    await new Promise((done) => setTimeout(done, 1_000));
+    const status = await call({ channel: 'file-browser:remote-op', args: [{ op: 'exportFileStatus', workdir, transferId: startResult.transferId }] });
+    const result = status?.reply?.payload?.result;
+    if (result?.state === 'done' && typeof result.key === 'string') { key = result.key; size = result.size ?? size; break; }
+    if (result?.state === 'error') { console.error(`导出失败: ${String(result.message)}`); process.exit(1); }
+  }
+  if (key === undefined) { console.error('导出超时'); process.exit(1); }
+  console.log(`已暂存: ${key}`);
 }
-if (key === undefined) { console.error('导出超时'); process.exit(1); }
-console.log(`已暂存: ${key}`);
 
 const presign = await fetch(`${mediaApiBaseUrl(RELAY_WS_URL)}/media/presign-get`, {
   method: 'POST',
