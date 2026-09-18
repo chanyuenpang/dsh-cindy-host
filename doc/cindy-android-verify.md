@@ -294,12 +294,24 @@ Host 同时刻:推送一直在发(watchers=1)、订阅在、reconnect=0、handle
 入站帧与回前台这两个**不经过计时器**的事件当检查点,心跳间隙 ≥3 秒判定停摆 → 重建心跳 +
 重连/rehydrate,并上报 `tdiag.stall.s<秒>.r<次数>.<来源>` / `tdiag.recover.after<秒>s.r<次数>.<来源>`。
 
-**第二层(commit `HEAD`,即使重建救不回来界面也能恢复)**:取证精确到了那一跳 ——
+**第二层(即使重建救不回来界面也能恢复)**:取证精确到了那一跳 ——
 push → `historyView.invalidate()` → **`setTimeout(500ms)`** → 重读
-(`packages/maker-shared/src/historyViewController.ts:116-122`)。计时器停摆时这一跳永不执行,
+(`packages/maker-shared/src/historyViewController.ts`)。计时器停摆时这一跳永不执行,
 所以「推送一直在到、界面永不刷新、手机一次 `messages:view` 都不再发」。现在:
 `HistoryViewController` 接受注入的 `timersHealthy` 判定,判定为停摆时改用**挂钟节流
 300ms + 立即重读**(不依赖任何定时器);「思考时间」的显示值也改为渲染时按真实时间算。
+
+**第三层(用户真机反馈后补的最后一环)**:「进会话页思考时间不动,退到列表再进来会更新一次,
+但不实时更新」—— `remoteSessionStore` 的流式文本增量批量刷新(`scheduleTextDeltaFlush`)把
+`flushPendingTextDeltas` 排在 `setTimeout` 上,而**该函数只在那一个回调里**被调用:
+计时器停摆时增量永远停在缓冲里,退出再进走整页重读所以只更新一次(用户描述与机制一字不差)。
+停摆时改为**直接刷**(正常批量间隔本来只有 32–96ms,同量级;也不会有"最后一批增量滞留"的风险)。
+
+**第四层(用户提出的"回前台强制重刷")**:回前台的重新订阅 + 重读其实一直在做
+(`rehydrateWithClient`,日志 10:37:03–06 那一串),但它是**一次性**的。用户补上关键一半:
+「退到列表再进来就恢复」的本质是**数据层整体换代**,而 `connectionEpoch` 只在**客户端重连成功**
+时才换代 —— 停摆时没有重连,所以屏幕各层 effect 都不重跑。现在**判定停摆时也换代一次**
+(只在这个降级态做,不在每次回前台都做)。
 
 **判据(不靠肉眼)**:
 
