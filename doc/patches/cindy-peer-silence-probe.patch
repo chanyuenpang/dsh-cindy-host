@@ -1,0 +1,1112 @@
+From eadedb8d5b1014e4c2ee4885e7ee55532c857714 Mon Sep 17 00:00:00 2001
+From: Yop <chanyuenpang@hotmail.com>
+Date: Fri, 18 Sep 2026 01:55:44 +0800
+Subject: [PATCH 1/5] =?UTF-8?q?fix(device-link):=20peer=20=E7=BA=A7?=
+ =?UTF-8?q?=E9=9D=99=E9=BB=98=E6=8E=A2=E9=92=88,=E4=BF=AE=E5=A4=8D?=
+ =?UTF-8?q?=E5=9B=9E=E5=89=8D=E5=8F=B0=E5=90=8E=E5=AF=B9=E7=AB=AF=E6=96=B9?=
+ =?UTF-8?q?=E5=90=91=E5=93=91=E6=8E=89=E5=8D=B4=E4=B8=8D=E9=87=8D=E5=BB=BA?=
+MIME-Version: 1.0
+Content-Type: text/plain; charset=UTF-8
+Content-Transfer-Encoding: 8bit
+
+挑照片回前台后 socket 半开时,relay 每 10s 的 pong 会让既有半开检测永久失明:
+手机端 pingIntervalMs=10s / pongMissLimit=1,判死条件是「20s 内没有任何入站帧」,
+而 relay 自己应答的 pong 恰好每 10s 刷新一次 —— 所有既有判据量的都是
+「本机↔relay」,量不到「对端方向」。实测:手机每秒重试同一个读、2.5 分钟不恢复,
+只有重启 App 才恢复。
+
+新增 opt-in 的 peer 级判据(peerSilenceProbeMs,默认 0 = 关闭,桌面端曲线不变):
+- 只有带 src 的 routed 帧算「对端还在说话」,pong/presence 不算;
+- 同一 peer 连续两次请求超时且对端持续静默 → restartConnection(自带 link 复位);
+- 回前台探针改以对端活性作为「relay 可达」的证据,并要求已存在超时证据,
+  避免把长执行通道(desktop-cmd:run 等)运行期间的正常静默打成失败;
+- relay 已判定 DEVICE_OFFLINE 时不介入;同一窗口内最多重建一次。
+
+手机端显式开启 20_000ms(需 ≥ requestTimeoutMs,否则第二次超时时静默凑不满窗口)。
+新增 5 条单测;device-link 414/414。
+
+Signed-off-by: Yop <chanyuenpang@hotmail.com>
+---
+ .../src/device-link/DeviceLinkContext.tsx     |   9 ++
+ .../device-link/src/__tests__/client.test.ts  | 152 ++++++++++++++++++
+ packages/device-link/src/client.ts            | 133 ++++++++++++++-
+ 3 files changed, 292 insertions(+), 2 deletions(-)
+
+diff --git a/apps/mobile/src/device-link/DeviceLinkContext.tsx b/apps/mobile/src/device-link/DeviceLinkContext.tsx
+index bd1727d3c..71855eeba 100644
+--- a/apps/mobile/src/device-link/DeviceLinkContext.tsx
++++ b/apps/mobile/src/device-link/DeviceLinkContext.tsx
+@@ -838,6 +838,15 @@ export function DeviceLinkProvider({ children }: { children: ReactNode }) {
+         // worktree:create / schedule 等)在 sendInvoke 按 invokeTimeouts 解析规则单独放宽,
+         // 与桌面控制端同一张协议契约表,不受此默认值影响。
+         requestTimeoutMs: 15_000,
++        // peer 级静默探针(2026-09-17 实测)。挑照片回前台后 socket 半开时:上面的
++        // 心跳只量「本机↔relay」,而 relay 每 10s 主动回一次 pong,于是「20s 内有
++        // 任意入站帧就清零」让半开检测永久失明 —— 手机每秒重试同一个读、2.5 分钟
++        // 不恢复,只有重启 App 才恢复。开启后追加一条**对端**活性判据:同一 peer
++        // 连续两次请求超时、且这 20s 内对端一个带 src 的帧都没发 → 强制重建连接
++        // (restartConnection 会一并复位 link 状态,host 侧重开链路)。
++        // 窗口必须 ≥ requestTimeoutMs(15s),否则第二次超时时静默时长还凑不满窗口;
++        // 两次超时是刻意的门槛:单次慢请求(桌面正忙)不该拆掉共享 socket。
++        peerSilenceProbeMs: 20_000,
+       },
+     });
+     clientRef.current = client;
+diff --git a/packages/device-link/src/__tests__/client.test.ts b/packages/device-link/src/__tests__/client.test.ts
+index dee0caa8b..1f7c9f334 100644
+--- a/packages/device-link/src/__tests__/client.test.ts
++++ b/packages/device-link/src/__tests__/client.test.ts
+@@ -8744,3 +8744,155 @@ describe('定时重发的单趟预算(TRANSPORT_RETRY_PASS_BUDGET)', () => {
+     h.client.stop();
+   }, 10_000);
+ });
++
++/**
++ * peer 级静默探针(2026-09-17 安卓端实测的补偿机制)。
++ *
++ * 现场:挑照片回前台后 socket 半开,手机每秒重试同一个读、2.5 分钟不恢复,只有重启
++ * App 才恢复。原因是**所有既有活性判据都是 relay 级**的:relay 每 10s 回一次 pong,
++ * 手机的半开检测(`client.ts` 心跳)「20 秒内有任意入站帧就清零」因此永久失明。
++ * 这里断言新增的 peer 级判据:只有带 `src` 的对端帧算「对端还在说话」。
++ */
++describe('peer 级静默探针', () => {
++  it('默认关闭:relay 可达但对端全程静默,连续请求超时也不重建共享 socket', async () => {
++    // pingIntervalMs 拉长把「本机↔relay」的判死逻辑摘出去:这样唯一可能重建的
++    // 只有 peer 级探针,断言才有意义。
++    const h = makeHarness({ timing: { pingIntervalMs: 60_000, requestTimeoutMs: 20 } });
++    h.client.start();
++    await tick();
++    const socket = h.current();
++    socket.ack();
++
++    await expect(h.client.invoke('dev-b', { channel: 'x', args: [] }, 20))
++      .rejects.toMatchObject({ code: 'INVOKE_TIMEOUT' });
++    await expect(h.client.invoke('dev-b', { channel: 'x', args: [] }, 20))
++      .rejects.toMatchObject({ code: 'INVOKE_TIMEOUT' });
++    await tick(40);
++
++    expect(h.sockets).toHaveLength(1);
++    h.client.stop();
++  });
++
++  it('开启后:同一 peer 连续两次超时且对端持续静默 → 强制重建连接', async () => {
++    const h = makeHarness({
++      timing: { pingIntervalMs: 60_000, requestTimeoutMs: 20, peerSilenceProbeMs: 35 },
++    });
++    h.client.start();
++    await tick();
++    const socket = h.current();
++    socket.ack();
++
++    // 第一次超时:连续计数只有 1,单次慢请求不拆链路。
++    await expect(h.client.invoke('dev-b', { channel: 'x', args: [] }, 20))
++      .rejects.toMatchObject({ code: 'INVOKE_TIMEOUT' });
++    await tick(5);
++    expect(h.sockets).toHaveLength(1);
++
++    // 第二次超时:连续两次 + 静默已过窗口 → 重建。
++    await expect(h.client.invoke('dev-b', { channel: 'x', args: [] }, 20))
++      .rejects.toMatchObject({ code: 'INVOKE_TIMEOUT' });
++    await tick(30);
++
++    expect(h.sockets.length).toBeGreaterThan(1);
++    expect(socket.terminated || socket.closed !== null).toBe(true);
++    h.client.stop();
++  });
++
++  it('开启后:对端仍有帧(带 src)时永不判定静默', async () => {
++    const h = makeHarness({
++      timing: { pingIntervalMs: 60_000, requestTimeoutMs: 20, peerSilenceProbeMs: 35 },
++    });
++    h.client.start();
++    await tick();
++    const socket = h.current();
++    socket.ack();
++
++    await expect(h.client.invoke('dev-b', { channel: 'x', args: [] }, 20))
++      .rejects.toMatchObject({ code: 'INVOKE_TIMEOUT' });
++    // 对端发来一帧:连续超时计数清零,静默窗口重新开始计时。
++    socket.push({
++      v: PROTOCOL_VERSION,
++      kind: 'push',
++      src: 'dev-b',
++      payload: { channel: 'demo', payload: {} },
++    });
++    await expect(h.client.invoke('dev-b', { channel: 'x', args: [] }, 20))
++      .rejects.toMatchObject({ code: 'INVOKE_TIMEOUT' });
++    await tick(30);
++
++    expect(h.sockets).toHaveLength(1);
++    h.client.stop();
++  });
++
++  it('开启后:relay 已判定该 peer 离线时不重建(DEVICE_OFFLINE 是路由事实)', async () => {
++    const h = makeHarness({
++      timing: { pingIntervalMs: 60_000, requestTimeoutMs: 20, peerSilenceProbeMs: 35 },
++    });
++    h.client.start();
++    await tick();
++    const socket = h.current();
++    socket.ack();
++
++    const offline = h.client.invoke('dev-b', { channel: 'x', args: [] }, 20);
++    const sent = socket.sent.find((e) => e.kind === 'invoke')!;
++    socket.push({
++      v: PROTOCOL_VERSION,
++      kind: 'relay-error',
++      id: sent.id,
++      payload: { code: 'DEVICE_OFFLINE', message: 'offline' },
++    });
++    await expect(offline).rejects.toMatchObject({ code: 'DEVICE_OFFLINE' });
++
++    await expect(h.client.invoke('dev-b', { channel: 'x', args: [] }, 20))
++      .rejects.toMatchObject({ code: 'INVOKE_TIMEOUT' });
++    await expect(h.client.invoke('dev-b', { channel: 'x', args: [] }, 20))
++      .rejects.toMatchObject({ code: 'INVOKE_TIMEOUT' });
++    await tick(30);
++
++    expect(h.sockets).toHaveLength(1);
++    h.client.stop();
++  });
++
++  it('开启后:回前台探针只在「确实在等对端回包」时才重建', async () => {
++    vi.useFakeTimers();
++    // peerSilenceProbeMs 取 1ms:这一条断言的是**闸门**(有没有 pending),
++    // 不依赖窗口长度,避免在 fake timers 下把断言压在时钟精度上。
++    const h = makeHarness({
++      timing: { pingIntervalMs: 60_000, peerSilenceProbeMs: 1 },
++    });
++    try {
++      h.client.start();
++      await vi.advanceTimersByTimeAsync(0);
++      const socket = h.current();
++      socket.ack();
++
++      // (1) 空闲回前台:没有在途请求 → 探针超时也不该拆掉健康的共享 socket。
++      h.client.notifyNetworkChanged({ urgent: true });
++      await vi.advanceTimersByTimeAsync(16_000);
++      expect(h.sockets).toHaveLength(1);
++
++      // (2) 有 pending 但**还没有任何超时证据** → 也不重建:长执行通道运行期间
++      //     被控端本来就可能几十秒不发帧,那种请求不该被探针打成失败。
++      const inFlight = h.client.invoke('dev-b', { channel: 'x', args: [] }, 60_000);
++      void inFlight.catch(() => {});
++      h.client.notifyNetworkChanged({ urgent: true });
++      await vi.advanceTimersByTimeAsync(16_000);
++      expect(h.sockets).toHaveLength(1);
++
++      // (3) 已经有过一次「等不到对端而超时」+ 仍在等回包 → 探针超时后重建。
++      const timedOut = h.client.invoke('dev-b', { channel: 'x', args: [] }, 20);
++      const timedOutAssertion = expect(timedOut).rejects
++        .toMatchObject({ code: 'INVOKE_TIMEOUT' });
++      await vi.advanceTimersByTimeAsync(25);
++      await timedOutAssertion;
++      expect(h.sockets).toHaveLength(1);
++
++      h.client.notifyNetworkChanged({ urgent: true });
++      await vi.advanceTimersByTimeAsync(16_000);
++      expect(h.sockets.length).toBeGreaterThan(1);
++    } finally {
++      h.client.stop();
++      vi.useRealTimers();
++    }
++  });
++});
+diff --git a/packages/device-link/src/client.ts b/packages/device-link/src/client.ts
+index 165359098..169005ceb 100644
+--- a/packages/device-link/src/client.ts
++++ b/packages/device-link/src/client.ts
+@@ -247,6 +247,24 @@ export interface DeviceLinkTiming {
+   pongMissLimit: number;
+   /** invoke / link-open 默认等待响应时长 */
+   requestTimeoutMs: number;
++  /**
++   * peer 级静默探针窗口(ms,0 = 关闭)。
++   *
++   * 心跳判死(pongMisses)量的是**本机↔relay**:`pong` 由 relay 自己应答(线上契约),
++   * 所以只要 relay 还在回 pong,对端方向整个哑掉也永远 online、永远不重建。
++   * 2026-09-17 安卓端实测:挑照片回前台后 socket 半开,手机每秒重试同一个读、
++   * 持续 2.5 分钟不恢复,只有重启 App 才恢复(手机侧 pingIntervalMs=10s /
++   * pongMissLimit=1,10s 一次的 pong 恰好让它的半开检测永久失明)。
++   *
++   * 开启后追加一条**peer 级**判据:只有带 `src` 的 routed 帧才算「对端还在说话」
++   * (pong/presence 由 relay 产生,不算),并且要求更强的证据才动手:
++   * - 同一 peer **连续两个**请求超时(中间收到它的任何一帧即作废;单次慢请求不拆共享 socket);
++   * - relay 未判定该 peer 离线(DEVICE_OFFLINE 是路由事实,不是 socket 问题);
++   * - 同一窗口内最多重建一次。
++   *
++   * 默认 0 = 关闭,桌面端既有曲线不变;目前只有手机端显式开启。
++   */
++  peerSilenceProbeMs: number;
+   /**
+    * getToken 的等待上限。token 刷新可能走网络(移动端弱网下可能长时间无响应),
+    * 不设上限时 connect 会卡在 connecting 且没有任何重连计时器兜底。
+@@ -305,6 +323,7 @@ const DEFAULT_TIMING: DeviceLinkTiming = {
+   // 允许弱网在一个额外周期内恢复；真正无响应仍由连续 miss + 无入站流量判定。
+   pongMissLimit: 3,
+   requestTimeoutMs: 30_000,
++  peerSilenceProbeMs: 0,
+   getTokenTimeoutMs: 15_000,
+   handshakeTimeoutMs: 15_000,
+   transportRetryIntervalMs: TRANSPORT_RETRY_INTERVAL_MS,
+@@ -670,6 +689,15 @@ export class DeviceLinkClient {
+   private pongMisses = 0;
+   /** 最近一次收到任何有效 relay 帧的时刻；避免把有业务流量的 socket 误判为僵死。 */
+   private lastInboundAt = 0;
++  /**
++   * 最近一次收到**对端帧**(带 relay 注入的 `src`)的时刻。relay 自己应答的
++   * pong / presence 不算:它们只证明 relay 可达,不证明对端方向还通。
++   */
++  private lastPeerInboundAt = 0;
++  /** peer 级静默重建的限速时间戳:同一窗口内最多重建一次,防重连风暴。 */
++  private peerSilenceRebuildAt = 0;
++  /** 每个 peer 的连续请求超时次数(收到该 peer 的帧即清零)。 */
++  private readonly peerTimeoutStreak = new Map<string, number>();
+   private networkChangeTimer: ReturnType<typeof setTimeout> | null = null;
+   private networkProbeTimer: ReturnType<typeof setTimeout> | null = null;
+   private networkProbeStartedAt = 0;
+@@ -857,7 +885,13 @@ export class DeviceLinkClient {
+       }
+       // Activity after the latest hint already proves this relay is reachable.
+       // Do not compare Wi-Fi labels: switching access points can keep them equal.
+-      if (this.lastInboundAt > this.networkChangeHintedAt) return;
++      // peer 级探针开启时改用**对端**活性:relay 自己回的 pong 每 10s 刷新
++      // lastInboundAt,拿它当可达证据会让这条探针在真机上恒为空转(实测见
++      // peerSilenceProbeMs 的说明)。
++      const activityAt = this.peerSilenceProbeEnabled()
++        ? this.lastPeerInboundAt
++        : this.lastInboundAt;
++      if (activityAt > this.networkChangeHintedAt) return;
+       const epoch = this.connEpoch;
+       const socket = this.ws;
+       const startedAt = this.monotonicNow();
+@@ -869,6 +903,17 @@ export class DeviceLinkClient {
+         this.networkProbeTimer = null;
+         if (this.stopped || this.connEpoch !== epoch || this.ws !== socket) return;
+         this.log.info(`network probe timed out (elapsedMs=${this.monotonicNow() - startedAt})`);
++        const now = this.monotonicNow();
++        // peer 级探针开启时,只有「本机确实在等对端回包、且对端一直没说话」才重建:
++        // 空闲回前台本来就没有对端帧,为此重建共享 socket 只会带来无谓抖动。
++        if (
++          this.peerSilenceProbeEnabled()
++          && !this.shouldRebuildForPeerSilence(now, undefined, { requirePending: true })
++        ) {
++          this.log.debug('network probe timed out without peer silence evidence; retaining socket');
++          return;
++        }
++        if (this.peerSilenceProbeEnabled()) this.peerSilenceRebuildAt = now;
+         this.restartConnection('network-probe-timeout');
+       }, Math.max(DEFAULT_TIMING.handshakeTimeoutMs, this.timing.handshakeTimeoutMs));
+       try {
+@@ -889,6 +934,74 @@ export class DeviceLinkClient {
+     this.networkProbeNextAllowedAt = 0;
+   }
+ 
++  /** peer 级静默探针是否开启(默认关闭,桌面端既有曲线不变)。 */
++  private peerSilenceProbeEnabled(): boolean {
++    return this.timing.peerSilenceProbeMs > 0;
++  }
++
++  /**
++   * 是否已能判定「对端方向哑到必须重建连接」。
++   *
++   * 刻意保守:relay 已判定该 peer 离线时不动手(DEVICE_OFFLINE 是路由事实,不是
++   * socket 问题);同一窗口内最多重建一次,避免重连风暴。
++   */
++  private shouldRebuildForPeerSilence(
++    now: number,
++    dst: string | undefined,
++    opts?: { requirePending?: boolean },
++  ): boolean {
++    const window = this.timing.peerSilenceProbeMs;
++    if (!(window > 0)) return false;
++    if (this.status !== 'online') return false;
++    // 0 = 本次生命周期内还没重建过(单调时钟的绝对值可能很小,不能只比差值)。
++    if (this.peerSilenceRebuildAt !== 0 && now - this.peerSilenceRebuildAt < window) return false;
++    if (dst !== undefined && this.peerOfflineNotifiedGeneration.has(dst)) return false;
++    if (opts?.requirePending === true && !this.hasPeerTimeoutEvidence()) return false;
++    return now - this.lastPeerInboundAt >= window;
++  }
++
++  /**
++   * 是否已经有「请求等不到对端而超时」的证据,且此刻仍有请求在等回包。
++   *
++   * 回前台探针只凭「有 pending」还不足以拆共享 socket:长执行通道
++   * (desktop-cmd:run / worktree:create 等按通道放宽超时的请求)运行期间被控端
++   * 本来就可能几十秒不发一个帧,那时重建会把**正在执行**的命令打成失败。
++   * 超时证据天然排除这种请求——它们的超时被放宽到分钟级,不会先超时。
++   */
++  private hasPeerTimeoutEvidence(): boolean {
++    if (this.pending.size === 0) return false;
++    for (const [deviceId, streak] of this.peerTimeoutStreak) {
++      if (streak < 1) continue;
++      if (this.peerOfflineNotifiedGeneration.has(deviceId)) continue;
++      return true;
++    }
++    return false;
++  }
++
++  /**
++   * 记录一次请求超时,并在「同一 peer 连续两次超时 + 对端持续静默」时重建连接。
++   *
++   * 连续计数不需要额外的时间窗:收到该 peer 的任一帧(`handleFrame`)、或本次重建
++   * 之后就清零,所以「连续两次」必然意味着这两次之间对端一个字都没说 —— 那正是要
++   * 抓的形态。加窗口反而会在测试/CI 的真实开销下把证据判散。
++   */
++  private notePeerRequestTimeout(dst: string, now: number): void {
++    const window = this.timing.peerSilenceProbeMs;
++    if (!(window > 0)) return;
++    const streak = (this.peerTimeoutStreak.get(dst) ?? 0) + 1;
++    this.peerTimeoutStreak.set(dst, streak);
++    if (streak < 2) return;
++    if (!this.shouldRebuildForPeerSilence(now, dst)) return;
++    this.peerSilenceRebuildAt = now;
++    this.peerTimeoutStreak.delete(dst);
++    this.log.warn(
++      'peer silence detected, forcing reconnect'
++      + ` (peer=${dst}, silentForMs=${now - this.lastPeerInboundAt},`
++      + ` pending=${this.pending.size}, timeouts=${streak})`,
++    );
++    this.restartConnection('peer-silence');
++  }
++
+   /**
+    * 有界等待连接就绪。online 立即 resolve;否则订阅状态变化,在 timeoutMs 内
+    * 等到 online 就 resolve,超时 / stopped 则 reject(NOT_CONNECTED)。
+@@ -1486,6 +1599,9 @@ export class DeviceLinkClient {
+         if (env.dst) this.settleOutboundRouteAttemptsForId(env.dst, id);
+         if (env.dst && env.kind === 'invoke') this.dropReliablePendingForRequest(env.dst, id);
+         logFinished('timeout');
++        // peer 级探针:同一 peer 连续两个请求超时(中间对端一个字都没说),才认为
++        // 「对端方向整体哑了」并重建共享 socket —— 单次慢请求(桌面正忙)不足以拆链路。
++        if (env.dst) this.notePeerRequestTimeout(env.dst, this.monotonicNow());
+         reject(new DeviceLinkError('INVOKE_TIMEOUT', `no ${expectKind} within ${timeout}ms`));
+       }, timeout);
+ 
+@@ -1910,6 +2026,9 @@ export class DeviceLinkClient {
+     }
+     this.pongMisses = 0;
+     this.lastInboundAt = this.monotonicNow();
++    this.lastPeerInboundAt = this.lastInboundAt;
++    // 新连接:上一代的连续超时计数不再适用(限速时间戳仍保留,防跨代重连风暴)。
++    this.peerTimeoutStreak.clear();
+     this.pingTimer = setInterval(() => {
+       if (this.status !== 'online') return;
+       const now = this.monotonicNow();
+@@ -2033,7 +2152,17 @@ export class DeviceLinkClient {
+     }
+     if (validForHeartbeat) {
+       this.lastInboundAt = this.monotonicNow();
+-      if (this.networkProbeTimer) {
++      // relay 注入的 `src` = 这帧来自某个对端设备。只有这类帧能证明**对端方向**通;
++      // pong/presence 由 relay 自己产生,只能证明 relay 可达。
++      const peerSource = typeof env.src === 'string' && env.src.length > 0 ? env.src : null;
++      if (peerSource !== null) {
++        this.lastPeerInboundAt = this.lastInboundAt;
++        // 对端又说话了:它的连续超时计数不再成立。
++        this.peerTimeoutStreak.delete(peerSource);
++      }
++      // peer 级探针开启时,「relay 可达」也必须由对端帧来证明:relay 自己回的 pong
++      // 每 10s 刷新 lastInboundAt,拿它当确认会让这条探针在真机上恒为空转。
++      if (this.networkProbeTimer && (peerSource !== null || !this.peerSilenceProbeEnabled())) {
+         clearTimeout(this.networkProbeTimer);
+         this.networkProbeTimer = null;
+         this.networkProbeNextAllowedAt = this.lastInboundAt + 3_000;
+-- 
+2.52.0.windows.1
+
+
+From 308b4badc974dd79be598964bb809ff38fd5bf0f Mon Sep 17 00:00:00 2001
+From: Yop <chanyuenpang@hotmail.com>
+Date: Fri, 18 Sep 2026 16:28:55 +0800
+Subject: [PATCH 2/5] =?UTF-8?q?fix(device-link):=20=E5=9B=9E=E5=89=8D?=
+ =?UTF-8?q?=E5=8F=B0=E6=8E=A2=E9=92=88=E4=B8=8D=E5=86=8D=E8=A6=81=E6=B1=82?=
+ =?UTF-8?q?=E3=80=8C=E5=85=88=E6=9C=89=E8=BF=87=E4=B8=80=E6=AC=A1=E8=AF=B7?=
+ =?UTF-8?q?=E6=B1=82=E8=B6=85=E6=97=B6=E3=80=8D?=
+MIME-Version: 1.0
+Content-Type: text/plain; charset=UTF-8
+Content-Transfer-Encoding: 8bit
+
+现场(2026-09-18):装上带 peerSilenceProbeMs 的包后,后台断线仍然不恢复。原因是判据
+设计过严 —— 升级需要「同一 peer 连续两次请求超时」,而回前台后 App 往往只发一轮请求
+(每个只超时一次),连续计数永远到不了 2;回前台探针那条路又额外要求「已存在超时证据」,
+于是两条路都永远不会重建。
+
+改为:探针超时(= 提示之后一个对端帧都没来)本身就是证据,只要此刻确实有**短超时**
+业务请求在等回包就重建。长执行通道(desktop-cmd:run / worktree:create 等分钟级超时)用
+请求自己的生效超时排除,不再依赖「先超时过一次」。
+
+- PendingRequest 记录生效 timeoutMs
+- hasPeerTimeoutEvidence → hasPromptAwaitingReply(短超时 = <= 窗口*2)
+- 探针路径传 { requirePromptRequest: true, silenceProven: true }
+- 单测:空闲回前台不重建 / 长执行通道不重建 / 短超时请求+探针超时 → 重建
+
+device-link 414/414。
+
+Signed-off-by: Yop <chanyuenpang@hotmail.com>
+---
+ .../device-link/src/__tests__/client.test.ts  | 30 +++++------
+ packages/device-link/src/client.ts            | 52 +++++++++++++------
+ 2 files changed, 48 insertions(+), 34 deletions(-)
+
+diff --git a/packages/device-link/src/__tests__/client.test.ts b/packages/device-link/src/__tests__/client.test.ts
+index 1f7c9f334..d6890a3c3 100644
+--- a/packages/device-link/src/__tests__/client.test.ts
++++ b/packages/device-link/src/__tests__/client.test.ts
+@@ -8853,12 +8853,14 @@ describe('peer 级静默探针', () => {
+     h.client.stop();
+   });
+ 
+-  it('开启后:回前台探针只在「确实在等对端回包」时才重建', async () => {
++  it('开启后:回前台探针只在「有短超时请求在等回包」时才重建', async () => {
+     vi.useFakeTimers();
+-    // peerSilenceProbeMs 取 1ms:这一条断言的是**闸门**(有没有 pending),
+-    // 不依赖窗口长度,避免在 fake timers 下把断言压在时钟精度上。
++    // 窗口 20s ⇒「短超时」的界线 = window*2 = 40s:25s 的普通请求算在等答复,
++    // 10 分钟的长执行通道不算。现场修正(2026-09-18):原先探针还要求「先有过一次请求
++    // 超时」,而回前台后 App 往往只发一轮请求(每个只超时一次),连续计数到不了 2,
++    // 于是探针永远不会重建 —— 这正是「装了带修复的包仍然不恢复」。
+     const h = makeHarness({
+-      timing: { pingIntervalMs: 60_000, peerSilenceProbeMs: 1 },
++      timing: { pingIntervalMs: 60_000, peerSilenceProbeMs: 20_000 },
+     });
+     try {
+       h.client.start();
+@@ -8866,27 +8868,21 @@ describe('peer 级静默探针', () => {
+       const socket = h.current();
+       socket.ack();
+ 
+-      // (1) 空闲回前台:没有在途请求 → 探针超时也不该拆掉健康的共享 socket。
++      // (1) 空闲回前台:没有在等答复 → 探针超时也不该拆掉健康的共享 socket。
+       h.client.notifyNetworkChanged({ urgent: true });
+       await vi.advanceTimersByTimeAsync(16_000);
+       expect(h.sockets).toHaveLength(1);
+ 
+-      // (2) 有 pending 但**还没有任何超时证据** → 也不重建:长执行通道运行期间
+-      //     被控端本来就可能几十秒不发帧,那种请求不该被探针打成失败。
+-      const inFlight = h.client.invoke('dev-b', { channel: 'x', args: [] }, 60_000);
+-      void inFlight.catch(() => {});
++      // (2) 长执行通道在跑(分钟级超时)→ 不算「在等答复」,不拆 socket。
++      const longRun = h.client.invoke('dev-b', { channel: 'desktop-cmd:run', args: [] }, 600_000);
++      void longRun.catch(() => {});
+       h.client.notifyNetworkChanged({ urgent: true });
+       await vi.advanceTimersByTimeAsync(16_000);
+       expect(h.sockets).toHaveLength(1);
+ 
+-      // (3) 已经有过一次「等不到对端而超时」+ 仍在等回包 → 探针超时后重建。
+-      const timedOut = h.client.invoke('dev-b', { channel: 'x', args: [] }, 20);
+-      const timedOutAssertion = expect(timedOut).rejects
+-        .toMatchObject({ code: 'INVOKE_TIMEOUT' });
+-      await vi.advanceTimersByTimeAsync(25);
+-      await timedOutAssertion;
+-      expect(h.sockets).toHaveLength(1);
+-
++      // (3) 有短超时请求在等回包 + 探针已证明「这 15 秒一个对端帧都没来」→ 重建。
++      const prompt = h.client.invoke('dev-b', { channel: 'x', args: [] }, 25_000);
++      void prompt.catch(() => {});
+       h.client.notifyNetworkChanged({ urgent: true });
+       await vi.advanceTimersByTimeAsync(16_000);
+       expect(h.sockets.length).toBeGreaterThan(1);
+diff --git a/packages/device-link/src/client.ts b/packages/device-link/src/client.ts
+index 169005ceb..049c1d99a 100644
+--- a/packages/device-link/src/client.ts
++++ b/packages/device-link/src/client.ts
+@@ -502,6 +502,11 @@ interface PendingRequest {
+   reliableDst?: string;
+   /** 请求真正发出时所属的 peer link 代次，供迟到 relay-error 归属。 */
+   linkGeneration?: number;
++  /**
++   * 本次请求的生效超时。peer 级静默探针据此区分「App 在等一个答复」与
++   * 「长执行通道在跑」——后者的超时被放宽到分钟级,不能拿来当重建证据。
++   */
++  timeoutMs?: number;
+   /** peer reset 时让 host 快速结束本次等待，由 host 重开后决定是否重试。 */
+   retryAfterPeerReset?: () => void;
+ }
+@@ -904,13 +909,17 @@ export class DeviceLinkClient {
+         if (this.stopped || this.connEpoch !== epoch || this.ws !== socket) return;
+         this.log.info(`network probe timed out (elapsedMs=${this.monotonicNow() - startedAt})`);
+         const now = this.monotonicNow();
+-        // peer 级探针开启时,只有「本机确实在等对端回包、且对端一直没说话」才重建:
+-        // 空闲回前台本来就没有对端帧,为此重建共享 socket 只会带来无谓抖动。
++        // peer 级探针开启时:探针本身已经证明「提示之后一个对端帧都没来」,只要此刻
++        // 确实有**短超时**请求在等回包就重建;空闲回前台(没有在等答复)不重建,
++        // 长执行通道(分钟级超时)也不算证据。
+         if (
+           this.peerSilenceProbeEnabled()
+-          && !this.shouldRebuildForPeerSilence(now, undefined, { requirePending: true })
++          && !this.shouldRebuildForPeerSilence(now, undefined, {
++            requirePromptRequest: true,
++            silenceProven: true,
++          })
+         ) {
+-          this.log.debug('network probe timed out without peer silence evidence; retaining socket');
++          this.log.debug('network probe timed out without a prompt request awaiting the peer; retaining socket');
+           return;
+         }
+         if (this.peerSilenceProbeEnabled()) this.peerSilenceRebuildAt = now;
+@@ -944,11 +953,18 @@ export class DeviceLinkClient {
+    *
+    * 刻意保守:relay 已判定该 peer 离线时不动手(DEVICE_OFFLINE 是路由事实,不是
+    * socket 问题);同一窗口内最多重建一次,避免重连风暴。
++   *
++   * @param opts.requirePromptRequest 只认「**短超时**业务请求在等回包」这条证据。
++   *   回前台探针用它。2026-09-18 现场修正:原先探针还要求「先有过一次请求超时」,
++   *   而回前台后 App 往往只发一轮请求(每个只超时一次),连续超时计数永远到不了 2,
++   *   于是**探针永远不会重建** —— 这正是「装了带修复的包仍然不恢复」的原因。
++   * @param opts.silenceProven 探针本身已证明「提示之后一个对端帧都没来」,不必再等满
++   *   静默窗口(探针只等一个握手窗口,通常短于该窗口)。
+    */
+   private shouldRebuildForPeerSilence(
+     now: number,
+     dst: string | undefined,
+-    opts?: { requirePending?: boolean },
++    opts?: { requirePromptRequest?: boolean; silenceProven?: boolean },
+   ): boolean {
+     const window = this.timing.peerSilenceProbeMs;
+     if (!(window > 0)) return false;
+@@ -956,24 +972,25 @@ export class DeviceLinkClient {
+     // 0 = 本次生命周期内还没重建过(单调时钟的绝对值可能很小,不能只比差值)。
+     if (this.peerSilenceRebuildAt !== 0 && now - this.peerSilenceRebuildAt < window) return false;
+     if (dst !== undefined && this.peerOfflineNotifiedGeneration.has(dst)) return false;
+-    if (opts?.requirePending === true && !this.hasPeerTimeoutEvidence()) return false;
++    if (opts?.requirePromptRequest === true && !this.hasPromptAwaitingReply()) return false;
++    if (opts?.silenceProven === true) return true;
+     return now - this.lastPeerInboundAt >= window;
+   }
+ 
+   /**
+-   * 是否已经有「请求等不到对端而超时」的证据,且此刻仍有请求在等回包。
++   * 是否有**短超时**业务请求在等回包 —— 即「App 此刻真的在等一个答复」。
+    *
+-   * 回前台探针只凭「有 pending」还不足以拆共享 socket:长执行通道
+-   * (desktop-cmd:run / worktree:create 等按通道放宽超时的请求)运行期间被控端
+-   * 本来就可能几十秒不发一个帧,那时重建会把**正在执行**的命令打成失败。
+-   * 超时证据天然排除这种请求——它们的超时被放宽到分钟级,不会先超时。
++   * 长执行通道(`desktop-cmd:run` / `worktree:create` / `schedule` 等)的超时按通道
++   * 放宽到分钟级,运行期间被控端本来就可能几十秒不发帧;把它们算成证据会让回前台
++   * 探针把**正在执行**的命令打成失败。用请求自己的生效超时区分最直接。
+    */
+-  private hasPeerTimeoutEvidence(): boolean {
+-    if (this.pending.size === 0) return false;
+-    for (const [deviceId, streak] of this.peerTimeoutStreak) {
+-      if (streak < 1) continue;
+-      if (this.peerOfflineNotifiedGeneration.has(deviceId)) continue;
+-      return true;
++  private hasPromptAwaitingReply(): boolean {
++    const window = this.timing.peerSilenceProbeMs;
++    if (!(window > 0)) return false;
++    for (const request of this.pending.values()) {
++      if (request.dst !== undefined && this.peerOfflineNotifiedGeneration.has(request.dst)) continue;
++      const requestTimeout = request.timeoutMs ?? this.timing.requestTimeoutMs;
++      if (requestTimeout <= window * 2) return true;
+     }
+     return false;
+   }
+@@ -1619,6 +1636,7 @@ export class DeviceLinkClient {
+         timer,
+         expectKind,
+         dst: env.dst,
++        timeoutMs: timeout,
+         linkGeneration: env.dst ? this.getPeerLinkGeneration(env.dst) : undefined,
+       };
+       this.pending.set(id, pendingRequest);
+-- 
+2.52.0.windows.1
+
+
+From bd4ed7e7338d665a0727962ed317039b273ea1d7 Mon Sep 17 00:00:00 2001
+From: Yop <chanyuenpang@hotmail.com>
+Date: Fri, 18 Sep 2026 16:53:07 +0800
+Subject: [PATCH 3/5] =?UTF-8?q?fix(device-link):=20=E5=BF=83=E8=B7=B3?=
+ =?UTF-8?q?=E5=91=A8=E6=9C=9F=E4=B9=9F=E6=A3=80=E6=9F=A5=E5=AF=B9=E7=AB=AF?=
+ =?UTF-8?q?=E9=9D=99=E9=BB=98(App=20=E4=B8=80=E7=9B=B4=E5=BE=85=E5=9C=A8?=
+ =?UTF-8?q?=E5=89=8D=E5=8F=B0=E6=97=B6=E5=94=AF=E4=B8=80=E4=BC=9A=E8=B7=91?=
+ =?UTF-8?q?=E7=9A=84=E5=88=A4=E6=8D=AE)?=
+MIME-Version: 1.0
+Content-Type: text/plain; charset=UTF-8
+Content-Transfer-Encoding: 8bit
+
+现场(2026-09-18):用户停在前台盯着看,手机上行通、下行死。前两条路都有前提没被满足:
+- 回前台探针只在 AppState 变化时跑 —— 他已经在前台,没有新的前台事件;
+- 超时判据要求「真的完成过一次超时」,而 App 反复重发同一个读时会把上一个在途请求取消
+  (实测同一秒连发 4 次 local-db:messages:view、答复字节完全相同),永远不产生超时。
+于是连接一直不自愈。
+
+补上心跳周期里的兜底检查(手机端 pingIntervalMs=10s,待在前台也照跑),与探针共用同一套
+护栏:必须在等**短超时**请求的回包、对端静默超过窗口、中继未判该 peer 离线、同一窗口内
+只重建一次。
+
+新增单测:空闲心跳不重建 / 有短超时请求在等回包+对端静默 → 下一个心跳周期就重建。
+device-link 415/415。
+
+Signed-off-by: Yop <chanyuenpang@hotmail.com>
+---
+ .../device-link/src/__tests__/client.test.ts  | 32 +++++++++++++++++++
+ packages/device-link/src/client.ts            | 19 +++++++++++
+ 2 files changed, 51 insertions(+)
+
+diff --git a/packages/device-link/src/__tests__/client.test.ts b/packages/device-link/src/__tests__/client.test.ts
+index d6890a3c3..b5830390d 100644
+--- a/packages/device-link/src/__tests__/client.test.ts
++++ b/packages/device-link/src/__tests__/client.test.ts
+@@ -8891,4 +8891,36 @@ describe('peer 级静默探针', () => {
+       vi.useRealTimers();
+     }
+   });
++
++  it('开启后:App 一直待在前台时,心跳周期也会发现对端静默并重建', async () => {
++    vi.useFakeTimers();
++    // 现场补丁(2026-09-18):回前台探针只在 AppState 变化时跑;超时判据要求「真的完成过
++    // 一次超时」,而 App 反复重发同一个读会把上一个在途请求取消掉 —— 用户停在前台盯着时
++    // 两条路都不跑,连接永远不自愈。这条断言心跳周期里的兜底判据。
++    const h = makeHarness({
++      timing: {
++        pingIntervalMs: 1_000,
++        pongMissLimit: 99, // 摘掉 socket 判死,单独考察 peer 级判据
++        peerSilenceProbeMs: 800,
++      },
++    });
++    try {
++      h.client.start();
++      await vi.advanceTimersByTimeAsync(0);
++      h.current().ack();
++
++      // (1) 空闲:没有在等答复 → 心跳只发 ping,不重建。
++      await vi.advanceTimersByTimeAsync(3_000);
++      expect(h.sockets).toHaveLength(1);
++
++      // (2) 有短超时请求在等回包、对端一个帧都没发 → 下一个心跳周期就重建。
++      const waiting = h.client.invoke('dev-b', { channel: 'x', args: [] }, 1_400);
++      void waiting.catch(() => {});
++      await vi.advanceTimersByTimeAsync(1_100);
++      expect(h.sockets.length).toBeGreaterThan(1);
++    } finally {
++      h.client.stop();
++      vi.useRealTimers();
++    }
++  });
+ });
+diff --git a/packages/device-link/src/client.ts b/packages/device-link/src/client.ts
+index 049c1d99a..31f3e5745 100644
+--- a/packages/device-link/src/client.ts
++++ b/packages/device-link/src/client.ts
+@@ -2074,6 +2074,25 @@ export class DeviceLinkClient {
+         this.handleDisconnect(1006, 'heartbeat lost');
+         return;
+       }
++      // peer 级静默探针:心跳周期里也查一次 —— 这是**唯一在"App 一直待在前台"
++      // 时也会跑**的判据。另外两条路都有前提:回前台探针只在 AppState 变化时跑,
++      // 超时判据要求「真的完成过一次超时」(而 App 反复重发同一个读时会把上一个
++      // 在途请求取消掉,永远不产生超时)。现场 2026-09-18:用户停在前台盯着,
++      // 手机上行通、下行死,这两条都没跑到,于是连接一直不自愈。
++      // 护栏不变:必须在等**短超时**请求的回包(长执行通道不算)、对端静默超过窗口、
++      // 中继未判该 peer 离线、且同一窗口内只重建一次。
++      if (
++        this.peerSilenceProbeEnabled()
++        && this.shouldRebuildForPeerSilence(now, undefined, { requirePromptRequest: true })
++      ) {
++        this.peerSilenceRebuildAt = now;
++        this.log.warn(
++          'peer silence detected on heartbeat, forcing reconnect'
++          + ` (silentForMs=${now - this.lastPeerInboundAt}, pending=${this.pending.size})`,
++        );
++        this.restartConnection('peer-silence');
++        return;
++      }
+       try {
+         this.sendEnvelope({ v: PROTOCOL_VERSION, kind: 'ping' });
+       } catch {
+-- 
+2.52.0.windows.1
+
+
+From b72f15a61c0679244a106a6bb71f50fc477ed137 Mon Sep 17 00:00:00 2001
+From: Yop <chanyuenpang@hotmail.com>
+Date: Fri, 18 Sep 2026 16:58:25 +0800
+Subject: [PATCH 4/5] =?UTF-8?q?fix(device-link):=20peer=20=E7=BA=A7?=
+ =?UTF-8?q?=E9=9D=99=E9=BB=98=E6=94=B9=E7=94=A8=E7=B4=AF=E8=AE=A1=E5=88=A4?=
+ =?UTF-8?q?=E6=8D=AE=20+=20=E7=BB=8F=E4=B8=8A=E8=A1=8C=E8=87=AA=E6=8A=A5?=
+ =?UTF-8?q?=E5=86=85=E9=83=A8=E7=8A=B6=E6=80=81?=
+MIME-Version: 1.0
+Content-Type: text/plain; charset=UTF-8
+Content-Transfer-Encoding: 8bit
+
+现场(2026-09-18 第三轮):用户在外地,手机上行通、下行死,停在会话界面时连接永不
+自愈。前两条路在真实场景里都没被满足:
+- 回前台探针只在 AppState 变化时跑(用户一直待在前台,没有新事件);
+- 超时判据要求「真的完成过一次超时」,而 App 反复重发同一个读时会把上一个在途请求
+  取消/替换(实测同一秒连发 4 次 local-db:messages:view、答复字节完全相同),
+  永远不产生超时。
+
+改动:
+1. 心跳周期(手机端 10s,前台也跑)按周期累计「这一周期对端一个帧都没来 + 此刻确实
+   有短超时请求在等回包」的时长,累计满窗口即重建;收到对端帧或没有请求在等就清零。
+   瞬时判据会因 pending 被反复替换而漏,tick 累加不会。
+2. 新增 sendPeerSilenceDiagnostic():对端静默时经**上行**把内部状态编码进通道名发出
+   (`psdiag.s<静默10s桶>.p<pending>.a<是否有短超时请求在等>.c<累计秒>.o<中继是否判离线>`),
+   Host 会把它记进 recentRefusals —— 远端真机没 USB、拿不到 logcat 时,这是唯一能读到
+   App 内部状态的通道。纯旁路,失败不影响连接。
+3. 单测:App 反复替换在途请求时,累计判据仍能在心跳里重建(共 7 条 peer 级探针测试)。
+
+device-link 416/416。
+
+Signed-off-by: Yop <chanyuenpang@hotmail.com>
+---
+ .../device-link/src/__tests__/client.test.ts  | 23 +++++
+ packages/device-link/src/client.ts            | 94 ++++++++++++++++---
+ 2 files changed, 102 insertions(+), 15 deletions(-)
+
+diff --git a/packages/device-link/src/__tests__/client.test.ts b/packages/device-link/src/__tests__/client.test.ts
+index b5830390d..55bf73725 100644
+--- a/packages/device-link/src/__tests__/client.test.ts
++++ b/packages/device-link/src/__tests__/client.test.ts
+@@ -8923,4 +8923,27 @@ describe('peer 级静默探针', () => {
+       vi.useRealTimers();
+     }
+   });
++
++  it('开启后:App 反复替换在途请求时,累计判据也能在心跳里重建', async () => {
++    vi.useFakeTimers();
++    // 现场(2026-09-18):App 反复重发同一个读 → pending 集合不断被替换,任何「此刻必须
++    // 存在 X」的瞬时判据都会在某些 tick 落空。累计口径按心跳周期累加「等回包 + 对端
++    // 静默」的时长,累计满窗口即重建。
++    const h = makeHarness({
++      timing: { pingIntervalMs: 1_000, pongMissLimit: 99, peerSilenceProbeMs: 2_000 },
++    });
++    try {
++      h.client.start();
++      await vi.advanceTimersByTimeAsync(0);
++      h.current().ack();
++      // 短超时(<= 窗口*2)请求一直挂着;两个心跳周期后累计满窗口
++      const waiting = h.client.invoke('dev-b', { channel: 'x', args: [] }, 3_500);
++      void waiting.catch(() => {});
++      await vi.advanceTimersByTimeAsync(2_100);
++      expect(h.sockets.length).toBeGreaterThan(1);
++    } finally {
++      h.client.stop();
++      vi.useRealTimers();
++    }
++  });
+ });
+diff --git a/packages/device-link/src/client.ts b/packages/device-link/src/client.ts
+index 31f3e5745..18824127d 100644
+--- a/packages/device-link/src/client.ts
++++ b/packages/device-link/src/client.ts
+@@ -701,6 +701,13 @@ export class DeviceLinkClient {
+   private lastPeerInboundAt = 0;
+   /** peer 级静默重建的限速时间戳:同一窗口内最多重建一次,防重连风暴。 */
+   private peerSilenceRebuildAt = 0;
++  /**
++   * 「有短超时请求在等回包 + 这一心跳周期内对端一个帧都没来」的累计时长。
++   *
++   * 用**累计**而不是瞬时快照:App 反复重发同一个读时会不断替换 pending 集合,
++   * 「此刻必须存在 X」的瞬时条件会在某些 tick 落空,于是判据永远不成立。
++   */
++  private peerSilenceAccumMs = 0;
+   /** 每个 peer 的连续请求超时次数(收到该 peer 的帧即清零)。 */
+   private readonly peerTimeoutStreak = new Map<string, number>();
+   private networkChangeTimer: ReturnType<typeof setTimeout> | null = null;
+@@ -964,7 +971,7 @@ export class DeviceLinkClient {
+   private shouldRebuildForPeerSilence(
+     now: number,
+     dst: string | undefined,
+-    opts?: { requirePromptRequest?: boolean; silenceProven?: boolean },
++    opts?: { requirePromptRequest?: boolean; silenceProven?: boolean; accumulatedSilence?: boolean },
+   ): boolean {
+     const window = this.timing.peerSilenceProbeMs;
+     if (!(window > 0)) return false;
+@@ -974,6 +981,8 @@ export class DeviceLinkClient {
+     if (dst !== undefined && this.peerOfflineNotifiedGeneration.has(dst)) return false;
+     if (opts?.requirePromptRequest === true && !this.hasPromptAwaitingReply()) return false;
+     if (opts?.silenceProven === true) return true;
++    // 累计口径:心跳周期里已累计出「等回包 + 对端静默」超过窗口(现场主路径)。
++    if (opts?.accumulatedSilence === true) return this.peerSilenceAccumMs >= window;
+     return now - this.lastPeerInboundAt >= window;
+   }
+ 
+@@ -995,6 +1004,45 @@ export class DeviceLinkClient {
+     return false;
+   }
+ 
++  /**
++   * 把 peer 级静默的内部状态经**上行**通道报给 Host。
++   *
++   * 为什么用通道名承载数据:Host 把未知通道记进 `recentRefusals`
++   * (`{at, channel, src, code}`),而**上行是通的**、下行才是坏的。远端真机、没有
++   * USB、拿不到 logcat 时,这是唯一能读到 App 内部状态的通道。
++   *
++   * 编码(取值都被装进有限桶,避免 refusalTotals 的键无限增长):
++   *   `psdiag.s<静默秒:10 秒桶,≥60 记 60>.p<pending 数 0-9>.a<是否有短超时请求在等>.c<累计静默秒 0-99>.o<中继是否判该 peer 离线>`
++   *
++   * 诊断永远是旁路:整段 try/catch,失败不触碰连接状态。
++   */
++  private sendPeerSilenceDiagnostic(now: number): void {
++    try {
++      const dst = this.peerTransport.keys().next().value as string | undefined;
++      if (dst === undefined) return;
++      const silentSeconds = Math.round((now - this.lastPeerInboundAt) / 1000);
++      const silentBucket = silentSeconds >= 60
++        ? '60'
++        : String(Math.floor(silentSeconds / 10) * 10).padStart(2, '0');
++      const pending = Math.min(this.pending.size, 9);
++      const awaiting = this.hasPromptAwaitingReply() ? 1 : 0;
++      const accumulated = Math.min(Math.round(this.peerSilenceAccumMs / 1000), 99);
++      const offlineMarked = this.peerOfflineNotifiedGeneration.size > 0 ? 1 : 0;
++      this.sendEnvelope({
++        v: PROTOCOL_VERSION,
++        kind: 'invoke',
++        id: createRequestId(),
++        dst,
++        payload: {
++          channel: `psdiag.s${silentBucket}.p${pending}.a${awaiting}.c${accumulated}.o${offlineMarked}`,
++          args: [],
++        },
++      });
++    } catch {
++      // 诊断失败不影响主流程
++    }
++  }
++
+   /**
+    * 记录一次请求超时,并在「同一 peer 连续两次超时 + 对端持续静默」时重建连接。
+    *
+@@ -2047,6 +2095,8 @@ export class DeviceLinkClient {
+     this.lastPeerInboundAt = this.lastInboundAt;
+     // 新连接:上一代的连续超时计数不再适用(限速时间戳仍保留,防跨代重连风暴)。
+     this.peerTimeoutStreak.clear();
++    // 上一个心跳周期的时刻,用于累计「这一周期内对端有没有说过话」。
++    let prevTickAt = this.monotonicNow();
+     this.pingTimer = setInterval(() => {
+       if (this.status !== 'online') return;
+       const now = this.monotonicNow();
+@@ -2078,21 +2128,35 @@ export class DeviceLinkClient {
+       // 时也会跑**的判据。另外两条路都有前提:回前台探针只在 AppState 变化时跑,
+       // 超时判据要求「真的完成过一次超时」(而 App 反复重发同一个读时会把上一个
+       // 在途请求取消掉,永远不产生超时)。现场 2026-09-18:用户停在前台盯着,
+-      // 手机上行通、下行死,这两条都没跑到,于是连接一直不自愈。
+-      // 护栏不变:必须在等**短超时**请求的回包(长执行通道不算)、对端静默超过窗口、
+-      // 中继未判该 peer 离线、且同一窗口内只重建一次。
+-      if (
+-        this.peerSilenceProbeEnabled()
+-        && this.shouldRebuildForPeerSilence(now, undefined, { requirePromptRequest: true })
+-      ) {
+-        this.peerSilenceRebuildAt = now;
+-        this.log.warn(
+-          'peer silence detected on heartbeat, forcing reconnect'
+-          + ` (silentForMs=${now - this.lastPeerInboundAt}, pending=${this.pending.size})`,
+-        );
+-        this.restartConnection('peer-silence');
+-        return;
++      // 手机上行通、下行死,这两条都没跑,于是连接一直不自愈。
++      //
++      // 判据用**累计**口径:App 重发读时会不断替换 pending 集合,任何「此刻必须
++      // 存在 X」的瞬时条件都会在某个 tick 落空。这里按心跳周期累计「这一周期对端
++      // 一个帧都没来 + 此刻确实有短超时请求在等回包」的时长,累计满窗口即重建;
++      // 只要有一个周期收到对端帧、或没有请求在等,就清零。
++      if (this.peerSilenceProbeEnabled()) {
++        const peerFrameSincePrevTick = this.lastPeerInboundAt > prevTickAt;
++        if (peerFrameSincePrevTick || !this.hasPromptAwaitingReply()) {
++          this.peerSilenceAccumMs = 0;
++        } else {
++          this.peerSilenceAccumMs += now - prevTickAt;
++        }
++        // 对端静默时把内部状态经上行报给 Host(down 方向坏了,up 方向是好的)。
++        if (now - this.lastPeerInboundAt >= this.timing.pingIntervalMs) {
++          this.sendPeerSilenceDiagnostic(now);
++        }
++        if (this.shouldRebuildForPeerSilence(now, undefined, { accumulatedSilence: true })) {
++          this.peerSilenceRebuildAt = now;
++          this.peerSilenceAccumMs = 0;
++          this.log.warn(
++            'peer silence detected on heartbeat, forcing reconnect'
++            + ` (silentForMs=${now - this.lastPeerInboundAt}, pending=${this.pending.size})`,
++          );
++          this.restartConnection('peer-silence');
++          return;
++        }
+       }
++      prevTickAt = now;
+       try {
+         this.sendEnvelope({ v: PROTOCOL_VERSION, kind: 'ping' });
+       } catch {
+-- 
+2.52.0.windows.1
+
+
+From 94f083331dc8287472902e468dafa1c0012db594 Mon Sep 17 00:00:00 2001
+From: Yop <chanyuenpang@hotmail.com>
+Date: Fri, 18 Sep 2026 18:05:47 +0800
+Subject: [PATCH 5/5] =?UTF-8?q?fix(mobile):=20=E5=AF=B9=E7=AB=AF=E6=B4=BB?=
+ =?UTF-8?q?=E6=80=A7=E7=9C=8B=E9=97=A8=E7=8B=97=20=E2=80=94=E2=80=94=20?=
+ =?UTF-8?q?=E5=8D=A1=E4=BD=8F=E6=97=B6=E4=B8=BB=E5=8A=A8=E6=8E=A2=E4=B8=80?=
+ =?UTF-8?q?=E6=AC=A1,=E8=80=8C=E4=B8=8D=E6=98=AF=E7=AD=89=E3=80=8C?=
+ =?UTF-8?q?=E6=9C=89=E5=9C=A8=E9=80=94=E8=AF=B7=E6=B1=82=E3=80=8D?=
+MIME-Version: 1.0
+Content-Type: text/plain; charset=UTF-8
+Content-Transfer-Encoding: 8bit
+
+真机实测(2026-09-18,手机自报 psdiag 共 21 条,全部 p0.a0.c0):手机卡住时 client
+的 pending 是**空的** —— App 自己不再发请求、也没有在等回包,而中继仍认为它 online。
+所以此前三条判据都永远不触发:
+- 连续两次请求超时(没有请求);
+- 回前台探针要求「有短超时请求在等回包」(没有);
+- 心跳累计同样要求 pending 非空(没有)。
+socket 级心跳也因为 relay 正常回 pong 而失明。
+
+改为在 App 侧加一个**与页面轮询循环无关**的独立定时器(页面循环停掉它照跑):
+前台 + client online + 对端静默 ≥20s + 该设备已有已建立的 link
+→ 主动发一个最便宜的读(`maker:list-active`,5s 超时)
+→ 回包到了 = 对端活着(空闲会话不会被误重建)
+→ 没回包 = 下行真的死了 → restartConnection('peer-liveness-probe') + rehydrate。
+
+- client 暴露 peerSilenceMs():只有对端帧(带 src)刷新它,relay 的 pong 不算;
+- 看门狗直接用 client.invoke(绕过 App 的熔断/排队门禁),否则门禁关着时它自己也发不出去;
+- 单测:peerSilenceMs 的 pong 不刷新语义;device-link 417/417。
+
+Signed-off-by: Yop <chanyuenpang@hotmail.com>
+---
+ .../src/device-link/DeviceLinkContext.tsx     | 59 +++++++++++++++++++
+ .../device-link/src/__tests__/client.test.ts  | 23 ++++++++
+ packages/device-link/src/client.ts            | 14 +++++
+ 3 files changed, 96 insertions(+)
+
+diff --git a/apps/mobile/src/device-link/DeviceLinkContext.tsx b/apps/mobile/src/device-link/DeviceLinkContext.tsx
+index 71855eeba..cf093e3ff 100644
+--- a/apps/mobile/src/device-link/DeviceLinkContext.tsx
++++ b/apps/mobile/src/device-link/DeviceLinkContext.tsx
+@@ -271,6 +271,25 @@ const BACKGROUND_FINAL_UNSUBSCRIBE_WAIT_MS = 1_000;
+  */
+ const BACKGROUND_SUSPEND_SUSPECT_MS = 10_000;
+ 
++/**
++ * 对端活性看门狗:卡住时唯一的可靠证据。
++ *
++ * 2026-09-18 真机实测(手机自报 `psdiag` 21 条,全部 `p0.a0.c0`):手机卡住时
++ * client 的 `pending` 是**空的** —— App 自己不再发请求、也没有在等回包,而中继仍认为
++ * 它是 online。所以:
++ *   - 「等回包」型判据(超时计数 / 探针要求有在途请求)永远不会触发;
++ *   - socket 级心跳也因为 relay 正常回 pong 而失明。
++ * 唯一能自己造出证据的办法是**主动问一次**:静默超过阈值就发一个最便宜的读,
++ * 回包到了 = 对端活着(空闲会话不会被误重建),短超时内没回包 = 下行真的死了。
++ */
++const PEER_LIVENESS_SILENCE_MS = 20_000;
++/** 检查周期:要短于静默阈值,否则一次故障要等两个周期才被发现。 */
++const PEER_LIVENESS_INTERVAL_MS = 10_000;
++/** 探测本身的超时:远小于正常请求,回包该在毫秒级到。 */
++const PEER_LIVENESS_TIMEOUT_MS = 5_000;
++/** 最便宜的被控端读通道(`maker:list-active` = 每个会话一个布尔)。 */
++const PEER_LIVENESS_CHANNEL = 'maker:list-active';
++
+ /** 桌面端 presence 闪断宽限:短暂离线不立刻清空该设备的会话镜像与能力缓存。 */
+ const PRESENCE_OFFLINE_WIPE_GRACE_MS = 5_000;
+ 
+@@ -1252,8 +1271,48 @@ export function DeviceLinkProvider({ children }: { children: ReactNode }) {
+       console.warn('[device-link] network listener unavailable; using heartbeat recovery');
+     });
+ 
++    // 对端活性看门狗:与页面轮询循环**无关**的独立定时器 —— 页面循环停了它也照跑。
++    // 触发条件刻意不依赖「有在途请求」(真机实测卡住时 pending 是空的),而是主动问一次。
++    const livenessTimer = setInterval(() => {
++      const current = clientRef.current;
++      if (current === null || current.getStatus() !== 'online') return;
++      if (AppState.currentState !== 'active') return;
++      const silenceMs = current.peerSilenceMs();
++      if (silenceMs < PEER_LIVENESS_SILENCE_MS) return;
++      // 只探「已经建立了 link」的设备:没有 link 就没有可失去的下行。
++      let target: string | null = null;
++      for (const plan of registryRef.current.snapshot()) {
++        if (
++          typeof plan.deviceId === 'string'
++          && plan.deviceId !== ''
++          && current.getPeerLinkGeneration(plan.deviceId) > 0
++        ) {
++          target = plan.deviceId;
++          break;
++        }
++      }
++      if (target === null) return;
++      const probedDevice = target;
++      mobileDebugLog('debug', 'device-link', 'peer liveness probe', {
++        deviceId: probedDevice,
++        silenceMs: Math.round(silenceMs),
++      });
++      void current
++        .invoke(probedDevice, { channel: PEER_LIVENESS_CHANNEL, args: [] }, PEER_LIVENESS_TIMEOUT_MS)
++        .catch((error: unknown) => {
++          const code = (error as { code?: string } | null)?.code;
++          mobileDebugLog('warn', 'device-link', 'peer liveness probe failed; rebuilding connection', {
++            deviceId: probedDevice,
++            code: code ?? String((error as { message?: string } | null)?.message ?? error),
++          });
++          current.restartConnection('peer-liveness-probe');
++          void rehydrateWithClient(current);
++        });
++    }, PEER_LIVENESS_INTERVAL_MS);
++
+     return () => {
+       disposed = true;
++      clearInterval(livenessTimer);
+       diagnostics.background();
+       recoveryDiagnostics.delete(client);
+       networkSubscription?.remove();
+diff --git a/packages/device-link/src/__tests__/client.test.ts b/packages/device-link/src/__tests__/client.test.ts
+index 55bf73725..575a155ca 100644
+--- a/packages/device-link/src/__tests__/client.test.ts
++++ b/packages/device-link/src/__tests__/client.test.ts
+@@ -8946,4 +8946,27 @@ describe('peer 级静默探针', () => {
+       vi.useRealTimers();
+     }
+   });
++
++  it('peerSilenceMs:只有对端帧刷新它,relay 自己回的 pong 不算', async () => {
++    // 控制器用这个读数决定「静默够久,该主动探一次了」。若 pong 也能刷新它,
++    // relay 每 10s 的 pong 会让它永远为 0,看门狗就永远不会开火。
++    const h = makeHarness({ timing: { pingIntervalMs: 60_000, peerSilenceProbeMs: 20_000 } });
++    h.client.start();
++    await tick();
++    const socket = h.current();
++    socket.ack();
++    await tick(25);
++    const afterQuiet = h.client.peerSilenceMs();
++    expect(afterQuiet).toBeGreaterThan(0);
++    socket.push({ v: PROTOCOL_VERSION, kind: 'pong' });
++    expect(h.client.peerSilenceMs()).toBeGreaterThan(0);
++    socket.push({
++      v: PROTOCOL_VERSION,
++      kind: 'push',
++      src: 'dev-b',
++      payload: { channel: 'demo', payload: {} },
++    });
++    expect(h.client.peerSilenceMs()).toBeLessThan(afterQuiet);
++    h.client.stop();
++  });
+ });
+diff --git a/packages/device-link/src/client.ts b/packages/device-link/src/client.ts
+index 18824127d..502409d99 100644
+--- a/packages/device-link/src/client.ts
++++ b/packages/device-link/src/client.ts
+@@ -1217,6 +1217,20 @@ export class DeviceLinkClient {
+     return this.peerTransport.get(deviceId)?.linkGeneration ?? 0;
+   }
+ 
++  /**
++   * 距离最近一次收到**对端帧**(带 relay 注入的 `src`)过了多久,毫秒。
++   *
++   * 控制器用它做「主动活性探测」的触发条件。2026-09-18 真机实测:手机卡住时
++   * `pending` 是空的(它自己不再发请求、也没有在等回包),所以任何「等回包」型判据
++   * 都不可能触发 —— 必须在静默超时后**自己发一个问题**去问对端。
++   *
++   * 从未收到过对端帧时返回 0(免得刚连上就被判定静默)。
++   */
++  peerSilenceMs(): number {
++    if (this.lastPeerInboundAt === 0) return 0;
++    return Math.max(0, this.monotonicNow() - this.lastPeerInboundAt);
++  }
++
+   /** Subscribe to typed peer route lifecycle changes (currently authoritative offline). */
+   onPeerRouteStateChanged(
+     cb: (change: DeviceLinkPeerRouteStateChanged) => void,
+-- 
+2.52.0.windows.1
+
