@@ -3,6 +3,128 @@
 本文件记录**用户可见**的变化与**每次发布验证过的 DSH 版本**。格式遵循
 [Keep a Changelog](https://keepachangelog.com/zh-CN/1.1.0/)，版本号遵循语义化版本。
 
+## [0.1.15] - 2026-09-30
+
+验证环境：DSH **0.2.0-rc.2**（桌面版 `@deepseek-ai/dsh-desktop-runtime`，Electron 44 / Node 24.18.1）
+**与** DSH **0.1.5-rc.2**（Web profile）—— 同一份产物同时服务两条线。要求 Node >=22，werift 固定 **0.24.4**。
+
+### Added
+
+- 支持 DSH **0.2** 宿主：`@deepseek-ai/dsh-session` / `dsh-settings` 的 peer 区间加入
+  `>=0.2.0-rc.1 <0.3.0-0`。`^0.1.5-rc.2` 匹配不到 `0.2.0-rc.2`（semver 预发布规则），
+  缺这一段会在**安装时**被拒（`installation rejected`）、在**启动时**被静默跳过。
+
+### Fixed
+
+- **设置 seam 在 0.2 上不再抛错**。0.2 删掉了 `settings.register`，插件原本会在 mount 时
+  抛 `settings.register is not a function`；DSH 把加载失败的 entry 当致命错误，于是**整个
+  profile 起不来**。现在按宿主能力选路径：有 `register` 走 0.1.x 的命名空间注册（行为不变），
+  没有则用**插件条目自己的 `Config`** —— 0.2 的 `SettingsForms` 按 **profile entry id** 投影它，
+  并把解析结果作为 `apply(ctx, config)` 的第二个参数。`SETTINGS_NAMESPACE` 正好就是本 bundle
+  的行 id（`dsh-cindy-host`），所以两条路径操作的是同一个面，下游代码无需分支。
+- **`@deepseek-ai/dsh-host-apiproxy` 从 `peerDependencies` 移除**。0.2 已删除该包，而
+  `evaluatePluginCompatibility` 遍历 peers 的**每一个键、且不查 `peerDependenciesMeta`**，
+  所以只要它还在 peers 里，安装与启动两道门禁都会拒绝整个插件（bundle 被跳过后
+  `dsh-cindy-host` 行根本不会出现）。该适配器仍是惰性 `require` + 失败降级，运行时行为不变。
+- **`.volatile()` 改为特性检测**。只有 0.2 的 schemastery `3.18.4` 有这个方法；`0.1.5-rc.2`
+  解析到的 `3.18.2` 没有（仍在声明的 `^3.18.1` 区间内）。无条件调用会在**模块加载**时抛错，
+  把 profile 一起拖垮；没有它时纯 schema 仍服务于 0.1.x 的 `register` 路径。
+- **`keytar` 移入 `optionalDependencies`**。它是原生模块，没有 C++ 工具链的机器上必然构建失败，
+  而普通 dependency 的构建失败会让 pnpm 退出 1（见下面"部署注意"的后果）。
+
+### 部署注意（**必须看**）
+
+pnpm 11 把 `strictDepBuilds` 默认设为 **true**，于是"构建脚本被忽略"从警告变成**硬错误**：
+`add` 退出码 1。而 DSH 只在 pnpm 成功时才把 bundle 写进 `dsh.profile.bundles` —— 结果是
+**包装上了、行却永远不出现**（这正是历史上要手写 insert 行的原因）。
+
+在没有 C++ 工具链的机器上，安装前请在 profile 的 `pnpm-workspace.yaml` 里**显式承认**这一条：
+
+```yaml
+allowBuilds:
+  keytar: false
+```
+
+这样 `add` 退出 0、bundle 正常登记，插件在没有 keytar 二进制时照常 mount，只是凭据能力不可用。
+`strictDepBuilds: false` 也能让安装通过（实测），但它会**全局**关掉这道保护，不建议。
+
+### 发布验证
+
+- 单元测试：**682 通过 / 1 跳过 / 0 失败**（`node --test`）。
+- peer 门禁：用宿主自带 semver 复现 `evaluatePluginCompatibility` → **compatible**，无需版本豁免。
+- 干净 profile 真机启动（独立 `DSH_HOME`，宿主 `0.2.0-rc.2`，profile 里只装本 tarball）：
+  `add exit=0`、`profile-local @deepseek-ai = 0`、`rows disabled 0 / bundles skipped 0 / pending 0`、
+  `GET /` → 200 且含 `__DSH_BOOT__`、**`GET /api/dsh-cindy-host/status` → 200
+  `{"ok":true,"installed":true,…,"diagnostics":{"dataSource":"session-controller",…}}`**、
+  未知 Cindy 路由 → 404（证明路由表确已挂载，而不是被鉴权层统一挡掉）。
+- **keytar 未构建时仍能 mount**：本机无 VS Build Tools，`keytar@7.9.0` 未编译，插件照常挂载并
+  服务上述路由（`login.authenticated:false` 属预期：沙盒无 Cindy 会话）。§5.2 的说法这次是
+  在 0.2 上**实测**的，不是沿用旧结论。
+
+## [0.1.13] - 2026-09-23
+
+验证环境：DSH **0.1.5-rc.2**、Node **24.12.0**；要求 Node >=22，werift 固定 **0.24.4**。
+
+### Changed
+
+- Cindy 任务图标的未知来源/模型默认值由 Pi 改为 Claude；Pi 现在只用于明确识别为 DeepSeek 的来源（即使该来源的模型名未知）。旧会话在重新拉取列表时也按当前来源重新映射。
+
+### 部署注意
+
+- 当前 Web profile 如仍安装旧版（实查曾为 `0.1.10`），单独重启不会自动升级；先安装本版再按预警重启。重启后的短暂凭证恢复/中继重连不能当作 running 通道失败。
+
+## [0.1.12] - 2026-09-23
+
+验证环境：DSH **0.1.5-rc.2**、Node **24.12.0**；要求 Node >=22，keytar 需要原生构建，werift 固定 **0.24.4**。
+
+### Changed
+
+- Cindy 手机任务的三种 agent 图标在 DSH Host 上按会话实际来源和模型展示：DeepSeek 来源（任意模型）→ Pi、GPT 模型 → Codex、其他已知来源模型 → Claude。来源无法确认时回退 Pi；创建时手机所选 agent 平台不决定 DSH 的执行 harness。
+- 三种 Cindy agentKind 均为同一 DSH harness 的协议别名，能力列表和模型/权限入口一致。手机的 agent 标签、搜索分类与最近会话草稿也会随图标的 kind 变化，属于本方案已接受的表现。
+
+### 发布验证与限制
+
+- 完整 Host 单测 680 通过、1 跳过；通道审计 `unclassified: 0`；独立沙盒普通验收 79/79、带真实 prompt 的沙盒验收 103/103。手机实际图标表现及文件直传仍需发布后真机复核，不能将沙盒验收视作真机验证。
+- 本版本包含当前工作区其他已验证的文件传输、队列与登录修订；传输的真实手机 P2P 连接尚未确认建立，不宣称已修复。仅发布 npm 包不会让运行中的 DSH Host 加载新代码，需另行通知并重启。
+
+## [0.1.11] - 2026-09-21
+
+验证环境：DSH **0.1.5-rc.2**、Node **24.12.0**；要求 Node >=22，原生凭据依赖 keytar，werift 保持 **0.24.4**。
+
+### Fixed
+
+- 手机原 Export 的 OSS 兜底从 512 MiB 提升为 **2 GiB（含边界）**，遵守调用方更小的 maxBytes；采用64 KiB分块读取、SHA-256与网络背压，不再整文件读入内存。
+- 持续有进展的上传不再被原10分钟总时限截断；保留阶段与无进展超时、两个活动槽和取消/清理配额。签名401仅受控刷新一次，文件PUT不自动重传。
+- Export任务绑定已认证账号和请求设备；撤销、关闭及账号切换阻止迟到结果发布，短暂Relay断线不取消在途OSS上传。显式成功登录/选择账号可替换旧连接，上传与刷新不主动重连。
+- 保留25秒peer offer等待预算；在既有status诊断中增加有界、脱敏的传输阶段信息。
+
+### 验证与已知限制
+
+- 已实测本地HTTP完整2 GiB、约11分钟持续流式上传及取消；真实约1.3 GB文件经OSS上传完成，用户确认手机下载完成。
+- **本次成功走的是OSS，不是P2P。实际手机P2P未建立的原因仍待后续定位**；不宣称直连、TURN或系统分享问题已修复。
+- 手机原30分钟总轮询预算未改；不新增断点续传、手机上传或超过2 GiB支持。OS文件/凭据库阻塞不保证按网络超时收口。
+
+## [0.1.10] - 2026-09-20
+
+验证环境：DSH **0.1.5-rc.2**、Node **24.12.0**、werift **0.24.4**；要求 Node >=22。
+
+### Added
+
+- **手机文件直传**：对接 Cindy `device-link:file-peer` / `files-v1`，电脑到手机按块下载，上限 2 GiB；需要支持该协议的客户端。固定 werift 0.24.4，处理空文件 EOF、连接复用、授权撤销和资源清理；保留 512 MiB OSS 导出兜底。
+- 真实 Chromium + Cindy 接收器验证空文件、1B、16KiB、256KiB、跨批次及连续两次 32MiB+37B 文件，落盘 SHA-256 一致。
+
+### Fixed
+
+- **手机显示已插入而 DSH 仍排队**：不再把未消费输入混进正式历史；普通排队和等待插话均保留完整待发送内容，真正回流后才变为正式消息，重新进入会话仍可看到等待中的正文。
+- **任务标题退化为 Untitled DSH task**：缓存到期仅触发刷新，不清空已知标题；暂时读取失败、批次缺项或空白标题保留最后有效值。过滤从未输入过内容的空白会话。
+- 通道审计明确分类当前不支持的远端模型收藏与下一条输入预测，不再把它们当成未决通道；未新增这两项能力。
+
+### 限制
+
+- 手机真机、前后台行为、跨 NAT 和公网 TURN UDP/TCP/TLS、完整 2 GiB 文件尚未实测。
+- 不新增手机上传、持久断点续传或嵌套 SSH 文件导出；直传失败时大于 512 MiB 的文件不能由旧 OSS 导出接管。详见 [文件直传说明](doc/file-transfer.md)。
+- 发布/更新安装包不等于运行进程生效；安装后仍需手动重启原 DSH Web。
+
 ## [0.1.8] - 2026-09-18
 
 ### Fixed

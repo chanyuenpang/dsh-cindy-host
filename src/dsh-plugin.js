@@ -41,7 +41,40 @@ const ControllerSchema = Schema.object({ state: Schema.union(['authorized', 'rev
 // actions DSH has no concept of. `pinnedAt: ''` is a remembered unpin (settings
 // reject `null`, and an absent field cannot be told apart from "never pinned").
 const SessionFlagSchema = Schema.object({ status: Schema.union(['active', 'archived', 'deleted']), pinnedAt: Schema.string() });
-const HostSchema = Schema.object({ transportEnabled: Schema.boolean(), remoteControlEnabled: Schema.boolean(), controllers: Schema.dict(ControllerSchema), deviceId: Schema.string(), sessionFlags: Schema.dict(SessionFlagSchema) });
+
+/**
+ * This bundle's settings schema.
+ *
+ * Each field restates the matching `DEFAULT_HOST_SETTINGS` entry, so a profile that has never
+ * written a value still resolves a complete object rather than an empty one.
+ */
+const HostSettingsSchema = Schema.object({
+  transportEnabled: Schema.boolean().default(DEFAULT_HOST_SETTINGS.transportEnabled),
+  remoteControlEnabled: Schema.boolean().default(DEFAULT_HOST_SETTINGS.remoteControlEnabled),
+  controllers: Schema.dict(ControllerSchema).default({}),
+  deviceId: Schema.string().default(DEFAULT_HOST_SETTINGS.deviceId),
+  sessionFlags: Schema.dict(SessionFlagSchema).default({}),
+});
+
+/**
+ * The schema DSH projects as this entry's settings surface.
+ *
+ * DSH 0.2 reads a plugin **entry's own `Config`** (`SettingsForms.describe()`, keyed by profile
+ * entry id) and accepts a write only to a field beneath a **volatile** node, so the root is
+ * marked volatile when the running schemastery supports it: one volatile root is the exact
+ * equivalent of the namespace-wide registration that 0.2 removed (see
+ * {@link createSettingsScope}).
+ *
+ * `volatile()` is **feature-detected on purpose**: schemastery `3.18.2` — the copy DSH
+ * `0.1.5-rc.2` resolves, and still inside this bundle's declared `^3.18.1` peer range — has no
+ * such method, so calling it unconditionally would throw while this module loads and take the
+ * whole profile down. Without it the plain schema still serves the 0.1.x `settings.register`
+ * path, which does not need the marker.
+ */
+const HostSchema = typeof HostSettingsSchema.volatile === 'function' ? HostSettingsSchema.volatile() : HostSettingsSchema;
+
+/** The plugin entry's settings surface; see {@link createSettingsScope}. */
+export const Config = HostSchema;
 
 /**
  * Services that can supply the DSH session read source, in preference order.
@@ -1167,6 +1200,7 @@ export function buildDiagnostics({ runtime, sourceKind, seam, listingDiagnostics
   };
   return {
     dataSource: sourceKind,
+    transfers: field(() => runtime?.getTransferDiagnostics?.() ?? null, null),
     projectionRunning: runtime?.projectionRunning === true,
     projectedSessions: field(() => (runtime ? runtime.model.list().length : 0), 0),
     // What a controller actually asked for and what it got back, with the
@@ -1389,8 +1423,83 @@ export function sessionFlagsWriter(settings, ns) {
   return (sessionFlags) => settings.mutate(ns, [{ op: 'set', path: ['sessionFlags'], value: sessionFlags }]);
 }
 
-export function apply(ctx) {
-  const scope = ctx.settings.register(settingsNamespace(SETTINGS_NAMESPACE), HostSchema, { base: DEFAULT_HOST_SETTINGS, applies: 'live', validate: validateHostSettings });
+/**
+ * The settings seam, for both DSH generations this bundle supports.
+ *
+ * **0.1.x**: `settings.register(ns, schema, options)` publishes a plugin's settings and returns
+ * a live scope (`get`/`watch`/`update`/`replace`). The registration is *also* what makes
+ * `update(ns, …)` and `mutate(ns, …)` accept this namespace — their write path looks the
+ * namespace up in the provider's registration table.
+ *
+ * **0.2 removed `register`.** The host now reads the plugin **entry's own `Config`** schema
+ * (`SettingsForms.describe()`, keyed by **profile entry id**), resolves it, and hands the value
+ * to `apply(ctx, config)`; `update`/`mutate` address that same entry id. This bundle's row is
+ * `- id: dsh-cindy-host` (see `cordis.patch.yml`), so `SETTINGS_NAMESPACE` names the same
+ * surface under both models — only the way the plugin obtains it differs. Hence one seam with
+ * two branches instead of two code paths through the rest of the plugin.
+ *
+ * The returned object always has the 0.1.x scope shape, so every consumer below is
+ * generation-agnostic.
+ *
+ * @param ctx - the plugin context that owns the `settings` service.
+ * @param entryId - the namespace (0.1.x) / profile entry id (0.2) this bundle writes.
+ * @param projected - the host-resolved `Config` value; only 0.2 supplies it.
+ * @returns the settings scope described above.
+ */
+function createSettingsScope(ctx, entryId, projected) {
+  const { settings } = ctx;
+  if (typeof settings.register === 'function') {
+    return settings.register(entryId, HostSchema, { base: DEFAULT_HOST_SETTINGS, applies: 'live', validate: validateHostSettings });
+  }
+  if (projected === undefined) throw new Error('dsh-cindy-host: the host resolved no Config for this entry, so there is nowhere to read settings from');
+  // The schema declares every field, but schemastery does not materialize those defaults in the
+  // resolved value, so the base is merged here: a profile that has never written settings must
+  // still hand the runtime a complete object.
+  const base = { ...DEFAULT_HOST_SETTINGS, ...projected };
+  validateHostSettings(base);
+
+  let current = base;
+  const watchers = new Set();
+  const publish = (next) => {
+    current = next;
+    // One watcher throwing must not take the others — or the write that triggered them — down.
+    // `runtime?.updateSettings` is called on a runtime the host may already be replacing, which
+    // is exactly the shape that turns into an unhandled rejection and a dead `dsh web`.
+    for (const callback of [...watchers]) {
+      try {
+        callback(next);
+      } catch (error) {
+        ctx.logger?.warn?.(`dsh-cindy-host settings: a watcher threw and was contained: ${String(error)}`);
+      }
+    }
+  };
+
+  return {
+    get: () => current,
+    /**
+     * A write is persisted by the host, which re-applies this entry, so the new value normally
+     * arrives as a fresh `apply(ctx, config)`. Publishing locally as well covers the window
+     * before that remount and keeps `watch` meaningful for a reader in the same tick.
+     */
+    watch: (callback) => {
+      watchers.add(callback);
+      return () => {
+        watchers.delete(callback);
+      };
+    },
+    update: async (patch) => {
+      await settings.update(entryId, patch);
+      publish({ ...current, ...patch });
+    },
+    replace: async (section) => {
+      await settings.replace(entryId, section);
+      publish({ ...DEFAULT_HOST_SETTINGS, ...section });
+    },
+  };
+}
+
+export function apply(ctx, config) {
+  const scope = createSettingsScope(ctx, settingsNamespace(SETTINGS_NAMESPACE), config);
   let runtime;
   // The source can arrive before OR after the runtime: `startHost` awaits a
   // Cindy session before resolving, while `ctx.inject` fires the moment the DSH
