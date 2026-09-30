@@ -309,6 +309,15 @@ export function createApprovalRegistry({
     return { accepted: true };
   }
 
+
+  /** Settle one pending interaction with an outcome already validated by DSH's local UI. */
+  function settleOutcome(requestId, outcome) {
+    const entry = pending.get(requestId);
+    if (entry === undefined) return { accepted: false };
+    entry.settle(outcome);
+    return { accepted: true };
+  }
+
   /** Forget every open question (the switch going off). */
   function clear() {
     for (const requestId of [...pending.keys()]) {
@@ -316,5 +325,5 @@ export function createApprovalRegistry({
     }
   }
 
-  return { ask, askUser, list, observeUserQuestions, settle, clear, size: () => pending.size };
+  return { ask, askUser, list, observeUserQuestions, settle, settleOutcome, clear, size: () => pending.size };
 }

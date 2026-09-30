@@ -674,6 +674,7 @@ export function buildDshSource(ctx, serviceName, options = {}) {
       subscribe: (name, listener) => ctx.on(name, listener),
       readTitles: sessionQuery === undefined ? undefined : (ids) => readTitles(sessionQuery, ids),
       readSessionMeta: sessionQuery === undefined ? undefined : (ids) => readSessionMeta(sessionQuery, ids),
+      readActivityEvidence: typeof readMessages?.activity === 'function' ? (sessionId) => readMessages.activity(sessionId) : undefined,
       // ID lookup is not sidebar discovery. New drafts exist before they have a
       // user turn and must be readable without waiting for the list cache.
       readSessionSummary: typeof sessionQuery?.observeSession !== 'function' ? undefined : async (sessionId) => {
@@ -1536,6 +1537,52 @@ export function createSettingsScope(ctx, entryId, projected) {
   };
 }
 
+
+/**
+ * Present one interaction to Cindy and the downstream DSH UI, settling on the first answer.
+ * The downstream branch receives a private abort signal so the losing local card is dismissed;
+ * without that cancellation contract a Promise.race would leak a parked waterfall listener.
+ */
+export async function arbitrateInteraction({ request, next, begin, settleLocal }) {
+  const handle = await begin();
+  if (handle === null) return next();
+
+  const downstreamAbort = new AbortController();
+  const upstreamSignal = request?.signal;
+  const downstreamSignal = upstreamSignal === undefined
+    ? downstreamAbort.signal
+    : AbortSignal.any([upstreamSignal, downstreamAbort.signal]);
+  let cancellable = false;
+  try {
+    request.signal = downstreamSignal;
+    cancellable = request.signal === downstreamSignal;
+  } catch {
+    try {
+      Object.defineProperty(request, 'signal', { value: downstreamSignal, configurable: true, writable: true });
+      cancellable = request.signal === downstreamSignal;
+    } catch {
+      cancellable = false;
+    }
+  }
+  // Never start a branch we cannot dismiss; keep the existing Cindy answer path instead.
+  if (!cancellable) return handle.answered;
+
+  const controller = Promise.resolve(handle.answered).then((value) => ({ kind: 'controller', value }));
+  const local = Promise.resolve().then(next).then(
+    (value) => ({ kind: 'local', value }),
+    (error) => ({ kind: 'local-error', error }),
+  );
+  const first = await Promise.race([controller, local]);
+  if (first.kind === 'local-error') return (await controller).value;
+  if (first.kind === 'local') {
+    settleLocal(handle.requestId, first.value);
+    return first.value;
+  }
+  downstreamAbort.abort(new Error('interaction settled by Cindy'));
+  void local.then(() => undefined, () => undefined);
+  return first.value;
+}
+
 export function apply(ctx, config) {
   const scope = createSettingsScope(ctx, settingsNamespace(SETTINGS_NAMESPACE), config);
   let runtime;
@@ -1787,6 +1834,7 @@ export function apply(ctx, config) {
     if (currentSeam !== undefined && currentSeam !== null && typeof currentSeam.readMessages === 'function'
       && typeof currentSeam.readMessages.noteEvent === 'function') {
       currentSeam.readMessages.noteEvent(sessionId, event);
+      currentSource?.invalidateActivityEvidence?.(sessionId);
     }
     // A harness notice is hidden from the phone (the fold returns no rows for it), and the count is
     // what keeps that hiding honest: "there was nothing to show" and "the Host dropped a message"
@@ -1809,17 +1857,20 @@ export function apply(ctx, config) {
   // UI — or the fail-closed default — decides. Swallowing a question the user
   // could have answered at the desk would be worse than not answering at all.
   ctx.effect(() => ctx.on('approval/request', guarded('approval-request', async (req, next) => {
-    if (!runtime || typeof runtime.askApproval !== 'function') return next();
+    if (!runtime || typeof runtime.beginApproval !== 'function') return next();
     const sessionId = req?.agent?.session?.header?.id;
-    const outcome = await runtime.askApproval({
-      sessionId: typeof sessionId === 'string' ? sessionId : '',
-      toolName: typeof req?.toolName === 'string' ? req.toolName : '',
-      reason: req?.reason,
-      callId: req?.callId,
-      signal: req?.signal,
+    return arbitrateInteraction({
+      request: req,
+      next,
+      begin: () => runtime.beginApproval({
+        sessionId: typeof sessionId === 'string' ? sessionId : '',
+        toolName: typeof req?.toolName === 'string' ? req.toolName : '',
+        reason: req?.reason,
+        callId: req?.callId,
+        signal: req?.signal,
+      }),
+      settleLocal: (requestId, outcome) => runtime.settleInteractionOutcome(requestId, outcome),
     });
-    // `null` means nobody was watching: pass the question down the chain.
-    return outcome === null ? next() : outcome;
     // `prepend` and `global` are both REQUIRED, and this is the difference between
     // a phone that can answer a card and one that never sees one.
     //
@@ -1844,15 +1895,18 @@ export function apply(ctx, config) {
   // the question. Same rule as approvals: only claim questions for a session a
   // controller is watching, and pass the rest down the chain.
   ctx.effect(() => ctx.on('user-questions/request', guarded('user-questions-request', async (request, next) => {
-    if (!runtime || typeof runtime.askUserQuestion !== 'function') return next();
+    if (!runtime || typeof runtime.beginUserQuestion !== 'function') return next();
     const sessionId = request?.agent?.session?.header?.id;
-    const answer = await runtime.askUserQuestion({
-      sessionId: typeof sessionId === 'string' ? sessionId : '',
-      questions: request?.questions,
-      signal: request?.signal,
+    return arbitrateInteraction({
+      request,
+      next,
+      begin: () => runtime.beginUserQuestion({
+        sessionId: typeof sessionId === 'string' ? sessionId : '',
+        questions: request?.questions,
+        signal: request?.signal,
+      }),
+      settleLocal: (requestId, outcome) => runtime.settleInteractionOutcome(requestId, outcome),
     });
-    // `null` means nobody was watching: let the local UI answer it.
-    return answer === null ? next() : answer;
     // Same `prepend` + `global` requirement as the approval answerer above, and the
     // same reason: this waterfall is agent-scoped and the Web bundle's remote
     // forwarding listener parks ahead of a late registration.

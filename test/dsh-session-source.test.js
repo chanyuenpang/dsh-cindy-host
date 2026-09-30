@@ -56,6 +56,46 @@ test('maps only non-blank host sessions into conversation rows', async () => {
   ]);
 });
 
+
+test('projects exact transcript activity and invalidates it on live changes', async () => {
+  let reads = 0;
+  const source = createSessionControllerSource({
+    sessionController: makeController([{ sessionId: 's1', updatedAt: 1_700_000_000_000, running: false, blank: false, cwd: 'G:/project' }]),
+    subscribe: makeSubscribe(),
+    readActivityEvidence: async () => {
+      reads += 1;
+      return { messageCount: reads, userSendAt: '2026-01-01T00:00:00.000Z' };
+    },
+  });
+  const [first] = await source.listSessions();
+  assert.deepEqual({ messageCount: first.messageCount, userSendAt: first.userSendAt }, {
+    messageCount: 1, userSendAt: '2026-01-01T00:00:00.000Z',
+  });
+  await source.listSessions();
+  assert.equal(reads, 1, 'stable transcript evidence is cached across list polls');
+  assert.equal(source.invalidateActivityEvidence('s1'), true);
+  const [fresh] = await source.listSessions();
+  assert.equal(fresh.messageCount, 2, 'a live event invalidates the evidence for the next poll');
+
+  const wire = toCindySessionListRow(first, { device: { deviceId: 'd', deviceName: 'Host' } });
+  assert.equal(wire.userSendAt, '2026-01-01T00:00:00.000Z');
+  assert.deepEqual(wire._count, { messages: 1 });
+});
+
+test('unknown transcript evidence remains unknown instead of fabricating project activity', async () => {
+  const source = createSessionControllerSource({
+    sessionController: makeController([{ sessionId: 's1', updatedAt: 1_700_000_000_000, running: false, blank: false, cwd: 'G:/project' }]),
+    subscribe: makeSubscribe(),
+    readActivityEvidence: async () => { throw new Error('unreadable'); },
+  });
+  const [row] = await source.listSessions();
+  assert.equal('messageCount' in row, false);
+  assert.equal('userSendAt' in row, false);
+  const wire = toCindySessionListRow(row, { device: { deviceId: 'd', deviceName: 'Host' } });
+  assert.equal(wire.userSendAt, null);
+  assert.equal(wire._count, null);
+});
+
 test('folds the session’s model, source and effort out of the same projection', async () => {
   // 三个值同源:同一个 `modelSelection` 投影。少带 providerId,控制端为下一个对话推导的
   // runtime 就会有模型没来源。

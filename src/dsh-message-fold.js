@@ -560,6 +560,19 @@ export function createMessageReader({
   readMessages.noteEvent = noteEvent;
   readMessages.invalidate = invalidate;
   readMessages.count = countRows;
+  /** Exact project-grouping evidence derived from the same folded transcript. */
+  readMessages.activity = async (sessionId) => {
+    const rows = await ensureTranscript(sessionId);
+    let userSendAt = null;
+    for (let index = rows.length - 1; index >= 0; index -= 1) {
+      const row = rows[index];
+      if (row?.role === 'user' && typeof row.createdAt === 'string' && row.createdAt !== '') {
+        userSendAt = row.createdAt;
+        break;
+      }
+    }
+    return { messageCount: rows.length, userSendAt };
+  };
   /**
    * The whole cached transcript, newest first.
    *

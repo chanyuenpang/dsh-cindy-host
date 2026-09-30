@@ -947,27 +947,26 @@ export async function startHost(initialSource, settings = DEFAULT_HOST_SETTINGS,
    * `next()` and let the local UI — or DSH's fail-closed default — decide. A
    * Host must never swallow a question the user could have answered at the desk.
    */
-  async function askApproval({ sessionId, toolName, reason, callId, signal }) {
+  async function beginApproval({ sessionId, toolName, reason, callId, signal }) {
     if (typeof sessionId !== 'string' || sessionId === '') return null;
     if (!claimsInteraction(sessionId)) return null;
-    const { request, answered } = await approvals.ask({ sessionId, toolName, reason, callId, signal });
-    // `{ sessionId, request }`, **not** the bare request. Both clients read the frame as
-    // `payload.sessionId` plus a **nested** `payload.request` and drop anything else in
-    // silence:
-    //   remoteSessionStore.ts:  const request = isRecord(payload.request) ? payload.request : null;
-    //                           if (sessionId && request) applyInteractionRequest(...)
-    //   makerChatStore.ts:      const payload = raw as { sessionId?, request?: { requestId?, kind? } }
-    // Sending the request flat therefore reached a watching controller and rendered
-    // nothing — the card existed on the Host, was pushed to one watcher, and no client
-    // ever showed it. `maker:get-pending-interactions` answers this same nested shape,
-    // which is why testing through the list hid the bug.
-    pushSessionUpdate(sessionId, 'maker:interaction-request', { sessionId, request });
-    return answered;
+    const handle = await approvals.ask({ sessionId, toolName, reason, callId, signal });
+    pushSessionUpdate(sessionId, 'maker:interaction-request', { sessionId, request: handle.request });
+    return handle;
+  }
+
+  async function askApproval(options) {
+    const handle = await beginApproval(options);
+    return handle === null ? null : handle.answered;
   }
 
   /** Answer one pending interaction on the controller's behalf. */
   function resolveInteraction(requestId, decision) {
     return approvals.settle(requestId, decision);
+  }
+
+  function settleInteractionOutcome(requestId, outcome) {
+    return approvals.settleOutcome(requestId, outcome);
   }
 
   /**
@@ -982,13 +981,17 @@ export async function startHost(initialSource, settings = DEFAULT_HOST_SETTINGS,
    * Returns `null` when nobody is watching, which is the answerer's cue to call
    * `next()`.
    */
-  async function askUserQuestion({ sessionId, questions, signal }) {
+  async function beginUserQuestion({ sessionId, questions, signal }) {
     if (typeof sessionId !== 'string' || sessionId === '') return null;
     if (!claimsInteraction(sessionId)) return null;
-    const { request, answered } = await approvals.askUser({ sessionId, questions, signal });
-    // Same nested shape as `askApproval` above, for the same reason.
-    pushSessionUpdate(sessionId, 'maker:interaction-request', { sessionId, request });
-    return answered;
+    const handle = await approvals.askUser({ sessionId, questions, signal });
+    pushSessionUpdate(sessionId, 'maker:interaction-request', { sessionId, request: handle.request });
+    return handle;
+  }
+
+  async function askUserQuestion(options) {
+    const handle = await beginUserQuestion(options);
+    return handle === null ? null : handle.answered;
   }
 
   /**
@@ -2385,8 +2388,12 @@ export async function startHost(initialSource, settings = DEFAULT_HOST_SETTINGS,
       inputQueue.mirror(sessionId, controllerId, { kind: 'remove' });
       pushSessionUpdate(sessionId, 'maker:input:projection', inputQueue.projectionFor(sessionId, sessionRowFor(sessionId)));
     },
+    /** Begin a controller approval and expose its cancellable pending handle. */
+    beginApproval,
     /** Ask the watching controllers to decide a DSH approval; null when none is watching. */
     askApproval,
+    /** Begin a controller question and expose its cancellable pending handle. */
+    beginUserQuestion,
     /** Ask the watching controllers a structured question; null when none is watching. */
     askUserQuestion,
     /** Fold one `sessionController.control()` frame into the input queue. */
@@ -2461,6 +2468,8 @@ export async function startHost(initialSource, settings = DEFAULT_HOST_SETTINGS,
     observeUserQuestions: (observer) => approvals.observeUserQuestions(observer),
     /** Both Web and Android answers go through this one registry settlement. */
     resolveInteraction,
+    /** A DSH-local UI answer is already in DSH outcome form. */
+    settleInteractionOutcome,
     updateSettings,
     connect,
     /** The card's reconnect button: retry immediately and forget the backoff ladder. */

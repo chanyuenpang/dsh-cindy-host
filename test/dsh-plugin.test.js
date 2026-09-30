@@ -1,6 +1,53 @@
 import test from 'node:test';
 import assert from 'node:assert/strict';
-import { inject, name, apply, buildDiagnostics, buildDshSource, buildGoalWrite, capabilityProvider, foldTitleSnapshots, sessionFlagsWriter } from '../src/dsh-plugin.js';
+import { inject, name, apply, arbitrateInteraction, buildDiagnostics, buildDshSource, buildGoalWrite, capabilityProvider, foldTitleSnapshots, sessionFlagsWriter } from '../src/dsh-plugin.js';
+
+
+test('local DSH and Cindy race one interaction, and local first dismisses Cindy', async () => {
+  const request = { signal: new AbortController().signal };
+  let settleController;
+  const controller = new Promise((resolve) => { settleController = resolve; });
+  const settled = [];
+  const result = await arbitrateInteraction({
+    request,
+    next: async () => ({ answers: [{ id: 'q', selected: ['local'] }] }),
+    begin: async () => ({ requestId: 'r1', answered: controller }),
+    settleLocal: (id, value) => { settled.push([id, value]); settleController(value); },
+  });
+  assert.deepEqual(result.answers[0].selected, ['local']);
+  assert.deepEqual(settled.map(([id]) => id), ['r1']);
+});
+
+test('Cindy first aborts the downstream DSH card instead of leaving a parked listener', async () => {
+  const request = { signal: new AbortController().signal };
+  let aborted = false;
+  const result = await arbitrateInteraction({
+    request,
+    next: () => new Promise((_resolve, reject) => {
+      request.signal.addEventListener('abort', () => { aborted = true; reject(request.signal.reason); }, { once: true });
+    }),
+    begin: async () => ({ requestId: 'r2', answered: Promise.resolve('allowed-once') }),
+    settleLocal: () => { throw new Error('local did not win'); },
+  });
+  assert.equal(result, 'allowed-once');
+  await new Promise((resolve) => setImmediate(resolve));
+  assert.equal(aborted, true);
+});
+
+test('a failed local surface leaves the Cindy answer path alive', async () => {
+  const request = {};
+  let answer;
+  const controller = new Promise((resolve) => { answer = resolve; });
+  const pending = arbitrateInteraction({
+    request,
+    next: async () => { throw new Error('browser disconnected'); },
+    begin: async () => ({ requestId: 'r3', answered: controller }),
+    settleLocal: () => {},
+  });
+  await Promise.resolve();
+  answer({ answers: [{ id: 'q', selected: ['mobile'] }] });
+  assert.deepEqual((await pending).answers[0].selected, ['mobile']);
+});
 
 test('exports the DSH Host bundle identity and only requires settings', () => {
   assert.equal(name, 'dsh-cindy-host');

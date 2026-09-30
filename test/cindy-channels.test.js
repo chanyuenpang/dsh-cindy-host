@@ -139,6 +139,7 @@ test('the supported set is exactly what the router serves', () => {
     'maker:create-session',
     'maker:get-capabilities',
     'maker:get-context-usage',
+    'maker:get-new-maker-defaults',
     'maker:get-pending-interactions',
     'maker:regenerate-title',
     'maker:git-safety:get',
@@ -1112,6 +1113,23 @@ test('answers the agent roster the phone asks for on every device open', async (
 });
 
 
+
+test('remote new-session defaults come from DSH catalog truth, not controller preferences', async () => {
+  const router = createChannelRouter({
+    listSessions: async () => ROWS,
+    resolveCapabilities: () => ({ modelCatalog: async () => ({
+      default: { provider: 'deepseek', model: 'deepseek-chat' },
+      groups: [{ id: 'deepseek', models: [{ id: 'deepseek-chat', reasoning: {
+        efforts: [{ id: 'low' }, { id: 'high' }], defaultEffort: 'high',
+      } }] }],
+    }) }),
+    subscribers: new Set(),
+  });
+  const result = await router(request('maker:get-new-maker-defaults', ['codex']));
+  assert.deepEqual(result.payload.result, {
+    model: 'deepseek-chat', modelChosenByUser: false, effort: 'high', fastMode: false, providerId: 'deepseek',
+  });
+});
 
 test('serves Cindy desktop provider views and maps permission controls', async () => {
   const writes = [];

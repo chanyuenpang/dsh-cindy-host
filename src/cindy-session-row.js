@@ -120,7 +120,10 @@ export function toCindySessionListRow(item, { now = () => new Date(), device, de
     workspaceKind: workingDir === null ? 'dialogue' : 'project',
     // A blank session has no user turn yet; the controller shows it as a draft.
     preview: null,
-    _count: null,
+    userSendAt: typeof item.userSendAt === 'string' && item.userSendAt !== '' ? item.userSendAt : null,
+    _count: Number.isFinite(item.messageCount) && item.messageCount >= 0
+      ? { messages: Math.floor(item.messageCount) }
+      : null,
     // Not part of the stored row's contract, but harmless and honest: the
     // controller reads running state from `maker:list-active`, not from here.
     running: item.running === true,

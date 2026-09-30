@@ -57,6 +57,7 @@ export function createSessionControllerSource({
   subscribe,
   readTitles,
   readSessionMeta,
+  readActivityEvidence,
   readSessionSummary,
   readActiveSessions,
   listTimeoutMs = 15_000,
@@ -70,6 +71,8 @@ export function createSessionControllerSource({
   // the handset reads as "the computer is not responding". Bounded, the same read costs
   // one batch and the rest of the titles arrive over the next few polls.
   titleRefreshBudget = 16,
+  // Transcript folds are heavier than title reads; keep the visible-path batch small.
+  activityRefreshBudget = 4,
   // A cached title is re-read at most this often, so a title changed by DSH's own
   // regeneration heals without this module needing to hear about it.
   titleTtlMs = 60_000,
@@ -85,6 +88,10 @@ export function createSessionControllerSource({
   const titleCache = new Map();
   /** The in-flight background title warm-up, or null. At most one runs at a time. */
   let warming = null;
+  /** Exact `{ messageCount, userSendAt }` observations, invalidated by live events. */
+  const activityEvidenceCache = new Map();
+  /** The one background transcript-evidence warm-up. */
+  let activityWarming = null;
   /** The one listing read currently in flight, shared by every concurrent caller. */
   let inFlightList = null;
   /** The last listing that was really read, and when — the stale fallback's whole state. */
@@ -172,6 +179,52 @@ export function createSessionControllerSource({
       // A warm-up that fails is a missing label, never a broken list.
     }).finally(() => {
       warming = null;
+    });
+  }
+
+
+
+  /** Read exact transcript evidence without making the whole list wait for every log. */
+  async function activitiesFor(sessionIds) {
+    const out = new Map();
+    if (typeof readActivityEvidence !== 'function') return out;
+    const missing = [];
+    for (const id of sessionIds) {
+      const cached = activityEvidenceCache.get(id);
+      if (cached !== undefined) out.set(id, cached);
+      else missing.push(id);
+    }
+    const batch = missing.slice(0, activityRefreshBudget);
+    if (batch.length > 0) await foldActivities(batch, out);
+    if (missing.length > batch.length) void warmActivities(missing.slice(activityRefreshBudget));
+    return out;
+  }
+
+  async function foldActivities(ids, out) {
+    const settled = await Promise.allSettled(ids.map((id) => readActivityEvidence(id)));
+    settled.forEach((result, index) => {
+      if (result.status !== 'fulfilled') return;
+      const value = result.value;
+      if (!Number.isFinite(value?.messageCount) || value.messageCount < 0) return;
+      if (value.userSendAt !== null && typeof value.userSendAt !== 'string') return;
+      const evidence = { messageCount: Math.floor(value.messageCount), userSendAt: value.userSendAt };
+      activityEvidenceCache.set(ids[index], evidence);
+      out?.set(ids[index], evidence);
+    });
+  }
+
+  function warmActivities(ids) {
+    if (activityWarming !== null || ids.length === 0) return;
+    activityWarming = (async () => {
+      for (let index = 0; index < ids.length; index += activityRefreshBudget) {
+        const batch = ids.slice(index, index + activityRefreshBudget)
+          .filter((id) => !activityEvidenceCache.has(id));
+        if (batch.length > 0) await foldActivities(batch);
+      }
+    })().catch(() => {
+      // Unknown evidence leaves a row unclassified; it never invents activity.
+    }).finally(() => {
+      activityWarming = null;
     });
   }
 
@@ -264,11 +317,12 @@ export function createSessionControllerSource({
           createdAtCache.set(String(item.sessionId), { createdAt: new Date(item.createdAt).toISOString(), cwd: item.cwd });
         }
       }
-      const [titles] = await Promise.all([titlesFor(ids), metaFor(ids)]);
+      const [titles, , activities] = await Promise.all([titlesFor(ids), metaFor(ids), activitiesFor(ids)]);
       return items.map((item) => {
         const id = String(item.sessionId);
         const updatedAt = Number.isFinite(item.updatedAt) ? new Date(item.updatedAt).toISOString() : new Date().toISOString();
         const meta = createdAtCache.get(id);
+        const activity = activities.get(id);
         // The session's own model, when the list already carries the
         // `modelSelection` projection. It is free here — the value rides the
         // list response — and it is what lets the controller's picker show the
@@ -305,6 +359,7 @@ export function createSessionControllerSource({
           ...(typeof selectedProvider === 'string' && selectedProvider !== '' ? { providerId: selectedProvider } : {}),
           ...(typeof selectedEffort === 'string' && selectedEffort !== '' ? { effort: selectedEffort } : {}),
           ...(currentPermission === undefined ? {} : { permissionMode: currentPermission }),
+          ...(activity === undefined ? {} : { messageCount: activity.messageCount, userSendAt: activity.userSendAt }),
           blank: item.blank === true,
         };
       });
@@ -312,6 +367,9 @@ export function createSessionControllerSource({
 
   return {
     invalidateListing,
+    invalidateActivityEvidence(sessionId) {
+      return activityEvidenceCache.delete(sessionId);
+    },
     /** A list hides drafts; an exact ID read must still resolve a real new draft. */
     async getSession(sessionId) {
       if (typeof sessionId !== 'string' || sessionId === '') return undefined;

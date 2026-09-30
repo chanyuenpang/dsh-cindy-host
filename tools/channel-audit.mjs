@@ -52,10 +52,6 @@ const DECLINED = [
   { match: (channel) => channel.startsWith('maker:learn') || channel.startsWith('learn:'), why: 'learn family — plan rule' },
   { match: (channel) => channel.startsWith('maker:plugins'), why: 'plugin management — plan rule' },
   { match: (channel) => /bot/i.test(channel), why: 'bots family — plan rule' },
-  {
-    match: (channel) => channel.startsWith('maker:provider:list'),
-    why: 'deliberate: a successful empty catalog hides the model list (defect #18). The client has a designed path for the refusal — `useDeviceProviders`: "仅结构化确认旧端没有 provider:list 时允许 capabilities-only 回退" — so refusing is what makes its capability-only fallback legitimate rather than a guess',
-  },
   { match: (channel) => channel.startsWith('maker:set-fast-mode'), why: 'deliberate: every model declares supportsFastMode:false' },
   { match: (channel) => channel.startsWith('maker:set-session-model-pref') || channel.startsWith('maker:apply-new-maker-draft-pref'), why: 'desktop-only write-through tunnels; the phone degrades on refusal' },
   { match: (channel) => channel.startsWith('maker:api-key:present'), why: 'credential probing — not exposed by this Host' },
@@ -98,7 +94,6 @@ const DECLINED = [
     candidate: 'would need two halves: map a failed turn to a trailing `role: \'error\'` row, and serve retry as a re-send of the last user prompt (or the shared continue prompt when the failed turn already produced output)',
   },
   { match: (channel) => channel.startsWith('maker:input:compact'), why: 'the Claude-Code-specific compact; the phone uses maker:compact-session for a pi session' },
-  { match: (channel) => channel.startsWith('maker:get-new-maker-defaults'), why: 'the phone reads capabilities and the session row instead (its own type says so)' },
   { match: (channel) => channel.startsWith('notification:'), why: 'local notification state; the phone owns it' },
   {
     match: (channel) => channel.startsWith('fs:mkdir-p'),

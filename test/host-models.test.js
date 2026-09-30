@@ -1,6 +1,6 @@
 import test from 'node:test';
 import assert from 'node:assert/strict';
-import { toAgentCapabilities, toAvailableModels, modelIdFor, toCindyPermissionMode, toDshPermissionMode, toPermissionOptions, toProviderList } from '../src/host-models.js';
+import { toAgentCapabilities, toAvailableModels, modelIdFor, toCindyPermissionMode, toDshPermissionMode, toNewMakerDefaults, toPermissionOptions, toProviderList } from '../src/host-models.js';
 
 /** A DSH `ModelCatalog` with two providers. */
 function catalog() {
@@ -73,6 +73,13 @@ test('reports plan mode as the object the controller reads', () => {
 });
 
 
+
+test('derives only truthful new-session defaults from the DSH catalog', () => {
+  assert.deepEqual(toNewMakerDefaults(catalog()), {
+    model: 'deepseek-chat', modelChosenByUser: false, effort: 'low', fastMode: false, providerId: 'deepseek',
+  });
+  assert.deepEqual(toNewMakerDefaults({}), {});
+});
 
 test('projects the DSH catalog into Cindy desktop provider views', () => {
   const result = toProviderList(catalog(), ['claude-code', 'codex', 'pi']);

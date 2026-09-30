@@ -38,6 +38,21 @@ test('registers a question, lists it, and settles it with the controller answer'
   assert.equal(registry.size(), 0, 'an answered question leaves the registry');
 });
 
+
+test('a DSH-local answer settles the shared registry and rejects a late controller answer', async () => {
+  const dismissed = [];
+  const registry = createApprovalRegistry({ onDismissed: (event) => dismissed.push(event) });
+  const { requestId, answered } = await registry.askUser({
+    sessionId: 's1',
+    questions: [{ id: 'q1', question: 'Continue?', options: [{ label: 'Yes' }] }],
+  });
+  const local = { answers: [{ id: 'q1', selected: ['Yes'] }] };
+  assert.deepEqual(registry.settleOutcome(requestId, local), { accepted: true });
+  assert.deepEqual(await answered, local);
+  assert.deepEqual(dismissed, [{ sessionId: 's1', requestId }]);
+  assert.deepEqual(registry.settle(requestId, { kind: 'ask_user_question', answers: { 'Continue?': 'Yes' } }), { accepted: false });
+});
+
 test('an unknown id or an unmappable decision is refused, not acknowledged', async () => {
   const registry = createApprovalRegistry();
   const { requestId, answered } = await registry.ask({ sessionId: 's1', toolName: 'x' });

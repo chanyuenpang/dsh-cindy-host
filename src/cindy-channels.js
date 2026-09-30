@@ -15,7 +15,7 @@
  * phone would show a broken feature instead of an absent one.
  */
 import { agentKindForModel, toCindyActiveSessions, toCindySessionList, toCindySessionListRow } from './cindy-session-row.js';
-import { toAgentCapabilities, toCindyPermissionMode, toDshPermissionMode, toPermissionOptions, toProviderList } from './host-models.js';
+import { toAgentCapabilities, toCindyPermissionMode, toDshPermissionMode, toNewMakerDefaults, toPermissionOptions, toProviderList } from './host-models.js';
 import { queueItemsFromInbox } from './host-input-queue.js';
 import { toAgentSkills, toAgentCommands, toAtResources } from './host-palette.js';
 import { toGoalStatusPayload } from './host-goals.js';
@@ -236,6 +236,7 @@ export const SUPPORTED_CHANNELS = Object.freeze([
   'maker:list-available-agents',
   'maker:provider:list',
   'maker:get-capabilities',
+  'maker:get-new-maker-defaults',
   'maker:list-agent-skills',
   'maker:list-agent-commands',
   'maker:set-plan-mode',
@@ -688,6 +689,21 @@ export function createChannelRouter({
     // is presentation-only; model routing always follows the DSH selection.
     if (channel === 'maker:list-available-agents') {
       return invokeResult(request, [...DSH_AGENT_KINDS]);
+    }
+
+    if (channel === 'maker:get-new-maker-defaults') {
+      const requested = typeof args[0] === 'string' ? args[0] : null;
+      if (requested !== null && !DSH_AGENT_KINDS.includes(requested)) {
+        return invokeError(request, 'NOT_AVAILABLE', `DSH Host does not offer the ${requested} alias`);
+      }
+      const readCatalog = capabilitiesNow().modelCatalog;
+      if (typeof readCatalog !== 'function') return invokeResult(request, {});
+      try {
+        return invokeResult(request, toNewMakerDefaults(await readCatalog()));
+      } catch {
+        // Native Cindy also answers an empty object while its defaults cache is unavailable.
+        return invokeResult(request, {});
+      }
     }
 
     if (channel === 'maker:provider:list') {

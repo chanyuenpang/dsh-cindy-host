@@ -203,3 +203,29 @@ export function toProviderList(catalog, agentKinds = []) {
   }
   return { providers, providerOrder: providers.map((provider) => provider.id) };
 }
+
+/** The new-session defaults DSH can state without owning Cindy's draft preferences. */
+export function toNewMakerDefaults(catalog) {
+  const providerId = typeof catalog?.default?.provider === 'string' && catalog.default.provider !== ''
+    ? catalog.default.provider
+    : null;
+  const modelId = typeof catalog?.default?.model === 'string' && catalog.default.model !== ''
+    ? catalog.default.model
+    : null;
+  if (modelId === null) return {};
+  const group = (Array.isArray(catalog?.groups) ? catalog.groups : []).find((entry) => entry?.id === providerId);
+  const model = (Array.isArray(group?.models) ? group.models : []).find((entry) => entry?.id === modelId);
+  const efforts = Array.isArray(model?.reasoning?.efforts)
+    ? model.reasoning.efforts.map((effort) => effort?.id).filter((id) => typeof id === 'string' && id !== '')
+    : [];
+  const effort = typeof model?.reasoning?.defaultEffort === 'string' && efforts.includes(model.reasoning.defaultEffort)
+    ? model.reasoning.defaultEffort
+    : (efforts[0] ?? undefined);
+  return {
+    model: modelId,
+    modelChosenByUser: false,
+    ...(effort === undefined ? {} : { effort }),
+    fastMode: false,
+    providerId,
+  };
+}

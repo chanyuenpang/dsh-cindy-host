@@ -3,6 +3,28 @@
 本文件记录**用户可见**的变化与**每次发布验证过的 DSH 版本**。格式遵循
 [Keep a Changelog](https://keepachangelog.com/zh-CN/1.1.0/)，版本号遵循语义化版本。
 
+## [0.1.18] - 2026-10-01
+
+验证环境：DSH **0.2.0-rc.2**（桌面端）与 **0.1.5-rc.2**（Web profile），Node **24.12.0**；要求 Node >=22，werift 固定 **0.24.4**。
+
+### Fixed
+
+- **桌面项目分类恢复。** Host 从 DSH transcript 的同一 fold 派生精确 `messageCount` 与首条 durable user 消息时间 `userSendAt`，通过 4 会话有界批次预热并缓存；live event 会失效对应证据。Cindy 的远程项目分组因此能区分已有内容的项目任务和真草稿，不再把所有 DSH 会话放进“未分类”。未知/不可读证据保持 `null`，绝不伪造固定计数或发送时间。
+- **DSH 与 Cindy 可同时处理 approval / ask_user_question。** 单一 Host registry 向两端 fan-out，同一 pending 由任一端首答原子结算；本地先答会 dismiss Cindy，Cindy 先答会 abort DSH 下游卡片，late answer 返回未接受。本地 UI 失败时 Cindy 路径继续有效；不使用无取消合同的裸 `Promise.race`。
+- **远程新建草稿默认值补齐。** `maker:get-new-maker-defaults` 从 DSH `modelCatalog.default` 投影 model/provider/default effort 与真实 `fastMode:false`，不冒充 Cindy 本地 draft preference；catalog 暂不可读时按 Cindy 原生语义返回 `{}`。
+
+### Contract audit
+
+- 固化 P0 发现/身份、P1 对话闭环、P2 会话控制的 owner / read / write / push / capability / shape / error 矩阵。
+- 继续 fail-closed 的独立产品家族：Orca、Bots/Workers、Schedule/Automation、Remote Desktop、Voice、Telegram、Learn、Usage、Memory、Worktree/Git Review、PI Subagent tree，以及 Cindy 自己拥有的 sidebar/project-order 与草稿偏好写穿。
+- `tools/channel-audit.mjs`：所有 allowlist channel 继续是 served 或有理由 declined，`unclassified: 0`；provider/defaults 的陈旧拒绝规则已删除。
+
+### 验证
+
+- 完整单元与契约测试：**754 通过 / 1 跳过 / 0 失败**。
+- 新增 project grouping activity evidence、local-first/Cindy-first/DSH-local-failure/late-answer、draft defaults 与 fail-closed 契约测试。
+- 仍需目标 Profile 安装并重启后，在真实 Cindy 桌面完成项目分类与双端询问卡的最终人工体验确认。
+
 ## [0.1.17] - 2026-10-01
 
 验证环境：DSH **0.2.0-rc.2**（桌面端）与 **0.1.5-rc.2**（Web profile），Node **24.12.0**；要求 Node >=22，werift 固定 **0.24.4**。

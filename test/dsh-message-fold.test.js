@@ -216,6 +216,27 @@ test('concurrent count, whole view and page share one transcript seed', async ()
   assert.equal(reads, 2, 'invalidation after settlement really re-reads');
 });
 
+test('activity evidence uses the folded rows and first durable user timestamp', async () => {
+  let reads = 0;
+  const reader = createMessageReader({ readSessionLog: async () => {
+    reads += 1;
+    return { events: [
+      { type: 'user/message', seq: 1, time: 1_000, surfaceOp: 'append', data: {
+        id: 'u1', role: 'user', source: { kind: 'user', rpcId: 'c1' }, content: [{ type: 'text', text: 'hello' }],
+      } },
+      { type: 'assistant/message', seq: 2, time: 2_000, surfaceOp: 'append', data: {
+        message: { id: 'a1', role: 'assistant', content: [{ type: 'text', text: 'world' }] },
+      } },
+    ] };
+  } });
+  assert.deepEqual(await reader.activity('s1'), {
+    messageCount: 2,
+    userSendAt: new Date(1_000).toISOString(),
+  });
+  assert.equal(await reader.count('s1'), 2);
+  assert.equal(reads, 1, 'activity and count reuse one transcript fold');
+});
+
 test('seed singleflight is per session, not a global read lock', async () => {
   const first = deferredSeed();
   const second = deferredSeed();
