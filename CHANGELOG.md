@@ -60,6 +60,10 @@ allowBuilds:
 - **keytar 未构建时仍能 mount**：本机无 VS Build Tools，`keytar@7.9.0` 未编译，插件照常挂载并
   服务上述路由（`login.authenticated:false` 属预期：沙盒无 Cindy 会话）。§5.2 的说法这次是
   在 0.2 上**实测**的，不是沿用旧结论。
+- **0.1.5-rc.2 侧同产物复验**（独立 `DSH_HOME`、0.1.5 CLI 起独立实例）：`add exit=0`
+  （该运行时的 pnpm 是 10.33.2）、`profile-local @deepseek-ai = 0`、`GET /` 200 且含 boot manifest、
+  **`GET /api/dsh-cindy-host/status` → 200 `ok:true installed:true`**、stderr 干净。
+  即这次的双代 seam 不是"只在 0.2 上验过"，两条线各跑了一次真机。
 
 ## [0.1.13] - 2026-09-23
 
