@@ -40,6 +40,8 @@ const INVOKE_POLICY = path.join(CINDY, 'packages/device-link/src/invokePolicy.ts
  * rather than rediscover it.
  */
 const DECLINED = [
+  { match: (channel) => ['maker:model-favorites:get', 'maker:model-favorites:apply'].includes(channel), why: 'explicitly unavailable: this Host has no remote model-favorites store or synchronization API; it must not report a successful empty catalog', candidate: 'would require a persisted favorites store plus matching changed pushes' },
+  { match: (channel) => channel === 'maker:predict-prompt', why: 'explicitly unavailable: optional next-prompt prediction has no DSH implementation; normal user sends remain independent', candidate: 'optional model-backed prompt prediction' },
   { match: (channel) => channel.startsWith('maker:schedule:') || channel.startsWith('maker:project-automation:'), why: 'schedule family — plan rule' },
   { match: (channel) => channel.startsWith('device-link:remote-desktop') || channel.startsWith('remote-desktop'), why: 'remote-desktop family — plan rule' },
   { match: (channel) => channel.startsWith('device-link:media:') || channel.startsWith('media:'), why: 'media pipeline — plan rule' },
@@ -365,9 +367,10 @@ if (open.length > 0) {
  * Push channels the phone handles that this Host does not send, and why not.
  *
  * "No fact to report" is the honest reason for most of them: DSH has no deletion,
- * no closed sessions, no provider registry, and a roster of exactly one harness.
+ * no closed sessions, no mutable provider registry, and a roster of exactly one harness.
  */
 const DECLINED_PUSH = [
+  { match: (channel) => channel === 'maker:model-favorites:changed', why: 'no remote favorites store or mutation API is served, so this Host has no favorites change to announce' },
   { match: (channel) => channel.startsWith('usage:'), why: 'usage/account reads — plan rule' },
   { match: (channel) => /bot/.test(channel), why: 'bots family — plan rule' },
   { match: (channel) => channel.startsWith('maker:schedule'), why: 'schedule family — plan rule' },
@@ -377,8 +380,8 @@ const DECLINED_PUSH = [
   { match: (channel) => channel.startsWith('local-db:messages:deleted'), why: 'the session log is append-only: there is no deletion to announce' },
   { match: (channel) => channel.startsWith('local-db:session:error-persisted'), why: 'there is no separate error-persistence path; failures travel as maker:event plus the message rows' },
   { match: (channel) => channel.startsWith('maker:status-changed'), why: 'DSH sessions are never `closed`, which is the only state that push retires' },
-  { match: (channel) => channel.startsWith('maker:provider:changed'), why: 'this Host exposes a model catalog, not a provider registry (maker:provider:list is refused for the same reason)' },
-  { match: (channel) => channel.startsWith('maker:agents:changed'), why: 'the roster is exactly one harness (`pi`) and never changes, so there is nothing to announce' },
+  { match: (channel) => channel.startsWith('maker:provider:changed'), why: 'provider:list is derived on demand from DSH modelCatalog; this Host owns no mutable provider registry or provider revision stream to announce' },
+  { match: (channel) => channel.startsWith('maker:agents:changed'), why: 'the fixed three-alias roster represents one DSH harness and never changes, so there is nothing to announce' },
   { match: (channel) => channel.startsWith('sidebar-settings:'), why: 'desktop sidebar ordering; the phone keeps its own' },
   { match: (channel) => channel.startsWith('maker:remote-resources'), why: 'desktop remote-resource inventory — not composed here' },
   { match: (channel) => channel.startsWith('file-browser:') || channel.startsWith('maker:file-browser:'), why: 'no file-watch events are produced here' },

@@ -1,4 +1,4 @@
-import test from 'node:test'; import assert from 'node:assert/strict'; import { publishActivity, turnEventFor, activityPhaseFor } from '../src/session-publisher.js';
+import test from 'node:test'; import assert from 'node:assert/strict'; import { publishActivity, runningStatusEvent, turnEventFor, activityPhaseFor } from '../src/session-publisher.js';
 test('sends safe activity only to subscribers',()=>{const sent=[]; publishActivity({send:(x)=>sent.push(JSON.parse(x))},new Set(['a']),{sessionId:'s',phase:'waiting'}); assert.deepEqual(sent[0],{v:1,kind:'push',dst:'a',payload:{channel:'local-db:sessions:activity',payload:{sessionId:'s',phase:'needs-interaction',compactDetail:'',attention:true}}});});
 
 test('a finished turn tells the session watchers to stop spinning', () => {
@@ -24,9 +24,10 @@ test('a finished turn tells the session watchers to stop spinning', () => {
 test('a live turn tells the session watchers to spin', () => {
   assert.deepEqual(turnEventFor({ sessionId: 's1', kind: 'session-status', phase: 'running' }), {
     channel: 'maker:event',
-    payload: { sessionId: 's1', event: { type: 'status', data: { isRunning: true } } },
+    payload: { sessionId: 's1', event: { type: 'status', data: { isRunning: true, status: 'running' } } },
   });
-  assert.equal(turnEventFor({ sessionId: 's1', kind: 'session-status', phase: 'waiting' }).payload.event.data.isRunning, true);
+  assert.deepEqual(turnEventFor({ sessionId: 's1', kind: 'session-status', phase: 'waiting' }).payload.event.data, { isRunning: true, status: 'waiting on input' });
+  assert.deepEqual(runningStatusEvent(), { type: 'status', data: { isRunning: true, status: 'running' } });
 });
 
 test('items that say nothing about a turn produce no event', () => {

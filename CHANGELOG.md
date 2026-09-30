@@ -3,6 +3,24 @@
 本文件记录**用户可见**的变化与**每次发布验证过的 DSH 版本**。格式遵循
 [Keep a Changelog](https://keepachangelog.com/zh-CN/1.1.0/)，版本号遵循语义化版本。
 
+## [0.1.17] - 2026-10-01
+
+验证环境：DSH **0.2.0-rc.2**（桌面端）与 **0.1.5-rc.2**（Web profile），Node **24.12.0**；要求 Node >=22，werift 固定 **0.24.4**。
+
+### Fixed
+
+- Cindy 桌面端现在能读取 DSH Host 的供应商分组与模型目录；新增 `maker:provider:list` 展示投影，只发送 provider/model 的非敏感显示字段，不发送路由凭据或 endpoint。
+- 控制权限在协议边界双向映射：DSH `read-only / workspace-write / danger-full-access` 对应 Cindy `ask / acceptEdits / bypassPermissions`；会话行、能力列表、创建与修改路径不再暴露 DSH 内部预设名。
+- 任务同步遵守 Cindy 原生 `local-db:sessions:list(limit, status, { includePinned })` 契约，active/archived 不再混在同一响应里，避免“正在自动重试；先显示已加载的内容”常驻。
+- `maker:event` 运行状态补齐非空 `data.status`，避免 Cindy 状态栏对 `undefined.trim()` 崩溃；等待交互显示为 `waiting on input`。
+- 普通 assistant/user/reasoning 消息按 Cindy 桌面原生格式发送字符串；仅附件和工具数据保留对象，桌面端不再把 `{"text":"…"}` 当正文显示，手机端继续兼容。
+
+### 验证
+
+- 完整单元与契约测试：**745 通过 / 1 跳过 / 0 失败**。
+- 通道与安全边界继续 fail-closed；provider 投影和权限映射新增双向契约测试。
+- 用户已确认本轮任务同步、状态栏与消息显示现象无其它问题；发布后仍需安装并重启目标 Host 才会加载新版本。
+
 ## [0.1.16] - 2026-09-30
 
 验证环境：DSH **0.2.0-rc.2**（桌面端）与 **0.1.5-rc.2**（Web profile）—— 同一份产物。

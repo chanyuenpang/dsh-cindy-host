@@ -35,10 +35,10 @@ export async function refreshLogin({ authBaseUrl, deviceId, refreshToken }) {
  * the first signs the user out (see `refreshStoredSession`). A transport failure
  * carries `transport: true` and no status.
  */
-export async function cindyRequest(base, path, body) {
+export async function cindyRequest(base, path, body, { signal } = {}) {
   let response;
   try {
-    response = await fetch(base + path, { method: "POST", headers: { "content-type": "application/json" }, body: JSON.stringify(body) });
+    response = await fetch(base + path, { method: "POST", headers: { "content-type": "application/json" }, body: JSON.stringify(body), ...(signal ? { signal } : {}) });
   } catch (error) {
     const failure = new Error(`Cindy request failed to reach the service: ${String(error?.message ?? error)}`);
     failure.transport = true;

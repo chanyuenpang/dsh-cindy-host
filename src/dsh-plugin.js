@@ -3,6 +3,7 @@ import { createRequire } from 'node:module';
 import { DEFAULT_HOST_SETTINGS, SETTINGS_NAMESPACE, validateHostSettings } from './host-settings.js';
 import { DshHostSource } from './dsh-host-source.js';
 import { createSessionControllerSource } from './dsh-session-source.js';
+import { readActiveSessionSummaries } from './dsh-active-sessions.js';
 import { createMessageCounter, createMessageReader, foldSessionEvent, isHarnessNotice, promptRpcIdOf } from './dsh-message-fold.js';
 import { createHistoryViewController } from './host-history-view.js';
 import { createFileReader } from './host-files.js';
@@ -669,9 +670,37 @@ export function buildDshSource(ctx, serviceName, options = {}) {
     // cached title, and a property of the object literal below is not in scope here.
     const sessionSource = createSessionControllerSource({
       sessionController,
+      readActiveSessions: () => readActiveSessionSummaries(ctx),
       subscribe: (name, listener) => ctx.on(name, listener),
       readTitles: sessionQuery === undefined ? undefined : (ids) => readTitles(sessionQuery, ids),
       readSessionMeta: sessionQuery === undefined ? undefined : (ids) => readSessionMeta(sessionQuery, ids),
+      // ID lookup is not sidebar discovery. New drafts exist before they have a
+      // user turn and must be readable without waiting for the list cache.
+      readSessionSummary: typeof sessionQuery?.observeSession !== 'function' ? undefined : async (sessionId) => {
+        let observation;
+        try {
+          observation = await sessionQuery.observeSession(sessionId, { projectionMode: 'all', signal: AbortSignal.timeout(15_000) });
+          const header = observation.header;
+          if (header.id !== sessionId || header.cwd === undefined) return undefined;
+          const metadata = observation.projections?.values?.sessionListMetadata;
+          return {
+            sessionId: header.id,
+            createdAt: header.createdAt,
+            updatedAt: Math.max(header.createdAt, metadata?.lastPromptAt ?? 0),
+            cwd: header.cwd,
+            origin: header.origin,
+            parentSessionId: header.parentSession,
+            blank: metadata?.blank === true,
+            running: options.isSessionRunning?.(sessionId) === true,
+            projections: observation.projections,
+          };
+        } catch (error) {
+          if (error?.code === 'SESSION_QUERY_SESSION_NOT_FOUND') return undefined;
+          throw error; // An I/O or replay failure is not evidence of absence.
+        } finally {
+          observation?.[Symbol.dispose]?.();
+        }
+      },
     });
     return {
       kind: 'session-controller',
@@ -732,6 +761,7 @@ export function buildDshSource(ctx, serviceName, options = {}) {
           ...(options.sessionId === undefined ? {} : { sessionId: options.sessionId }),
           ...(workspace === undefined ? (cwd === undefined ? {} : { cwd }) : { workspaceId: workspace.id }),
         });
+        sessionSource.invalidateListing();
         const installed = {};
         if (typeof options?.model === 'string' && options.model !== '') {
           const applied = await applyModelSelection({
@@ -1446,54 +1476,62 @@ export function sessionFlagsWriter(settings, ns) {
  * @param projected - the host-resolved `Config` value; only 0.2 supplies it.
  * @returns the settings scope described above.
  */
-function createSettingsScope(ctx, entryId, projected) {
+export function createSettingsScope(ctx, entryId, projected) {
   const { settings } = ctx;
   if (typeof settings.register === 'function') {
     return settings.register(entryId, HostSchema, { base: DEFAULT_HOST_SETTINGS, applies: 'live', validate: validateHostSettings });
   }
   if (projected === undefined) throw new Error('dsh-cindy-host: the host resolved no Config for this entry, so there is nowhere to read settings from');
-  // The schema declares every field, but schemastery does not materialize those defaults in the
-  // resolved value, so the base is merged here: a profile that has never written settings must
-  // still hand the runtime a complete object.
-  const base = { ...DEFAULT_HOST_SETTINGS, ...projected };
-  validateHostSettings(base);
-
-  let current = base;
+  // Volatile Config is updated WITHOUT remounting the plugin. Keep a detached
+  // snapshot and re-read the settings owner's resolved value after its event;
+  // copying apply(config) once left the relay disabled after the UI enabled it.
+  const snapshot = (value) => {
+    const next = JSON.parse(JSON.stringify({ ...DEFAULT_HOST_SETTINGS, ...value }));
+    validateHostSettings(next);
+    return next;
+  };
+  let current = snapshot(projected);
   const watchers = new Set();
+  const report = (error) => ctx.logger?.warn?.(`dsh-cindy-host settings: a watcher failed and was contained: ${String(error)}`);
   const publish = (next) => {
+    if (JSON.stringify(current) === JSON.stringify(next)) return;
     current = next;
-    // One watcher throwing must not take the others — or the write that triggered them — down.
-    // `runtime?.updateSettings` is called on a runtime the host may already be replacing, which
-    // is exactly the shape that turns into an unhandled rejection and a dead `dsh web`.
     for (const callback of [...watchers]) {
       try {
-        callback(next);
+        // Runtime updates are asynchronous. A synchronous try/catch alone does
+        // not contain a rejection from starting or stopping the relay.
+        Promise.resolve(callback(next)).catch(report);
       } catch (error) {
-        ctx.logger?.warn?.(`dsh-cindy-host settings: a watcher threw and was contained: ${String(error)}`);
+        report(error);
       }
+    }
+  };
+  let refreshing = false;
+  const refresh = () => {
+    if (refreshing) return; // describe may itself emit document-updated.
+    refreshing = true;
+    try {
+      const descriptor = settings.describe().find((row) => row.ns === entryId);
+      if (descriptor !== undefined) publish(snapshot(descriptor.value));
+    } finally {
+      refreshing = false;
     }
   };
 
   return {
     get: () => current,
-    /**
-     * A write is persisted by the host, which re-applies this entry, so the new value normally
-     * arrives as a fresh `apply(ctx, config)`. Publishing locally as well covers the window
-     * before that remount and keeps `watch` meaningful for a reader in the same tick.
-     */
+    refresh,
     watch: (callback) => {
       watchers.add(callback);
-      return () => {
-        watchers.delete(callback);
-      };
+      return () => watchers.delete(callback);
     },
     update: async (patch) => {
       await settings.update(entryId, patch);
-      publish({ ...current, ...patch });
+      refresh(); // Use resolved values, not an invented shallow merge.
     },
     replace: async (section) => {
       await settings.replace(entryId, section);
-      publish({ ...DEFAULT_HOST_SETTINGS, ...section });
+      refresh();
     },
   };
 }
@@ -1538,7 +1576,7 @@ export function apply(ctx, config) {
   /** Record one contained boundary failure, before or after the runtime exists. */
   const earlyBoundaryErrors = [];
   function noteBoundaryError(where, error) {
-    if (runtime !== null && typeof runtime.noteHandlerError === 'function') {
+    if (runtime != null && typeof runtime.noteHandlerError === 'function') {
       runtime.noteHandlerError(where, error);
       return;
     }
@@ -1579,7 +1617,7 @@ export function apply(ctx, config) {
 
   /** The boundary record for diagnostics: what is installed, and what it has contained. */
   function boundaryState() {
-    const contained = runtime !== null && typeof runtime.getHandlerErrors === 'function'
+    const contained = runtime != null && typeof runtime.getHandlerErrors === 'function'
       ? runtime.getHandlerErrors()
       : earlyBoundaryErrors;
     return { installed: [...guardedListeners], contained: contained.slice() };
@@ -1605,6 +1643,12 @@ export function apply(ctx, config) {
   // it a silent `none` looks identical to "this profile has no sessions yet".
   let sourceKind = 'none';
 
+  if (typeof scope.refresh === 'function') {
+    ctx.on('settings/document-updated', guarded('settings-document-updated', (namespace) => {
+      if (namespace === SETTINGS_NAMESPACE) scope.refresh();
+    }));
+  }
+
   ctx.effect(async () => {
     runtime = await startHost(undefined, scope.get(), {
       // A provider, not a snapshot: these callbacks come from the injected
@@ -1622,6 +1666,9 @@ export function apply(ctx, config) {
       // settings section, so the whole flag store reloads with the process.
       persistSessionFlags: sessionFlagsWriter(ctx.settings, settingsNamespace(SETTINGS_NAMESPACE)),
     });
+    // Settings can change while startHost awaits authentication. Reconcile the
+    // latest snapshot after the runtime exists instead of dropping that update.
+    await runtime.updateSettings(scope.get());
     if (currentSource !== undefined) await runtime.setSource(currentSource);
     return () => runtime.stop();
   }, 'dsh-cindy-host runtime');

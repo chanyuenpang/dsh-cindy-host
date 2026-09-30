@@ -8,7 +8,7 @@
  * (`apps/desktop/src/main/device-link/mediaFetch.ts`: 解析本机媒体 → 上传 OSS → 返回引用):
  *
  * ```
- * request   { url: 'xdt-file://open?path=<abs>&workdir=<abs>&maxBytes=<n>', thumbnail?, skipCache? }
+ * request   { url: 'xdt-file://open?path=<abs>&workdir=<abs>&maxBytes=<n>', thumbnail?, skipCache?, prepareOnly? }
  * response  { ossKey, mimeType, size }            // the controller presign-gets the key
  * ```
  *
@@ -38,7 +38,9 @@
  */
 import { createRequire } from 'node:module';
 import { extname, isAbsolute, relative, resolve as resolvePath } from 'node:path';
-import { readFile as readFileImpl, realpath as realpathImpl, stat as statImpl } from 'node:fs/promises';
+import { constants as fsConstants } from 'node:fs';
+import { open as openImpl, readFile as readFileImpl, realpath as realpathImpl, stat as statImpl } from 'node:fs/promises';
+import { FILE_INLINE_MAX_BYTES, FILE_PEER_MAX_BYTES } from './file-peer-protocol.js';
 
 /** Longest file this Host will stage for a controller. */
 export const MEDIA_FETCH_MAX_BYTES = 25 * 1024 * 1024;
@@ -287,60 +289,19 @@ export function isBlockedMediaPath(path, blocked = DEFAULT_BLOCKED) {
 }
 
 /**
- * Build the fetcher behind the channel.
- *
- * @param options - `uploader` (from `host-media.js`), plus injectable filesystem calls,
- *   the size cap, the never-serve list, and the thumbnail renderer (injectable so tests
- *   never touch a native codec).
- * @returns `fetchLocalMedia({ url, thumbnail })` → `{ ok: true, result }` or
- *   `{ ok: false, code, message }`.
+ * Authorize a local file without reading it, shared by media staging and file-peer.
+ * Returns { ok: true, real, info, mimeType, cap } or { ok: false, code, message }.
+ * The caller URL can lower, but never raise, this resolver's configured maxBytes.
  */
-export function createLocalMediaFetcher({
-  uploader,
-  readFile = readFileImpl,
+export function createLocalFileResolver({
   realpath = realpathImpl,
   stat = statImpl,
   maxBytes = MEDIA_FETCH_MAX_BYTES,
   blocked = DEFAULT_BLOCKED,
-  renderThumbnail = renderThumbnailWithSharp,
-  thumbnailLimits = {},
-  inlineOriginalMaxBytes = INLINE_ORIGINAL_MAX_BYTES,
-  cacheTtlMs = STAGING_CACHE_TTL_MS,
-  cacheMax = STAGING_CACHE_MAX,
-  now = () => Date.now(),
 } = {}) {
-  const inlineMaxBytes = Number.isFinite(thumbnailLimits.inlineMaxBytes) ? thumbnailLimits.inlineMaxBytes : THUMBNAIL_INLINE_MAX_BYTES;
-  const inputMaxBytes = Number.isFinite(thumbnailLimits.inputMaxBytes) ? thumbnailLimits.inputMaxBytes : THUMBNAIL_INPUT_MAX_BYTES;
-  const renderTimeoutMs = Number.isFinite(thumbnailLimits.timeoutMs) ? thumbnailLimits.timeoutMs : THUMBNAIL_RENDER_TIMEOUT_MS;
-  /** `path|size|mtime` → the object this Host already staged for it. */
-  const staged = new Map();
-
-  /** The object already staged for this exact file version, if it is still fresh. */
-  function lookupStaged(key) {
-    const hit = staged.get(key);
-    if (hit === undefined) return undefined;
-    if (hit.at + cacheTtlMs <= now()) {
-      staged.delete(key);
-      return undefined;
-    }
-    return hit;
-  }
-
-  /** Remember one staged object, evicting the oldest entries past the bound. */
-  function rememberStaged(key, entry) {
-    staged.set(key, entry);
-    while (staged.size > cacheMax) {
-      const oldest = staged.keys().next();
-      if (oldest.done === true) break;
-      staged.delete(oldest.value);
-    }
-  }
-
-  return async function fetchLocalMedia(input) {
-    const request = parseMediaFetchRequest(input?.url);
+  return async function resolveFile(url) {
+    const request = parseMediaFetchRequest(url);
     if (request.ok !== true) return { ok: false, code: 'BAD_REQUEST', message: `media fetch refused: ${request.reason}` };
-    if (typeof uploader !== 'function') return { ok: false, code: 'NOT_AVAILABLE', message: 'this Host cannot stage media for a controller' };
-
     let real;
     try {
       real = await realpath(request.path);
@@ -371,11 +332,130 @@ export function createLocalMediaFetcher({
     if (typeof info?.isDirectory === 'function' && info.isDirectory()) {
       return { ok: false, code: 'BAD_REQUEST', message: 'the requested path is a directory' };
     }
+    if (typeof info?.isFile === 'function' && !info.isFile()) {
+      return { ok: false, code: 'BAD_REQUEST', message: 'the requested path is not a regular file' };
+    }
+    if (!Number.isSafeInteger(info?.size) || info.size < 0) {
+      return { ok: false, code: 'BAD_REQUEST', message: 'the requested file has an invalid size' };
+    }
     const cap = request.maxBytes === null ? maxBytes : Math.min(request.maxBytes, maxBytes);
     if (Number.isFinite(info?.size) && info.size > cap) {
       return { ok: false, code: 'BAD_REQUEST', message: `the file is ${info.size} bytes, over the ${cap} byte limit` };
     }
 
+    return { ok: true, real, info, mimeType: mimeForMediaPath(real), cap };
+  };
+}
+
+/** Reject file replacement or mutation while a small inline response is being read. */
+function sameFileVersion(before, after) {
+  return !(typeof after?.isFile === 'function' && !after.isFile())
+    && !(typeof after?.isDirectory === 'function' && after.isDirectory())
+    && ['size', 'dev', 'ino', 'mtimeMs', 'ctimeMs'].every((key) => before[key] === undefined || before[key] === after?.[key]);
+}
+
+/** Read at most the authorized size plus one sentinel byte, even if the file grows. */
+async function readPreparedInline(real, info, open, stat) {
+  const file = await open(real, fsConstants.O_RDONLY | (fsConstants.O_NONBLOCK ?? 0) | (fsConstants.O_NOFOLLOW ?? 0));
+  try {
+    if (!sameFileVersion(info, await file.stat())) throw new Error('file changed');
+    const bytes = Buffer.alloc(info.size + 1);
+    let offset = 0;
+    while (offset < bytes.length) {
+      const { bytesRead } = await file.read(bytes, offset, bytes.length - offset, offset);
+      if (!Number.isInteger(bytesRead) || bytesRead < 0 || bytesRead > bytes.length - offset) throw new Error('invalid read');
+      if (bytesRead === 0) break;
+      offset += bytesRead;
+    }
+    if (offset !== info.size || !sameFileVersion(info, await file.stat()) || !sameFileVersion(info, await stat(real))) {
+      throw new Error('file changed');
+    }
+    return bytes.subarray(0, offset);
+  } finally {
+    await file.close();
+  }
+}
+
+/**
+ * Build the fetcher behind the channel.
+ *
+ * @param options - `uploader` (from `host-media.js`), plus injectable filesystem calls,
+ *   the size cap, the never-serve list, and the thumbnail renderer (injectable so tests
+ *   never touch a native codec).
+ * `prepareOnly` (unless thumbnail is true) uses prepareMaxBytes instead of the legacy
+ * staging cap: above 64 KiB it answers metadata with transferRequired, otherwise it
+ * inlines any file type, including empty files, using bounded open/read calls.
+ * Preparation needs no uploader and never consults or populates the staging cache.
+ * @returns `fetchLocalMedia({ url, thumbnail, prepareOnly })` → `{ ok: true, result }` or
+ *   `{ ok: false, code, message }`.
+ */
+export function createLocalMediaFetcher({
+  uploader,
+  open = openImpl,
+  prepareMaxBytes = FILE_PEER_MAX_BYTES,
+  readFile = readFileImpl,
+  realpath = realpathImpl,
+  stat = statImpl,
+  maxBytes = MEDIA_FETCH_MAX_BYTES,
+  blocked = DEFAULT_BLOCKED,
+  renderThumbnail = renderThumbnailWithSharp,
+  thumbnailLimits = {},
+  inlineOriginalMaxBytes = INLINE_ORIGINAL_MAX_BYTES,
+  cacheTtlMs = STAGING_CACHE_TTL_MS,
+  cacheMax = STAGING_CACHE_MAX,
+  now = () => Date.now(),
+} = {}) {
+  const resolveMedia = createLocalFileResolver({ realpath, stat, maxBytes, blocked });
+  const resolvePrepared = createLocalFileResolver({ realpath, stat, maxBytes: prepareMaxBytes, blocked });
+  const inlineMaxBytes = Number.isFinite(thumbnailLimits.inlineMaxBytes) ? thumbnailLimits.inlineMaxBytes : THUMBNAIL_INLINE_MAX_BYTES;
+  const inputMaxBytes = Number.isFinite(thumbnailLimits.inputMaxBytes) ? thumbnailLimits.inputMaxBytes : THUMBNAIL_INPUT_MAX_BYTES;
+  const renderTimeoutMs = Number.isFinite(thumbnailLimits.timeoutMs) ? thumbnailLimits.timeoutMs : THUMBNAIL_RENDER_TIMEOUT_MS;
+  /** `path|size|mtime` → the object this Host already staged for it. */
+  const staged = new Map();
+
+  /** The object already staged for this exact file version, if it is still fresh. */
+  function lookupStaged(key) {
+    const hit = staged.get(key);
+    if (hit === undefined) return undefined;
+    if (hit.at + cacheTtlMs <= now()) {
+      staged.delete(key);
+      return undefined;
+    }
+    return hit;
+  }
+
+  /** Remember one staged object, evicting the oldest entries past the bound. */
+  function rememberStaged(key, entry) {
+    staged.set(key, entry);
+    while (staged.size > cacheMax) {
+      const oldest = staged.keys().next();
+      if (oldest.done === true) break;
+      staged.delete(oldest.value);
+    }
+  }
+
+  return async function fetchLocalMedia(input) {
+    const prepareOnly = input?.prepareOnly === true && input?.thumbnail !== true;
+    // Keep legacy BAD_REQUEST / NOT_AVAILABLE precedence without requiring OSS for preparation.
+    if (!prepareOnly && typeof uploader !== 'function') {
+      const request = parseMediaFetchRequest(input?.url);
+      if (request.ok !== true) return { ok: false, code: 'BAD_REQUEST', message: `media fetch refused: ${request.reason}` };
+      return { ok: false, code: 'NOT_AVAILABLE', message: 'this Host cannot stage media for a controller' };
+    }
+    const resolved = await (prepareOnly ? resolvePrepared : resolveMedia)(input?.url);
+    if (resolved.ok !== true) return resolved;
+    const { real, info, mimeType, cap } = resolved;
+    if (prepareOnly) {
+      if (info.size > FILE_INLINE_MAX_BYTES) {
+        return { ok: true, result: { ossKey: '', size: info.size, mimeType, transferRequired: true } };
+      }
+      try {
+        const bytes = await readPreparedInline(real, info, open, stat);
+        return { ok: true, result: inlineResult(mimeType, bytes) };
+      } catch {
+        return { ok: false, code: 'INTERNAL', message: 'the requested file changed or could not be read' };
+      }
+    }
     let bytes;
     try {
       bytes = await readFile(real);
@@ -386,7 +466,6 @@ export function createLocalMediaFetcher({
       return { ok: false, code: 'BAD_REQUEST', message: `the file is ${bytes.length} bytes, over the ${cap} byte limit` };
     }
 
-    const mimeType = mimeForMediaPath(real);
     const wantsInline = input?.thumbnail === true;
     // The chat-thumbnail path: the controller asked for a smaller picture, so give it the
     // bytes directly when this Host can produce them inside the frame it has to fit.

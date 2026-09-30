@@ -14,8 +14,8 @@
  * comes. A channel we silently accepted and then failed would be worse — the
  * phone would show a broken feature instead of an absent one.
  */
-import { toCindyActiveSessions, toCindySessionList } from './cindy-session-row.js';
-import { toAgentCapabilities } from './host-models.js';
+import { agentKindForModel, toCindyActiveSessions, toCindySessionList, toCindySessionListRow } from './cindy-session-row.js';
+import { toAgentCapabilities, toCindyPermissionMode, toDshPermissionMode, toPermissionOptions, toProviderList } from './host-models.js';
 import { queueItemsFromInbox } from './host-input-queue.js';
 import { toAgentSkills, toAgentCommands, toAtResources } from './host-palette.js';
 import { toGoalStatusPayload } from './host-goals.js';
@@ -88,71 +88,6 @@ function answerQueueCommand(request, capabilities, sessionId) {
   const push = capabilities?.pushInputProjection;
   if (typeof push === 'function') push(sessionId);
   return invokeResult(request, projectionNow(capabilities, sessionId));
-}
-
-/**
- * When one controller-facing entry happened, for ordering.
- *
- * Three shapes reach this: a view `work` item (which spans a range, so it is placed by its end),
- * a view `messages` item (placed by its last message), and a raw transcript row (its own
- * `createdAt`).
- * @param entry - a view item or a transcript row.
- * @returns epoch ms, or 0 when the shape carries no time.
- */
-export function occurredAtMs(entry) {
-  if (entry?.type === 'work') return Number(entry.summary?.endedAtMs) || 0;
-  if (Array.isArray(entry?.messages)) {
-    const last = entry.messages[entry.messages.length - 1];
-    return Date.parse(last?.createdAt ?? '') || 0;
-  }
-  return Date.parse(entry?.createdAt ?? '') || 0;
-}
-
-/**
- * Place accepted-but-not-durable prompts **where the user typed them**, not at the end.
- *
- * The reported symptom: 「插入之后顺序会变，它会插入到我前面说的两行话前面」. Two of the user's
- * messages were queued for the next turn (10:45:11, 10:45:24) and a third was **inserted** — a
- * steer, which jumps the queue and became durable at 10:46:11, before either of them. So the
- * transcript order is genuinely insert-first, and this Host was making it worse: pending rows were
- * appended after the whole page, which put two rows the user typed *earlier* visually below a row
- * they typed later.
- *
- * Ordering them by acceptance time restores the user's own order while they wait. It is a
- * **prediction**, and the prediction is not always right: a queued message is delivered at the
- * next turn boundary, so it may still end up after the insert that overtook it — the rows move
- * once, when they become durable. Delivery order is the transcript's; typing order is what the
- * user is looking at while nothing has been delivered yet.
- *
- * **The streaming work item is pinned last.** 「你一直在我的对话之上在工作…最好是我发完对话之后
- * 无论如何你都把正在工作这个信息调到最后」 — a running group is the present tense, so it belongs
- * under everything the user has said, including a message still queued for the next turn (which
- * sorts after the group's own rows by time). Without the pin, a prompt accepted a moment ago lands
- * below the running card and the user's own words look pushed up into the middle of their
- * conversation.
- *
- * @param items - the page's own entries, already in the page's order.
- * @param pending - the pending entries, oldest acceptance first.
- * @param options - `newestFirst` for a descending page (`local-db:messages:list`).
- * @returns the merged sequence.
- */
-export function mergePendingByTime(items, pending, { newestFirst = false } = {}) {
-  const merged = [...items];
-  const last = merged[merged.length - 1];
-  const runsNow = !newestFirst && last?.type === 'work' && last.summary?.isStreaming === true;
-  for (const entry of pending) {
-    const at = occurredAtMs(entry);
-    const index = newestFirst
-      ? merged.findIndex((candidate) => occurredAtMs(candidate) < at)
-      : merged.findIndex((candidate) => occurredAtMs(candidate) > at);
-    if (index === -1) merged.push(entry);
-    else merged.splice(index, 0, entry);
-  }
-  if (!runsNow) return merged;
-  // Whatever sorted after the running group goes above it: the running card is the last thing shown.
-  const runningAt = merged.indexOf(last);
-  const running = merged.splice(runningAt, 1)[0];
-  return [...merged, running];
 }
 
 /**
@@ -299,12 +234,14 @@ export const SUPPORTED_CHANNELS = Object.freeze([
   'maker:resolve-interaction',
   'maker:input:get-projection',
   'maker:list-available-agents',
+  'maker:provider:list',
   'maker:get-capabilities',
   'maker:list-agent-skills',
   'maker:list-agent-commands',
   'maker:set-plan-mode',
   'file-browser:remote-op',
   'device-link:media:fetch',
+  'device-link:file-peer',
   // The work-grouped history window. Gated on the controller's side by the
   // `history-view-v1` capability this Host advertises in `link-accept`
   // (`host-authorization.js`), so serving them is only half of turning them on.
@@ -316,18 +253,10 @@ export const SUPPORTED_CHANNELS = Object.freeze([
   'maker:scan-at-resources',
 ]);
 
-/**
- * The one harness this Host offers.
- *
- * DSH's own agent drives every session, so there is nothing to choose and
- * nothing to keep book straight: the roster names a single kind, the phone's
- * picker shows a single entry, and every session row reports the same value.
- * The kind is `pi` because the controller's `MobileAgentKind` is a closed union
- * and only a kind it knows can be labelled.
- */
-export const DSH_AGENT_KINDS = Object.freeze(['pi']);
+/** Three Cindy wire aliases for the same DSH harness and capabilities. */
+export const DSH_AGENT_KINDS = Object.freeze(['claude-code', 'codex', 'pi']);
 
-/** The kind stamped on session rows; the only member of {@link DSH_AGENT_KINDS}. */
+/** Legacy native protocol alias; display fallback for unknown routes is Claude. */
 export const DSH_AGENT_KIND = 'pi';
 
 /**
@@ -446,6 +375,7 @@ export function extractSendAttachments(message) {
  */
 export function createChannelRouter({
   listSessions,
+  getSession,
   listSessionStates,
   readMessages,
   createSession,
@@ -483,6 +413,7 @@ export function createChannelRouter({
    * without the list call itself paying for a catalog read.
    */
   let catalogDefaultModel = null;
+  let agentCatalog = null;
 
   /** This Host's relay identity, as the phone's device filter needs it. */
   function deviceIdentity() {
@@ -513,6 +444,7 @@ export function createChannelRouter({
    */
   let rowsCache = null;
   let rowsRefresh = null;
+  let rowsGeneration = 0;
   /** How long a served page stays fresh enough to answer with before a refresh is kicked. */
   const SESSION_ROWS_TTL_MS = 5_000;
 
@@ -524,16 +456,19 @@ export function createChannelRouter({
    * lag but an instruction to revert the user's edit.
    */
   function invalidateSessionRows() {
+    rowsGeneration += 1;
     rowsCache = null;
+    rowsRefresh = null; // A pre-write read cannot fulfill a post-write request.
   }
 
   /** Read + fold once, sharing one flight between concurrent callers. */
   function refreshSessionRows() {
     if (rowsRefresh !== null) return rowsRefresh;
+    const generation = rowsGeneration;
     const attempt = (async () => {
       const items = await listSessions();
-      const rows = toCindySessionList(items, { now, device: deviceIdentity(), defaultModel: catalogDefaultModel });
-      rowsCache = { rows, at: now() };
+      const rows = toCindySessionList(items, { now, device: deviceIdentity(), defaultModel: catalogDefaultModel, catalog: agentCatalog });
+      if (generation === rowsGeneration) rowsCache = { rows, at: now() };
       return rows;
     })();
     rowsRefresh = attempt;
@@ -554,6 +489,37 @@ export function createChannelRouter({
     }
     // Cold start: the only case where the probe must wait for a read.
     return refreshSessionRows();
+  }
+
+  /** Mirror Cindy's native sessions:list paging contract over the cached full projection. */
+  function sessionListPage(rows, args) {
+    const rawLimit = typeof args[0] === 'number' ? args[0] : Number(args[0]);
+    const limit = Number.isFinite(rawLimit) && rawLimit > 0
+      ? Math.min(Math.max(Math.floor(rawLimit), 1), 1_000)
+      : 20;
+    const requestedStatus = args[1];
+    const matching = rows.filter((row) => requestedStatus === 'active' || requestedStatus === 'archived'
+      ? row.status === requestedStatus
+      : row.status !== 'deleted');
+    const recent = matching.slice(0, limit);
+    const options = args[2] !== null && typeof args[2] === 'object' ? args[2] : {};
+    if (options.includePinned !== true) return recent;
+    const seen = new Set(recent.map((row) => row.id));
+    return [...recent, ...matching.filter((row) => row.pinnedAt != null && !seen.has(row.id))];
+  }
+
+  async function sessionRow(sessionId) {
+    if (typeof getSession === 'function') {
+      const item = await getSession(sessionId);
+      if (item == null || String(item.id) !== sessionId) return undefined;
+      return toCindySessionListRow(item, { now, device: deviceIdentity(), defaultModel: catalogDefaultModel, catalog: agentCatalog });
+    }
+    let row = (await sessionRows()).find((candidate) => candidate.id === sessionId);
+    if (row === undefined) {
+      invalidateSessionRows();
+      row = (await sessionRows()).find((candidate) => candidate.id === sessionId);
+    }
+    return row;
   }
 
   return async function handleInvoke(request) {
@@ -584,21 +550,28 @@ export function createChannelRouter({
       // that ended it. Announce only what the source says now, and fall back to
       // the cache only when the source cannot be read at all.
       const subscribing = capabilitiesNow();
-      if (typeof subscribing.isSessionRunning === 'function'
+      const sessionIds = topics.filter((topic) => topic.startsWith(TOPIC_SESSION_PREFIX))
+        .map((topic) => topic.slice(TOPIC_SESSION_PREFIX.length));
+      // The creation pipeline awaits the sessions-topic subscription BEFORE
+      // sending create. Reading the corpus for that acknowledgement made cold
+      // listing timeouts look like failed creates that never reached this Host.
+      if (sessionIds.length > 0 && typeof subscribing.isSessionRunning === 'function'
         && typeof subscribing.pushTurnIdle === 'function'
         && typeof subscribing.pushTurnRunning === 'function') {
         let live = null;
-        try {
-          const rows = await listSessions();
-          live = Array.isArray(rows) ? rows : null;
-        } catch {
-          // No corpus read available: the cached answer is the best there is.
-          live = null;
+        if (typeof getSession !== 'function') {
+          try {
+            const rows = await listStates();
+            live = Array.isArray(rows) ? rows : null;
+          } catch {
+            // Legacy sources without exact reads keep the runtime fallback.
+          }
         }
-        for (const topic of topics) {
-          if (!topic.startsWith(TOPIC_SESSION_PREFIX)) continue;
-          const sessionId = topic.slice(TOPIC_SESSION_PREFIX.length);
-          const row = live === null ? null : live.find((candidate) => String(candidate?.id) === sessionId) ?? null;
+        for (const sessionId of sessionIds) {
+          let row = live === null ? null : live.find((candidate) => String(candidate?.id) === sessionId) ?? null;
+          if (typeof getSession === 'function') {
+            try { row = await getSession(sessionId) ?? null; } catch { row = null; }
+          }
           const running = row === null ? subscribing.isSessionRunning(sessionId) === true : row.running === true;
           if (running) subscribing.pushTurnRunning(sessionId);
           else subscribing.pushTurnIdle(sessionId);
@@ -627,15 +600,14 @@ export function createChannelRouter({
     }
 
     if (channel === 'local-db:sessions:list') {
-      return invokeResult(request, await sessionRows());
+      return invokeResult(request, sessionListPage(await sessionRows(), args));
     }
 
     if (channel === 'local-db:sessions:get') {
       const sessionId = String(args[0] ?? '');
-      const rows = await sessionRows();
-      // Same flat row as the list: the controller stores whatever it is handed,
-      // so a second shape here would be a second source of silent emptiness.
-      const row = rows.find((candidate) => candidate.id === sessionId);
+      // A known blank session must be readable before its first enqueue. The
+      // discovery list intentionally hides drafts and cannot prove absence.
+      const row = await sessionRow(sessionId);
       // Cindy answers an unknown id with an error the controller already handles.
       if (row === undefined) return invokeError(request, 'NOT_FOUND', `No DSH session ${sessionId}`);
       // The row's message total is what lets the controller light its "load
@@ -662,13 +634,10 @@ export function createChannelRouter({
       if (typeof read !== 'function') return invokeError(request, 'NOT_AVAILABLE', 'This DSH Host cannot read message history yet');
       const options = args[1] !== null && typeof args[1] === 'object' ? args[1] : {};
       const rows = await read(sessionId, options);
-      // The newest window also carries what this Host has **accepted but not yet made
-      // durable** — the prompt waiting in DSH's inbox. Only on the newest page: a cursor
-      // names a durable row, and inventing rows behind a cursor would corrupt paging.
-      const before = typeof options?.before === 'string' && options.before !== '' ? options.before : null;
-      const pending = before === null ? (capabilitiesNow().queueMirror?.pendingRows?.(sessionId) ?? []) : [];
-      // Newest first, and the pending prompts are the newest thing that exists.
-      return invokeResult(request, pending.length === 0 ? rows : mergePendingByTime(rows, pending, { newestFirst: true }));
+      // A user row in history is delivery evidence to Cindy, even if it carries
+      // an unknown pendingDelivery field. Keep unconsumed prompts exclusively in
+      // InputProjection, or a list read falsely settles the phone's queue.
+      return invokeResult(request, rows);
     }
 
     if (channel === 'maker:list-active') {
@@ -705,7 +674,7 @@ export function createChannelRouter({
       if (sessionId === '') return invokeError(request, 'BAD_REQUEST', 'maker:session-in-turn needs a session id');
       let running = null;
       try {
-        const rows = await listStates();
+        const rows = await listStates(sessionId);
         const row = Array.isArray(rows) ? rows.find((candidate) => String(candidate?.id) === sessionId) ?? null : null;
         running = row === null ? null : row.running === true;
       } catch {
@@ -715,16 +684,31 @@ export function createChannelRouter({
       return invokeResult(request, running === true);
     }
 
-    // The agent roster. This Host offers one harness, so the roster, the picker,
-    // and every session row all say the same thing.
+    // Three controller aliases share one actual DSH harness. The selected kind
+    // is presentation-only; model routing always follows the DSH selection.
     if (channel === 'maker:list-available-agents') {
       return invokeResult(request, [...DSH_AGENT_KINDS]);
     }
 
+    if (channel === 'maker:provider:list') {
+      const readCatalog = capabilitiesNow().modelCatalog;
+      if (typeof readCatalog !== 'function') return invokeResult(request, { providers: [], providerOrder: [] });
+      try {
+        const catalog = await readCatalog();
+        agentCatalog = catalog;
+        const defaultModel = catalog?.default?.model;
+        catalogDefaultModel = typeof defaultModel === 'string' && defaultModel !== '' ? defaultModel : null;
+        invalidateSessionRows();
+        return invokeResult(request, toProviderList(catalog, DSH_AGENT_KINDS));
+      } catch {
+        return invokeError(request, 'NOT_AVAILABLE', 'This DSH Host could not read its model catalog');
+      }
+    }
+
     if (channel === 'maker:get-capabilities') {
       const requested = typeof args[0] === 'string' ? args[0] : null;
-      if (requested !== null && requested !== DSH_AGENT_KIND) {
-        return invokeError(request, 'NOT_AVAILABLE', `DSH Host does not offer the ${requested} harness`);
+      if (requested !== null && !DSH_AGENT_KINDS.includes(requested)) {
+        return invokeError(request, 'NOT_AVAILABLE', `DSH Host does not offer the ${requested} alias`);
       }
       // The catalog is a live read, not a constant: it is what the picker lists,
       // and answering from a frozen copy would keep offering models that this
@@ -736,10 +720,15 @@ export function createChannelRouter({
         catalog = await readCatalog();
       } catch (error) {
         // A failed catalog read costs the picker, never the session list.
+        agentCatalog = null;
+        catalogDefaultModel = null;
+        invalidateSessionRows();
         return invokeResult(request, DSH_AGENT_CAPABILITIES);
       }
+      agentCatalog = catalog;
       const defaultModel = catalog?.default?.model;
       catalogDefaultModel = typeof defaultModel === 'string' && defaultModel !== '' ? defaultModel : null;
+      invalidateSessionRows();
       const capabilities = toAgentCapabilities(catalog);
       // These two fields are what make the controls appear at all: the controller
       // draws the permission picker only when presets are advertised, and the
@@ -748,9 +737,7 @@ export function createChannelRouter({
       const controls = capabilitiesNow().sessionControls;
       if (typeof controls?.permissionNames === 'function') {
         try {
-          capabilities.permissionModes = controls.permissionNames()
-            .filter((name) => typeof name === 'string' && name !== '')
-            .map((name) => ({ id: name, displayName: name }));
+          capabilities.permissionModes = toPermissionOptions(controls.permissionNames());
         } catch {
           capabilities.permissionModes = [];
         }
@@ -793,8 +780,8 @@ export function createChannelRouter({
       const controls = capabilitiesNow().sessionControls;
       if (typeof controls?.setPermissionMode !== 'function') return invokeError(request, 'NOT_AVAILABLE', 'This DSH Host composes no permission presets');
       const sessionId = String(args[0] ?? '');
-      const mode = typeof args[1] === 'string' ? args[1] : '';
-      if (sessionId === '' || mode === '') return invokeError(request, 'BAD_REQUEST', 'maker:set-permission-mode needs a session and a mode');
+      const mode = typeof args[1] === 'string' ? toDshPermissionMode(args[1]) : null;
+      if (sessionId === '' || mode === null) return invokeError(request, 'BAD_REQUEST', 'maker:set-permission-mode needs a supported Cindy mode');
       try {
         await controls.setPermissionMode({ sessionId, mode });
         // The preset writes the session's knobs, so the row the controller holds
@@ -845,14 +832,6 @@ export function createChannelRouter({
       }
     }
 
-    // `maker:provider:list` is deliberately NOT served, and that is the whole
-    // point: the controller only falls back to `capabilities.availableModels`
-    // when that channel is explicitly unsupported
-    // (`canUseFlatModelFallback` requires `providersUnsupported === true`, which
-    // only `CHANNEL_NOT_ALLOWED` sets). Answering `{ providers: [] }` claims a
-    // provider catalog that is merely empty, so the picker renders "no models"
-    // even though the capability list is full. Refusing is also the honest
-    // answer: this Host exposes a model catalog, not a provider registry.
     // The composer's `/` and `@` palettes.
     //
     // Refusing these is what the user sees as "channel is not available on DSH
@@ -964,15 +943,15 @@ export function createChannelRouter({
       //
       // `permissionMode` is the same class of field and the same class of loss, with a
       // worse failure: the handset's permission options **are** this Host's own
-      // advertised `permissionModes` (read-only / workspace-write / danger-full-access,
-      // read from the `permissions` presets), so a user who picks read-only and gets the
-      // profile default of danger-full-access believes the agent is restricted while it
+      // advertised Cindy `permissionModes` (ask / acceptEdits / bypassPermissions),
+      // mapped exactly onto DSH read-only / workspace-write / danger-full-access presets.
+      // A user who picks ask and gets the profile default of danger-full-access believes the agent is restricted while it
       // holds full access. Whatever reaches the seam here is whatever the controller
       // chose; the seam decides whether this Host can actually install it.
       const model = typeof options.model === 'string' ? options.model.trim() : '';
       const provider = typeof options.providerId === 'string' ? options.providerId.trim() : '';
       const effort = typeof options.effort === 'string' ? options.effort.trim() : '';
-      const permission = typeof options.permissionMode === 'string' ? options.permissionMode.trim() : '';
+      const permission = typeof options.permissionMode === 'string' ? toDshPermissionMode(options.permissionMode) : null;
       try {
         // The controller may pre-allocate the session id so its optimistic row and
         // route use the final id from the start; DSH's create is idempotent on a
@@ -983,7 +962,7 @@ export function createChannelRouter({
           ...(model === '' ? {} : { model }),
           ...(provider === '' ? {} : { provider }),
           ...(effort === '' ? {} : { reasoningEffort: effort }),
-          ...(permission === '' ? {} : { permissionMode: permission }),
+          ...(permission === null ? {} : { permissionMode: permission }),
         });
         // What the session is actually on, never what was asked for: DSH resolves and
         // normalizes the selection, so echoing the request would claim a route the
@@ -994,8 +973,9 @@ export function createChannelRouter({
         invalidateSessionRows();
         return invokeResult(request, {
           sessionId: String(created?.sessionId ?? options.id ?? ''),
-          // One harness, whatever the picker offered.
-          agentKind: DSH_AGENT_KIND,
+          // The requested platform is ignored. Echo only the applied DSH route
+          // (or its known default), not the controller's draft kind.
+          agentKind: agentKindForModel({ model: applied?.model, provider: applied?.provider, catalog: agentCatalog }),
           workDir: options.workingDir ?? null,
           usedProjectContext: false,
           ...(applied === null ? {} : {
@@ -1010,7 +990,7 @@ export function createChannelRouter({
           // the honest answer — the authoritative session row reports what is in force,
           // and the seam logs the request it could not honor.
           ...(typeof created?.permissionMode === 'string' && created.permissionMode !== ''
-            ? { permissionMode: created.permissionMode }
+            ? { permissionMode: toCindyPermissionMode(created.permissionMode) }
             : {}),
         });
       } catch (error) {
@@ -1064,8 +1044,7 @@ export function createChannelRouter({
       // this the reply below would echo the pre-write row, and the controller reads an
       // unchanged row as "revert my edit" (that is how these buttons looked dead once already).
       if (wrote) invalidateSessionRows();
-      const rows = await sessionRows();
-      const row = rows.find((candidate) => candidate.id === sessionId);
+      const row = await sessionRow(sessionId);
       return row === undefined ? invokeError(request, 'NOT_FOUND', `No DSH session ${sessionId}`) : invokeResult(request, row);
     }
 
@@ -1373,7 +1352,26 @@ export function createChannelRouter({
       const dshId = await resolveDshItemId(capabilities, sessionId, clientId);
       if (dshId === null) return invokeError(request, 'NOT_FOUND', `No queued item ${clientId}`);
       const failure = await commitQueueActionAndReconcile(capabilities, sessionId, dshId, action);
-      if (failure !== null) return invokeError(request, failure.code, failure.message);
+      if (failure !== null) {
+        // A phone can delete a row just after the desktop admitted or removed it.
+        // DSH then says the item is no longer pending; for *remove* only, that is
+        // already the requested outcome. Verify against the durable inbox before
+        // retiring the stale phone row, rather than turning it into a sync error.
+        // Edit and steer must still report the refusal: they did not take effect.
+        if (channel === 'maker:input:remove' && failure.code === 'session/queue-item-not-found'
+          && typeof capabilities.readSessionState === 'function' && typeof mirror?.adopt === 'function') {
+          let state = null;
+          try { state = await capabilities.readSessionState(sessionId); } catch { /* Keep the original refusal. */ }
+          if (state?.inbox !== null && typeof state?.inbox === 'object') {
+            const items = queueItemsFromInbox(state.inbox);
+            if (!items.some((item) => item.id === String(dshId) || item.rpcId === clientId)) {
+              mirror.adopt(sessionId, items);
+              return answerQueueCommand(request, capabilities, sessionId);
+            }
+          }
+        }
+        return invokeError(request, failure.code, failure.message);
+      }
       mirror?.mirror(sessionId, clientId, action);
       return answerQueueCommand(request, capabilities, sessionId);
     }
@@ -1579,6 +1577,14 @@ export function createChannelRouter({
     if (channel === 'file-browser:remote-op') {
       const capabilities = capabilitiesNow();
       const op = args[0]?.op;
+      // Whole-file access is Host-owned; never reinterpret nested SSH as local storage.
+      if (op === 'caps' && typeof capabilities.fileUrl === 'function') {
+        return invokeResult(request, { ok: true, fileRead: true });
+      }
+      if (op === 'fileUrl') {
+        if (typeof capabilities.fileUrl !== 'function') return invokeError(request, 'NOT_AVAILABLE', 'This Host has no whole-file reader');
+        return invokeResult(request, await capabilities.fileUrl({ workdir: args[0]?.workdir, relPath: args[0]?.relPath }));
+      }
       // The two export ops are the controller's only way to *see* a picture that lives on
       // this machine — a file the agent drew, or any image in the file browser. The
       // reference controlled end answers `exportFileStart` immediately with a transfer id
@@ -1591,11 +1597,13 @@ export function createChannelRouter({
         const status = capabilities.exportFileStatus;
         if (op === 'exportFileStart') {
           if (typeof start !== 'function') return invokeError(request, 'NOT_AVAILABLE', 'This DSH Host cannot export files yet');
-          const answered = await start({ workdir: args[0]?.workdir, relPath: args[0]?.relPath });
+          const answered = await start({ workdir: args[0]?.workdir, relPath: args[0]?.relPath,
+            ...(Object.hasOwn(args[0] ?? {}, 'maxBytes') ? { maxBytes: args[0].maxBytes } : {})
+          }, { src: request.src, id: request.id });
           return answered?.ok === true ? invokeResult(request, answered) : invokeError(request, answered?.code ?? 'INTERNAL', answered?.message ?? 'file export failed');
         }
         if (typeof status !== 'function') return invokeError(request, 'NOT_AVAILABLE', 'This DSH Host cannot export files yet');
-        const answered = status({ transferId: args[0]?.transferId });
+        const answered = status({ transferId: args[0]?.transferId }, { src: request.src, id: request.id });
         return answered?.ok === true ? invokeResult(request, answered) : invokeError(request, answered?.code ?? 'INTERNAL', answered?.message ?? 'unknown transfer');
       }
       const makeBrowser = capabilities.fileBrowser;
@@ -1624,20 +1632,7 @@ export function createChannelRouter({
         : channel === 'local-db:messages:work-details'
           ? await view.details(sessionId, args[1], args[2]?.after)
           : await view.intent(sessionId, args[1]);
-      if (answered?.ok === true && channel === 'local-db:messages:view'
-        && typeof args[1]?.before !== 'string' && Array.isArray(answered.result?.items)) {
-        // The newest view page also shows the prompts waiting in DSH's inbox: without them a
-        // message sent while a turn is running is absent from the projection the controller
-        // renders, and a reload looks like the message was lost (「退出去再进来，它不见了」)
-        // even though it is queued and will arrive.
-        const pending = capabilitiesNow().queueMirror?.pendingRows?.(sessionId) ?? [];
-        if (pending.length > 0) {
-          return invokeResult(request, {
-            ...answered.result,
-            items: mergePendingByTime(answered.result.items, pending.map((row) => ({ type: 'messages', key: row.clientId, messages: [row] }))),
-          });
-        }
-      }
+      // Pending bodies belong in InputProjection, never synthetic user history.
       return answered?.ok === true
         ? invokeResult(request, answered.result)
         : invokeError(request, answered?.code ?? 'INTERNAL', answered?.message ?? 'history view failed');
@@ -1646,6 +1641,18 @@ export function createChannelRouter({
     // A controller asking this machine for one of its files: an image the agent produced,
     // referenced by path in the transcript. The answer is a staged `ossKey` the controller
     // presign-gets itself, exactly as this Host does for a photo the phone uploaded.
+    if (channel === 'device-link:file-peer') {
+      const filePeer = capabilitiesNow().filePeer;
+      if (typeof filePeer !== 'function') return invokeError(request, 'NOT_AVAILABLE', 'This Host has no file-peer transport');
+      try {
+        // Identity comes from the relay envelope, never from controller-supplied args.
+        return invokeResult(request, await filePeer(request.src, args[0]));
+      } catch (error) {
+        const code = typeof error?.message === 'string' && /^(FILE_PEER_[A-Z_]+|INVALID_FILE_PEER_REQUEST|BAD_REQUEST|FORBIDDEN|NOT_FOUND|NOT_AVAILABLE)$/.test(error.message) ? error.message : 'FILE_PEER_FAILED';
+        return invokeError(request, code, code);
+      }
+    }
+
     if (channel === 'device-link:media:fetch') {
       const fetchMedia = capabilitiesNow().fetchLocalMedia;
       if (typeof fetchMedia !== 'function') return invokeError(request, 'NOT_AVAILABLE', 'This DSH Host cannot serve local media');
@@ -1656,6 +1663,7 @@ export function createChannelRouter({
         url: args[0]?.url,
         thumbnail: args[0]?.thumbnail === true,
         skipCache: args[0]?.skipCache === true,
+        ...(args[0]?.prepareOnly === true ? { prepareOnly: true } : {}),
       });
       return answered?.ok === true
         ? invokeResult(request, answered.result)

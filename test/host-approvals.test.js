@@ -174,6 +174,43 @@ test('a structured question settles with the controllers answer', async () => {
   assert.deepEqual(await asked.answered, { answers: [{ id: 'q1', selected: ['yes'] }] });
 });
 
+test('a Web question observer replays pending questions and only the first cross-device answer settles', async () => {
+  const androidDismissals = [];
+  const webEvents = [];
+  const registry = createApprovalRegistry({ onDismissed: (info) => androidDismissals.push(info) });
+  const stopWeb = registry.observeUserQuestions((event) => webEvents.push(event));
+
+  const webFirst = await registry.askUser({
+    sessionId: 's1',
+    questions: [{ id: 'q1', question: 'Web or Android?', options: [{ label: 'web' }, { label: 'android' }] }],
+  });
+  assert.deepEqual(webEvents[0], {
+    type: 'interaction-request', sessionId: 's1', requestId: webFirst.requestId, kind: 'ask_user_question',
+    questions: [{ id: 'q1', question: 'Web or Android?', options: [{ label: 'web' }, { label: 'android' }] }],
+  });
+
+  const reconnectEvents = [];
+  const stopReconnectedWeb = registry.observeUserQuestions((event) => reconnectEvents.push(event));
+  assert.equal(reconnectEvents[0].requestId, webFirst.requestId, 'a reconnect reads the shared pending entry');
+  stopReconnectedWeb();
+  assert.equal(registry.size(), 1, 'disconnecting an observer does not settle the user question');
+  assert.deepEqual(registry.settle(webFirst.requestId, { kind: 'ask_user_question', answers: { 'Web or Android?': 'web' } }), { accepted: true }, 'the Web answer wins when it arrives first');
+  assert.deepEqual(registry.settle(webFirst.requestId, { kind: 'ask_user_question', answers: { 'Web or Android?': 'android' } }), { accepted: false }, 'the late Android answer cannot produce a second tool result');
+  assert.deepEqual(await webFirst.answered, { answers: [{ id: 'q1', selected: ['web'] }] });
+
+  const androidFirst = await registry.askUser({ sessionId: 's1', questions: [{ id: 'q2', question: 'Android or Web?', options: [{ label: 'android' }, { label: 'web' }] }] });
+  assert.deepEqual(registry.settle(androidFirst.requestId, { kind: 'ask_user_question', answers: { 'Android or Web?': 'android' } }), { accepted: true }, 'the Android answer wins when it arrives first');
+  assert.deepEqual(registry.settle(androidFirst.requestId, { kind: 'ask_user_question', answers: { 'Android or Web?': 'web' } }), { accepted: false }, 'the late Web answer is refused');
+  assert.deepEqual(await androidFirst.answered, { answers: [{ id: 'q2', selected: ['android'] }] });
+
+  assert.deepEqual(androidDismissals, [
+    { sessionId: 's1', requestId: webFirst.requestId },
+    { sessionId: 's1', requestId: androidFirst.requestId },
+  ]);
+  assert.deepEqual(webEvents.filter((event) => event.type === 'interaction-dismissed').map((event) => event.requestId), [webFirst.requestId, androidFirst.requestId]);
+  stopWeb();
+});
+
 test('a decision aimed at the wrong kind is refused, not mistranslated', async () => {
   // A permission decision sent for a question would otherwise be read as "no
   // answer", and a question decision sent for an approval has no outcome at all.

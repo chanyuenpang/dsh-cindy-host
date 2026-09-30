@@ -2,23 +2,21 @@
 
 A DSH-to-Cindy host adapter. The console demo projects a DSH conversation list and safe lifecycle/status activity to a replaceable sink; the DSH bundle additionally carries the Cindy session, the DeviceLink relay, and the 「Cindy 手机连接」 settings card that lets the Cindy mobile client reach this Host.
 
-## Quick Start
+## Quick Start（从 npm 安装）
 
-1. Install the Cindy Host plugin into the DSH profile you use. The following example uses the `web` profile:
-
-```bash
-npx -y @deepseek-ai/dsh plugin --profile web add dsh-cindy-host-demo@latest
-```
-
-2. Approve the plugin's post-install script (`keytar`):
+需要 **Node.js 22 或更高版本**。下面将插件安装到默认 Web profile：
 
 ```bash
-npx -y @deepseek-ai/dsh plugin --profile web approve-builds
+# 从 npm 安装当前发布版本
+bunx @deepseek-ai/dsh plugin --profile web add dsh-cindy-host-demo
+
+# pnpm 10 需要显式批准 keytar 的构建脚本
+bunx @deepseek-ai/dsh plugin --profile web approve-builds
 ```
 
-3. Start DSH, then go to: Settings → Cindy Mobile Connection.
-Sign in with your Cindy phone number and verification code,
-then enable the mobile connection.
+在批准列表中选择 `keytar`，然后**重启 DSH Web**。重启后可在 **设置 → Plugins** 找到「Cindy 手机连接」：使用手机号和验证码登录，再开启手机连接。
+
+有关 `keytar` 的编译环境、失败降级与替代配置，请见[安装与原生模块说明](#安装与原生模块说明)。
 
 ## Console demo scope
 
@@ -67,6 +65,14 @@ phone" QR is just the regional app-download page. The four protocol questions an
 their source evidence are recorded in
 [Cindy phone link](doc/cindy-phone-link.md), together with the design.
 
+## 手机大文件下载（0.1.10 起）
+
+原 Export 入口按 inline → peer → OSS 回退。**0.1.11 起 OSS 兜底也支持最多2 GiB（含边界）**，流式上传，不再受旧512 MiB上限限制；约1.3 GB真实文件已经OSS下载到手机。实际手机P2P连接问题仍待定位，本次不宣称直连已修复。需更新/重启Host后生效，不含手机上传或断点续传。验证于DSH 0.1.5-rc.2 / Node 24.12.0；Node要求≥22，keytar为原生依赖。详见[文件传输说明](doc/file-transfer.md)。
+
+## 手机任务图标（0.1.12 起）
+
+DSH Host 仍只有一种执行 harness；手机任务行把 Cindy 的三种 `agentKind` 用作模型图标别名：DeepSeek 来源任意模型显示 Pi，GPT 模型显示 Codex，其他来源已知模型显示 Claude；**0.1.13 起**无法确认来源的图标改为 Claude，Pi 只保留给确认是 DeepSeek 的来源（0.1.12 的未知来源仍显示 Pi）。手机新建时选择的 agent 平台不会更换 DSH harness，实际模型和来源仍以 DSH 会话选择为准；手机的 agent 筛选、标签和最近会话默认项也会跟随图标 kind。手机端无需更新，但 Host 安装新版后必须重启才生效。
+
 ## Safe isolated DSH smoke test
 
 Do **not** add this package to the DSH profile you use every day. Use a disposable `DSH_HOME`; it gives the smoke profile its own bundles, settings, and credentials. These PowerShell commands run from this repository:
@@ -89,6 +95,8 @@ dsh --profile cindy-smoke --no-open --port 3081
 
 Run `npm test` before Gate 1. A clean Gate 2 must show a running DSH host on port 3081 and no Cindy authentication prompt. Stop it with `Ctrl+C`; removing `.sandbox/dsh-home` removes the whole test profile and its credentials. Do not enable `transportEnabled` until the mount, RPC, and lifecycle smoke checks are clean.
 
+**Never start port 3081 with `--profile web` and the normal `DSH_HOME`.** A second process then shares the production Host's DeviceLink identity; the relay may route a phone's `maker:input:enqueue` to the wrong process, where resuming a session owned by the 3080 process fails with `SessionAlreadyOwnedError` and appears as `[INTERNAL] DSH Host failed to serve this channel`. It can also make the phone's queue/sync status oscillate. Use only the isolated `cindy-smoke` profile above, and check both `/api/dsh-cindy-host/status` endpoints for duplicate `status.host.deviceId` before testing phone sends.
+
 With Gate 2 running, two Host surfaces answer over loopback:
 
 ```
@@ -105,33 +113,19 @@ rules are covered without a browser.
 
 **DSH's own packages are `peerDependencies`, never `dependencies`** — the host supplies them, and a plugin that installs its own copy drags a whole DSH generation into the profile and stops the profile from booting. That is what `0.1.1` did; see [`doc/publishing.md`](doc/publishing.md) §5.4 and §5.6 for the measured failure and the rule.
 
-## 安装要求：需要编译原生模块
+## 安装与原生模块说明
 
-装（**0.1.2 起发布在 npm registry**，MIT）：
+[Quick Start](#quick-start从-npm-安装) 已给出从 npm 安装、批准构建脚本和重启的最短路径。本节说明其中 `keytar` 构建步骤的原因与替代方案。
 
-```bash
-dsh plugin --profile <profile> add dsh-cindy-host-demo@0.1.2
-```
+### 为什么要批准 `keytar`？
 
-**不要用 0.1.1 的 tarball 安装**——那个版本会把整个旧一代 DSH 装进你的 profile，让 profile 起不来
-（详见 [`doc/publishing.md`](doc/publishing.md) §5.4）。
+`keytar` 将 Cindy 登录会话保存在系统凭据库（Windows 凭据管理器、macOS Keychain 或 Linux Secret Service），因此需要下载预编译二进制；没有适配的预编译包时，会回退到本机编译。对 pnpm 10 而言，这一步需要显式批准构建脚本。
 
-这个包**在安装时需要编译**，原因是它的凭据存储用的是原生模块：
+- Windows 通常需要 **VS Build Tools**（含 C++ 工作负载）；macOS 需要 Xcode Command Line Tools；Linux 需要 `libsecret-1-dev` 等构建依赖。
+- 如果未批准或编译失败，插件仍会安装并挂载；仅 Cindy 登录和凭据存储不可用，并会给出明确错误。
+- 不要使用 `0.1.1` 或更早版本的 tarball；它们会向 profile 装入不兼容的一代 DSH 依赖。请始终从 npm 安装当前版本。
 
-- `keytar` 是原生模块（Windows 凭据管理器 / macOS Keychain / Linux Secret Service），安装时要编译出
-  `keytar.node`。**没有纯 JS 的等价物**——Cindy 的登录会话必须放进操作系统的凭据库，而不是明文写进
-  配置或仓库。
-- 所以安装需要工具链：Windows 上通常是 **VS Build Tools（含 C++ 工作负载）**，macOS 需要
-  Xcode Command Line Tools，Linux 需要 `libsecret-1-dev` 等。
-- **pnpm 用户**还要显式允许构建脚本（pnpm 10 默认不执行依赖的构建脚本）：`pnpm approve-builds`，
-  或在 profile 的 `package.json` 里加 `"pnpm": { "onlyBuiltDependencies": ["keytar"] }` 后重装。
-  npm 默认会执行构建脚本。
-- **编译失败不会让插件装不上**（0.1.1 起 `keytar` 已改为惰性加载）：插件照常挂载，只有登录/凭据
-  相关能力明确不可用。也就是说"需要编译"影响的是凭据能力，不是能否安装。
-
-细节与实测记录见 [`doc/publishing.md`](doc/publishing.md) §5.2。
-
-**同时：不要用 `0.1.1` 及更早的 tarball 装到别人的 profile 上。** 那些版本的 `package.json` 把 DSH 自己的包声明成了依赖，pnpm 会把**整整一代旧 DSH**（28 个 `@deepseek-ai/*`）一起装进 profile，宿主再组合这个混合体就会启动失败。`0.1.2` 起改为 `peerDependencies` 且不再 import 只在旧代存在的导出，实测干净安装可以启动（§5.4 / §5.6）。
+发布、干净 profile 验证和替代的 `onlyBuiltDependencies` 配置见 [`doc/publishing.md`](doc/publishing.md) §5.2。
 
 ## 发布指南
 

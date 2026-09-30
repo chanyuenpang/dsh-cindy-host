@@ -57,10 +57,9 @@ test('folds a just-accepted item into the projection for a source-shaped session
   assert.deepEqual(projection.pendingQueue.map((row) => row.clientId), ['c1']);
 });
 
-test('a just-accepted steering prompt is projected as steering, and only that one', () => {
-  // The controller keeps its bubble alive from `steeringQueueClientIds`; a prompt DSH has
-  // spliced but not yet made durable has to appear there, without disturbing the queue the
-  // session already holds.
+test('a steering prompt keeps its pending content until consumed', () => {
+  // pendingQueue preserves the unconsumed body; steeringQueueClientIds marks it
+  // as sending. Both survive re-entry without pretending it is durable history.
   const tracker = createInputQueueTracker();
   tracker.apply({ type: 'queue', sessionId: 's1', items: [item('q1', 'queued', 'queued first')] });
 
@@ -72,7 +71,8 @@ test('a just-accepted steering prompt is projected as steering, and only that on
 
   const projection = tracker.projectionFor('s1', SOURCE_SESSION);
   assert.deepEqual(projection.steeringQueueClientIds, ['c2']);
-  assert.deepEqual(projection.pendingQueue.map((row) => row.clientId), ['q1'], 'the real queue is untouched');
+  assert.deepEqual(projection.pendingQueue.map((row) => row.clientId), ['q1', 'c2'], 'steering is still pending, with content available on reopen');
+  assert.equal(projection.pendingQueue[1].text, '插一句');
 
   // Marking the same id again replaces that entry rather than duplicating it.
   tracker.markSteering('s1', { id: 'c2', rpcId: 'c2', message: { id: 'c2', content: [] } });
@@ -84,32 +84,14 @@ test('a just-accepted steering prompt is projected as steering, and only that on
   assert.deepEqual(tracker.projectionFor('s1', SOURCE_SESSION).steeringQueueClientIds, []);
 });
 
-test('a prompt accepted but not yet durable is served as a transcript row', () => {
-  // Measured gap: a prompt sent while a turn runs waits in DSH's inbox until the turn
-  // reaches a step boundary — 0.4 s when idle, 42 s in the worst observed case. With no row
-  // in the transcript for it, a controller that reloads shows nothing and the user retypes a
-  // message that is still queued (「退出去再进来，它不见了」).
+test('authoritative inbox reads retain pending bodies even after reconnect', () => {
   const tracker = createInputQueueTracker();
-  assert.deepEqual(tracker.pendingTranscriptRows('s1'), [], 'nothing accepted, nothing to show');
-
-  tracker.markSteering('s1', {
-    id: 'c9',
-    rpcId: 'c9',
-    message: { id: 'c9', content: [{ type: 'text', text: '插一句' }] },
-  });
-  const rows = tracker.pendingTranscriptRows('s1');
-  assert.equal(rows.length, 1);
-  assert.equal(rows[0].role, 'user');
-  assert.equal(rows[0].clientId, 'c9', 'the controller recognises its own message by this id');
-  assert.equal(rows[0].content.text, '插一句');
-  assert.equal(rows[0].pendingDelivery, 'steering');
-  assert.equal(rows[0].id, 's1:pending:c9');
-  assert.ok(Number.isFinite(Date.parse(rows[0].createdAt)), 'the row carries when it was accepted');
-
-  // The durable row retires it: the two never coexist, and the controller's own echo
-  // reconciliation swaps one for the other.
-  tracker.mirror('s1', 'c9', { kind: 'remove' });
-  assert.deepEqual(tracker.pendingTranscriptRows('s1'), []);
+  const items = [item('q1', 'queued', 'later'), item('s1', 'steering', 'insert')];
+  // No local optimistic history survives a restart; the inbox alone must suffice.
+  const projection = tracker.projectionFor('session', SOURCE_SESSION, null, items);
+  assert.deepEqual(projection.pendingQueue.map((row) => row.text), ['later', 'insert']);
+  assert.deepEqual(projection.steeringQueueClientIds, ['s1']);
+  assert.deepEqual(tracker.queueFor('session'), [], 'authoritative reads need no previous fold');
 });
 
 test('folds the baseline, then replaces one session at a time', () => {
@@ -129,7 +111,7 @@ test('folds the baseline, then replaces one session at a time', () => {
   assert.deepEqual(tracker.queueFor('s1'), [], 'an empty queue frame clears it');
 });
 
-test('separates queued from steering, and projects the rest as empty', () => {
+test('projects queued and steering user entries but not context entries', () => {
   const tracker = createInputQueueTracker();
   tracker.apply({
     type: 'baseline',
@@ -141,7 +123,7 @@ test('separates queued from steering, and projects the rest as empty', () => {
 
   const projection = tracker.projectionFor('s1', SESSION);
   assert.equal(projection.sessionId, 's1');
-  assert.deepEqual(projection.pendingQueue.map((row) => row.clientId), ['a']);
+  assert.deepEqual(projection.pendingQueue.map((row) => row.clientId), ['a', 'b']);
   assert.deepEqual(projection.steeringQueueClientIds, ['b'], 'a context entry is neither queued nor steering');
 
   // The error/recovery fields describe a failure inside the controller's own

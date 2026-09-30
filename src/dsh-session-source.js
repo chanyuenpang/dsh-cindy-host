@@ -27,9 +27,11 @@ function activity(kind, sessionId, phase, extra = {}) {
 /**
  * Whether a session belongs in a controller's session list.
  *
- * **A subagent run is not a task.** DSH marks its delegated sessions in the summary
- * (`origin: 'subagent'`, and a `parentSessionId` when the delegation has a parent), and
- * its own Web list shows only user-facing sessions — which is why a deployment's
+ * **A subagent run and an unprompted draft are not tasks.** DSH marks delegated
+ * sessions in the summary (`origin: 'subagent'`, and a `parentSessionId` when the
+ * delegation has a parent). It also marks a newly opened, never-prompted conversation
+ * as `blank: true`. Neither appears in DSH's user-facing sidebar, so neither may be
+ * projected as a Cindy task — which is why a deployment's
  * `~/.dsh/sessions` can hold two hundred subagent logs the user has never seen. This Host
  * listed every one of them as "Untitled DSH task": measured on a real profile, 219 rows of
  * which the visible handful were the actual tasks, and the whole list had to be folded
@@ -38,10 +40,12 @@ function activity(kind, sessionId, phase, extra = {}) {
  * @param item - one `SessionSummary` from the session service.
  * @returns true when a controller should see it.
  */
-function isControllerVisible(item) {
-  if (item === null || typeof item !== 'object') return false;
-  if (item.origin === 'subagent') return false;
+function isControllerSession(item) {
+  if (item === null || typeof item !== 'object' || item.origin === 'subagent') return false;
   return item.parentSessionId === undefined || item.parentSessionId === null;
+}
+function isControllerVisible(item) {
+  return isControllerSession(item) && item.blank !== true;
 }
 
 /**
@@ -53,6 +57,8 @@ export function createSessionControllerSource({
   subscribe,
   readTitles,
   readSessionMeta,
+  readSessionSummary,
+  readActiveSessions,
   listTimeoutMs = 15_000,
   // How old a listing may be when it is served in place of one that failed. Long enough to
   // cover a cold start, short enough that a session created or renamed in the meantime is not
@@ -86,6 +92,9 @@ export function createSessionControllerSource({
   /** How many listings were answered from that fallback since start. */
   let staleServes = 0;
   let lastStaleReason = null;
+  let activeStateReads = 0;
+  let activeStateFallbacks = 0;
+  let lastActiveStateError = null;
 
   /**
    * Titles for the ids asked about, folding only what is missing or stale.
@@ -101,8 +110,10 @@ export function createSessionControllerSource({
     const stale = [];
     for (const id of sessionIds) {
       const cached = titleCache.get(id);
+      // Expiry schedules a refresh; it does not make a known title disappear.
+      // In particular, rows outside this read's budget still need their label.
+      if (cached?.title != null) out.set(id, cached.title);
       if (cached !== undefined && at - cached.readAt < titleTtlMs) {
-        if (cached.title !== null) out.set(id, cached.title);
         continue;
       }
       stale.push(id);
@@ -126,13 +137,14 @@ export function createSessionControllerSource({
     try {
       fetched = await readTitles(batch);
     } catch {
-      // A missing title costs a nicer row label, never the session list. Cached as
-      // "no title" so a permanently unreadable log is not re-folded forever.
-      for (const id of batch) titleCache.set(id, { title: null, readAt: now() });
-      return;
+      // A transient failure is not evidence that a known title was cleared.
+      // Fall through so failed attempts still receive the normal retry backoff.
     }
     for (const id of batch) {
-      const title = typeof fetched?.get === 'function' ? fetched.get(id) ?? null : null;
+      const value = typeof fetched?.get === 'function' ? fetched.get(id) : null;
+      // The batch adapter omits rejected and empty snapshots alike. Neither is
+      // an authoritative clear; only a usable title replaces the last good one.
+      const title = (typeof value === 'string' ? value.trim() : '') || titleCache.get(id)?.title || null;
       titleCache.set(id, { title, readAt: now() });
       if (title !== null && out !== undefined) out.set(id, title);
     }
@@ -202,8 +214,16 @@ export function createSessionControllerSource({
    *   an empty session list. The retry is inside the shared flight, so concurrent callers cost one
    *   retry between them, and it only happens when there is no fallback to serve instead.
    */
+  let listGeneration = 0;
+  function invalidateListing() {
+    listGeneration += 1;
+    inFlightList = null;
+    lastListed = null;
+  }
+
   async function listItems() {
     if (inFlightList !== null) return inFlightList;
+    const generation = listGeneration;
     const attempt = (async () => {
       let lastError = null;
       const tries = lastListed === null ? 2 : 1;
@@ -212,7 +232,7 @@ export function createSessionControllerSource({
           const signal = typeof AbortSignal?.timeout === 'function' ? AbortSignal.timeout(listTimeoutMs) : undefined;
           const value = await sessionController.list({}, signal);
           const items = (Array.isArray(value?.items) ? value.items : []).filter(isControllerVisible);
-          lastListed = { items, at: now() };
+          if (generation === listGeneration) lastListed = { items, at: now() };
           return items;
         } catch (error) {
           lastError = error;
@@ -231,18 +251,19 @@ export function createSessionControllerSource({
       }
       throw error;
     } finally {
-      inFlightList = null;
+      if (inFlightList === attempt) inFlightList = null;
     }
   }
 
-  return {
-    /**
-     * Read the current session list.
-     * @returns rows shaped for `contracts.toConversationRow` and the phone's row.
-     */
-    async listSessions() {
-      const items = await listItems();
+  async function projectItems(items) {
       const ids = items.map((item) => String(item.sessionId));
+      // Exact observations already carry authoritative immutable header fields.
+      // Do not perform a corpus-wide metadata read to rediscover those fields.
+      for (const item of items) {
+        if (Number.isFinite(item.createdAt) && typeof item.cwd === 'string' && item.cwd !== '') {
+          createdAtCache.set(String(item.sessionId), { createdAt: new Date(item.createdAt).toISOString(), cwd: item.cwd });
+        }
+      }
       const [titles] = await Promise.all([titlesFor(ids), metaFor(ids)]);
       return items.map((item) => {
         const id = String(item.sessionId);
@@ -278,7 +299,7 @@ export function createSessionControllerSource({
           updatedAt,
           // Falls back to the last activity time only when the header read is
           // unavailable; the phone requires a string here.
-          createdAt: meta?.createdAt ?? updatedAt,
+          createdAt: Number.isFinite(item.createdAt) ? new Date(item.createdAt).toISOString() : (meta?.createdAt ?? updatedAt),
           cwd: typeof item.cwd === 'string' && item.cwd !== '' ? item.cwd : (meta?.cwd ?? null),
           ...(typeof selectedModel === 'string' && selectedModel !== '' ? { model: selectedModel } : {}),
           ...(typeof selectedProvider === 'string' && selectedProvider !== '' ? { providerId: selectedProvider } : {}),
@@ -287,6 +308,31 @@ export function createSessionControllerSource({
           blank: item.blank === true,
         };
       });
+  }
+
+  return {
+    invalidateListing,
+    /** A list hides drafts; an exact ID read must still resolve a real new draft. */
+    async getSession(sessionId) {
+      if (typeof sessionId !== 'string' || sessionId === '') return undefined;
+      let item;
+      if (typeof readSessionSummary === 'function') {
+        item = await readSessionSummary(sessionId);
+      } else {
+        // Older compositions have no exact observation port. Use a fresh,
+        // unfiltered read, never the stale/shared list used for discovery.
+        const value = await sessionController.list({}, AbortSignal.timeout(listTimeoutMs));
+        item = value?.items?.find((candidate) => String(candidate.sessionId) === sessionId);
+      }
+      if (!isControllerSession(item) || String(item.sessionId) !== sessionId) return undefined;
+      const [row] = await projectItems([item]);
+      // A draft's missing title is expected, not a minute-long negative result:
+      // the first prompt may name it immediately after this exact read.
+      if (item.blank === true && row.title == null) titleCache.delete(sessionId);
+      return row;
+    },
+    async listSessions() {
+      return projectItems(await listItems());
     },
 
     /**
@@ -298,7 +344,31 @@ export function createSessionControllerSource({
      * 8.4s on a profile with 219 sessions, against a handset that times out in 15s.
      * @returns `{ id, running, updatedAt }` per session.
      */
-    async listSessionStates() {
+    async listSessionStates(requestedSessionId) {
+      if (typeof readActiveSessions === 'function') {
+        try {
+          const active = await readActiveSessions();
+          if (Array.isArray(active)) {
+            activeStateReads += 1;
+            lastActiveStateError = null;
+            const rows = active.filter(isControllerVisible).map((item) => ({
+              id: String(item.sessionId), running: item.running === true,
+              updatedAt: Number.isFinite(item.updatedAt) ? new Date(item.updatedAt).toISOString() : null,
+            }));
+            // A successful live-registry read proves absent IDs are not running.
+            // Explicit false prevents the watchdog resurrecting a stale push cache
+            // after an Agent was disposed. This is state, not fabricated metadata.
+            if (typeof requestedSessionId === 'string' && requestedSessionId !== ''
+              && !rows.some((row) => row.id === requestedSessionId)) {
+              rows.push({ id: requestedSessionId, running: false, updatedAt: null });
+            }
+            return rows;
+          }
+        } catch (error) {
+          lastActiveStateError = error instanceof Error ? error.message : String(error);
+        }
+        activeStateFallbacks += 1;
+      }
       const items = await listItems();
       return items.map((item) => ({
         id: String(item.sessionId),
@@ -343,7 +413,7 @@ export function createSessionControllerSource({
      * number to watch grow.
      */
     listDiagnostics() {
-      return { staleServes, lastStaleReason, lastListedAt: lastListed === null ? null : lastListed.at, lastListedCount: lastListed === null ? null : lastListed.items.length };
+      return { staleServes, lastStaleReason, lastListedAt: lastListed === null ? null : lastListed.at, lastListedCount: lastListed === null ? null : lastListed.items.length, activeStateReads, activeStateFallbacks, lastActiveStateError };
     },
 
     /**

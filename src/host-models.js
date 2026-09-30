@@ -127,3 +127,79 @@ export function modelIdFor({ catalog, selection }) {
   const fallback = catalog?.default?.model;
   return typeof fallback === 'string' && fallback !== '' ? fallback : null;
 }
+
+/** Cindy's permission vocabulary mapped onto DSH's sandbox presets. */
+const CINDY_PERMISSION_BY_DSH = new Map([
+  ['read-only', { id: 'ask', displayName: 'Ask' }],
+  ['workspace-write', { id: 'acceptEdits', displayName: 'Accept edits' }],
+  ['danger-full-access', { id: 'bypassPermissions', displayName: 'Full access' }],
+]);
+const DSH_PERMISSION_BY_CINDY = new Map([...CINDY_PERMISSION_BY_DSH].map(([dsh, cindy]) => [cindy.id, dsh]));
+
+/** Translate one DSH permission preset to the public Cindy option id. */
+export function toCindyPermissionMode(value) {
+  return CINDY_PERMISSION_BY_DSH.get(value)?.id ?? 'ask';
+}
+
+/** Translate one Cindy permission choice back to the DSH preset name. */
+export function toDshPermissionMode(value) {
+  return DSH_PERMISSION_BY_CINDY.get(value) ?? null;
+}
+
+/** Advertise only DSH presets that have an exact Cindy control meaning. */
+export function toPermissionOptions(names) {
+  const seen = new Set();
+  const options = [];
+  for (const name of Array.isArray(names) ? names : []) {
+    const option = CINDY_PERMISSION_BY_DSH.get(name);
+    if (option === undefined || seen.has(option.id)) continue;
+    seen.add(option.id);
+    options.push({ ...option });
+  }
+  return options;
+}
+
+/**
+ * Project DSH's provider-grouped catalog into Cindy desktop's ProviderView wire shape.
+ * Routing credentials never cross this boundary; every Cindy harness alias reaches the
+ * same DSH catalog, so each provider exposes the same models under all aliases.
+ */
+export function toProviderList(catalog, agentKinds = []) {
+  const routable = new Set(Array.isArray(catalog?.routableProviders) ? catalog.routableProviders : []);
+  const agents = [...new Set((Array.isArray(agentKinds) ? agentKinds : []).filter((kind) => typeof kind === 'string' && kind !== ''))];
+  const providers = [];
+  for (const group of Array.isArray(catalog?.groups) ? catalog.groups : []) {
+    if (typeof group?.id !== 'string' || group.id === '') continue;
+    const models = [];
+    for (const model of Array.isArray(group.models) ? group.models : []) {
+      if (typeof model?.id !== 'string' || model.id === '') continue;
+      const contextWindow = Number(model.contextWindow);
+      if (!Number.isFinite(contextWindow) || contextWindow <= 0) continue;
+      const efforts = Array.isArray(model?.reasoning?.efforts)
+        ? model.reasoning.efforts.map((effort) => effort?.id).filter((id) => typeof id === 'string' && id !== '')
+        : [];
+      const defaultEffort = typeof model?.reasoning?.defaultEffort === 'string'
+        && efforts.includes(model.reasoning.defaultEffort)
+        ? model.reasoning.defaultEffort
+        : (efforts[0] ?? null);
+      models.push({
+        id: model.id,
+        name: typeof model.name === 'string' && model.name !== '' ? model.name : model.id,
+        contextWindow,
+        efforts,
+        defaultEffort,
+        supportsFastMode: false,
+        defaultEnabled: true,
+      });
+    }
+    if (models.length === 0) continue;
+    providers.push({
+      id: group.id,
+      name: typeof group.name === 'string' && group.name !== '' ? group.name : group.id,
+      agents,
+      connected: routable.has(group.id),
+      models: Object.fromEntries(agents.map((agent) => [agent, models.map((model) => ({ ...model }))])),
+    });
+  }
+  return { providers, providerOrder: providers.map((provider) => provider.id) };
+}

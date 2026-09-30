@@ -1,6 +1,6 @@
 import test from 'node:test';
 import assert from 'node:assert/strict';
-import { toAgentCapabilities, toAvailableModels, modelIdFor } from '../src/host-models.js';
+import { toAgentCapabilities, toAvailableModels, modelIdFor, toCindyPermissionMode, toDshPermissionMode, toPermissionOptions, toProviderList } from '../src/host-models.js';
 
 /** A DSH `ModelCatalog` with two providers. */
 function catalog() {
@@ -16,11 +16,12 @@ function catalog() {
             id: 'deepseek-chat',
             name: 'DeepSeek Chat',
             description: 'fast',
+            contextWindow: 128_000,
             reasoning: { efforts: [{ id: 'low', name: 'Low' }, { id: 'high', name: 'High' }], defaultEffort: 'low' },
           },
         ],
       },
-      { id: 'openai', name: 'OpenAI', models: [{ id: 'gpt-x', name: 'GPT X' }] },
+      { id: 'openai', name: 'OpenAI', models: [{ id: 'gpt-x', name: 'GPT X', contextWindow: 200_000 }] },
     ],
     failures: [],
   };
@@ -69,6 +70,33 @@ test('reports plan mode as the object the controller reads', () => {
   assert.equal('planModeSupported' in capabilities, false);
   assert.deepEqual(capabilities.permissionModes, []);
   assert.equal(capabilities.hasFastMode, false);
+});
+
+
+
+test('projects the DSH catalog into Cindy desktop provider views', () => {
+  const result = toProviderList(catalog(), ['claude-code', 'codex', 'pi']);
+  assert.deepEqual(result.providerOrder, ['deepseek', 'openai']);
+  assert.equal(result.providers[0].connected, true);
+  assert.deepEqual(result.providers[0].agents, ['claude-code', 'codex', 'pi']);
+  assert.deepEqual(Object.keys(result.providers[0].models), ['claude-code', 'codex', 'pi']);
+  assert.deepEqual(result.providers[0].models.codex[0], {
+    id: 'deepseek-chat', name: 'DeepSeek Chat', contextWindow: 128_000,
+    efforts: ['low', 'high'], defaultEffort: 'low', supportsFastMode: false, defaultEnabled: true,
+  });
+  assert.equal('routing' in result.providers[0], false, 'provider credentials and endpoints never cross');
+});
+
+test('maps permission controls in both directions without leaking DSH preset ids', () => {
+  assert.deepEqual(toPermissionOptions(['read-only', 'workspace-write', 'danger-full-access', 'custom']), [
+    { id: 'ask', displayName: 'Ask' },
+    { id: 'acceptEdits', displayName: 'Accept edits' },
+    { id: 'bypassPermissions', displayName: 'Full access' },
+  ]);
+  assert.equal(toCindyPermissionMode('danger-full-access'), 'bypassPermissions');
+  assert.equal(toCindyPermissionMode('future-mode'), 'ask');
+  assert.equal(toDshPermissionMode('acceptEdits'), 'workspace-write');
+  assert.equal(toDshPermissionMode('workspace-write'), null);
 });
 
 test('a session row takes its model from the recorded selection, then the default', () => {

@@ -101,6 +101,27 @@ test('reports a required login instead of a failure when no Cindy session exists
   }
 });
 
+test('an unavailable credential store fails visibly without requesting another login', async () => {
+  let opened = false;
+  const message = '本机 Cindy 凭据存储不可用，请修复 keytar 后重启 DSH';
+  const runtime = await startHost(new FixtureDshSource(), ON, {
+    resolveSession: async () => ({ ok: false, reason: 'CREDENTIAL_STORE_UNAVAILABLE', message }),
+    openSocket: () => { opened = true; return new FakeSocket(); },
+  });
+  try {
+    const status = runtime.getStatus();
+    assert.equal(opened, false);
+    assert.equal(status.state, 'failed');
+    assert.equal(status.login.authenticated, false);
+    assert.equal(status.login.required, false);
+    assert.equal(status.message, message);
+    assert.equal(status.host, null);
+    assert.deepEqual(status.devices, []);
+  } finally {
+    await runtime.stop();
+  }
+});
+
 test('announces controllability so the relay will route the phone, then links it', async () => {
   const { runtime, socket } = await runtimeWithSocket();
   try {
@@ -1006,6 +1027,12 @@ test('a file on this machine can be exported to a controller, and nothing outsid
     openSocket: () => socket,
     heartbeatMs: 0,
     fetch: fetchImpl,
+    fileExportUploadOptions: { putImpl: async (_url, init) => {
+      let size = 0;
+      for await (const chunk of init.body) size += chunk.length;
+      staged.push({ step: 'put', headers: init.headers, size });
+      return { ok: true, status: 200 };
+    } },
   });
   const settle = () => new Promise((resolve) => setTimeout(resolve, 2));
   try {
@@ -1105,7 +1132,7 @@ test('a controller that re-links is told which sessions are in a turn', async ()
     const events = socket.sent.slice(before).filter((frame) => frame.kind === 'push' && frame.payload.channel === 'maker:event');
     assert.deepEqual(events.map((frame) => frame.dst), ['phone-2'], 'told directly, without a subscription');
     assert.deepEqual(events.map((frame) => frame.payload.payload), [
-      { sessionId: 'dsh-host-demo', event: { type: 'status', data: { isRunning: true } } },
+      { sessionId: 'dsh-host-demo', event: { type: 'status', data: { isRunning: true, status: 'running' } } },
     ]);
   } finally {
     await runtime.stop();

@@ -368,10 +368,8 @@ export function createMessageReader({
   if (typeof readSessionLog !== 'function') throw new Error('createMessageReader requires readSessionLog');
   /** `sessionId -> { rows, seq, at }`, in least-recently-used order. */
   const transcripts = new Map();
-  /** Sessions whose seed read is in flight; an event during one invalidates the seed. */
-  const seeding = new Set();
-  /** Sessions that received an event while seeding: that seed cannot be trusted. */
-  const dirty = new Set();
+  /** `sessionId -> { promise, dirty }`; count, view and page share one seed flight. */
+  const seeding = new Map();
   let clock = 0;
 
   /** Fold one session's log into message entries, in log order. */
@@ -461,22 +459,30 @@ export function createMessageReader({
       touch(sessionId, entry);
       return entry.rows;
     }
-    seeding.add(sessionId);
-    let rows = [];
-    let lastSeq = null;
-    try {
-      const read = await entriesFor(sessionId);
-      rows = toCindyMessages(read.entries, { sessionId, now });
-      lastSeq = read.lastSeq;
-    } finally {
-      seeding.delete(sessionId);
-      const raced = dirty.delete(sessionId);
-      // An event that arrived mid-read may or may not be inside the snapshot, and
-      // there is no way to tell from here — so the seed is thrown away rather than
-      // risking a transcript that is silently missing one row.
-      if (raced !== true) touch(sessionId, { rows, seq: lastSeq, at: clock });
-    }
-    return transcripts.get(sessionId)?.rows ?? rows;
+    const pending = seeding.get(sessionId);
+    if (pending !== undefined) return pending.promise;
+    const flight = { promise: null, dirty: false };
+    // Publish the flight before calling the log reader, including a reader that
+    // synchronously emits an event or invalidates the session on entry.
+    seeding.set(sessionId, flight);
+    flight.promise = Promise.resolve().then(async () => {
+      try {
+        const read = await entriesFor(sessionId);
+        const rows = toCindyMessages(read.entries, { sessionId, now });
+        // A live event during replay makes the snapshot unsafe to cache. Explicit
+        // invalidation also detaches this flight so a post-invalidation read starts
+        // fresh; an older completion must never overwrite that newer generation.
+        if (seeding.get(sessionId) === flight && !flight.dirty) {
+          touch(sessionId, { rows, seq: read.lastSeq, at: clock });
+        }
+        return transcripts.get(sessionId)?.rows ?? rows;
+      } finally {
+        // Failure is not an authoritative empty transcript. Release this flight
+        // on success or rejection, without deleting a newer read's ownership.
+        if (seeding.get(sessionId) === flight) seeding.delete(sessionId);
+      }
+    });
+    return flight.promise;
   }
 
   /**
@@ -508,7 +514,8 @@ export function createMessageReader({
     if (typeof sessionId !== 'string' || sessionId === '') return false;
     const entry = transcripts.get(sessionId);
     if (entry === undefined) {
-      if (seeding.has(sessionId)) dirty.add(sessionId);
+      const flight = seeding.get(sessionId);
+      if (flight !== undefined) flight.dirty = true;
       return false;
     }
     const seq = Number.isFinite(event?.seq) ? event.seq : null;
@@ -535,8 +542,11 @@ export function createMessageReader({
     return true;
   }
 
-  /** Forget one session's cached transcript (a rename, a rewind, a settings change). */
+  /** Forget one session's cached transcript and detach any pre-invalidation seed. */
   function invalidate(sessionId) {
+    // Existing waiters may finish their read, but new callers must not join it.
+    // Identity checks in ensureTranscript prevent it from caching after this point.
+    seeding.delete(sessionId);
     return transcripts.delete(sessionId);
   }
 

@@ -135,14 +135,14 @@ export async function selectLoginAccount({ authBaseUrl, loginTicket, accountId, 
  * @param session - the stored session.
  * @returns `{ ok: true, session }`, or a failure carrying `rejected` or `transient`.
  */
-export async function refreshStoredSession(session) {
+export async function refreshStoredSession(session, { signal } = {}) {
   const base = normalizeAuthBaseUrl(session?.authBaseUrl);
   if (typeof session?.refreshToken !== 'string' || typeof session?.deviceId !== 'string') {
     return { ok: false, rejected: true, message: '本机没有可续期的 Cindy 登录态' };
   }
   let next;
   try {
-    next = await cindyRequest(base, '/api/auth/refresh', { deviceId: session.deviceId, refreshToken: session.refreshToken });
+    next = await cindyRequest(base, '/api/auth/refresh', { deviceId: session.deviceId, refreshToken: session.refreshToken }, { signal });
   } catch (error) {
     const status = typeof error?.status === 'number' ? error.status : null;
     const refused = status === 400 || status === 401 || status === 403;

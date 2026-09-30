@@ -144,6 +144,12 @@ export function compactRowText(rows) {
   const next = rows.map((row) => {
     if (row === null || typeof row !== 'object') return row;
     const content = row.content;
+    if (typeof content === 'string') {
+      const result = cutToBytes(content, ROW_TEXT_LIMIT);
+      if (!result.cut) return row;
+      changed = true;
+      return { ...row, content: result.text, agentMeta: markContentTruncated(row.agentMeta) };
+    }
     if (content === null || typeof content !== 'object' || Array.isArray(content)) return row;
     if (row.role === 'tool_result' || row.role === 'tool-use') {
       const result = cutToBytes(content.text, TOOL_RESULT_LIMIT);

@@ -233,46 +233,7 @@ export function createInputQueueTracker() {
     if (id === null) return;
     const items = queues.get(sessionId) ?? [];
     const others = items.filter((entry) => String(entry?.id) !== id);
-    // `at` is what a pending transcript row is stamped with, so the message the user is
-    // looking at carries the moment it was accepted rather than the moment it was read.
-    queues.set(sessionId, [...others, { ...item, id, placement, at: Date.now() }]);
-  }
-
-  /**
-   * Transcript-shaped rows for prompts this Host has accepted but DSH has not made durable.
-   *
-   * The gap this closes, measured: a prompt sent while a turn is running waits in DSH's
-   * inbox until the turn reaches a step boundary — 0.4 s when idle, and **42 s** in the worst
-   * observed case. During that window the session's transcript (both the raw window and the
-   * work-grouped view) contains no row for it, so a controller that reloads the session — or
-   * simply drops its own optimistic bubble — shows nothing at all: 「退出去再进来，它不见了，
-   * 我就要重新输入这句话」, while the prompt is still queued and will be delivered. Serving
-   * the pending prompt as a row makes the Host the source of truth for "we have it", and the
-   * durable row replaces it by `clientId` the moment it lands.
-   *
-   * @param sessionId - the session.
-   * @returns newest-last rows in the controller's message shape.
-   */
-  function pendingTranscriptRows(sessionId) {
-    const rows = [];
-    for (const item of queueFor(sessionId)) {
-      const clientId = typeof item?.rpcId === 'string' && item.rpcId !== '' ? item.rpcId : String(item?.id ?? '');
-      if (clientId === '') continue;
-      const content = Array.isArray(item?.message?.content) ? item.message.content : [];
-      rows.push({
-        id: `${sessionId}:pending:${clientId}`,
-        clientId,
-        sessionId,
-        role: 'user',
-        toolUseId: null,
-        agentMeta: null,
-        createdAt: new Date(Number.isFinite(item?.at) ? item.at : Date.now()).toISOString(),
-        content: { text: textOf(content) ?? '' },
-        // Informational: which queue the prompt is waiting in, for anything that reads it.
-        pendingDelivery: item.placement === 'steering' ? 'steering' : 'queued',
-      });
-    }
-    return rows;
+    queues.set(sessionId, [...others, { ...item, id, placement }]);
   }
 
   /**
@@ -381,8 +342,11 @@ export function createInputQueueTracker() {
       const row = toQueuedRemoteMessage(item, session);
       if (row === null) continue;
       seen.add(row.clientId);
+      // DSH next-step (steering) is still an inbox wait, not a consumed message.
+      // Cindy supports the same id in both fields: the body survives re-entry
+      // and its phase is 'sending', with queue actions disabled until delivery.
+      if (item?.placement === 'queued' || item?.placement === 'steering') pendingQueue.push(row);
       if (item?.placement === 'steering') steeringQueueClientIds.push(row.clientId);
-      else if (item?.placement === 'queued') pendingQueue.push(row);
     }
     if (pending !== null && !seen.has(pending.clientId)) pendingQueue.push(pending);
 
@@ -461,15 +425,12 @@ export function createInputQueueTracker() {
     markSteering: (sessionId, item) => { markSteering(sessionId, item); },
     /** Record one just-accepted queued prompt, preserving the rest of the queue. */
     markQueued: (sessionId, item) => { markQueued(sessionId, item); },
-    /** Prompts accepted but not yet durable, in the controller's message shape. */
-    pendingTranscriptRows: (sessionId) => pendingTranscriptRows(sessionId),
     /**
      * The fold's own record for one item, by the controller's id or DSH's.
      *
-     * Needed because the record carries the message **content**, and the projection and the
-     * pending transcript row both render from it: an upsert that only carried an id produced a
-     * bubble with no text (「插入之后里面的文字被清空了」) and an empty transcript row for a
-     * prompt the user could plainly see. Callers that re-place an item preserve what the fold
+     * Needed because the pending projection renders the message **content**: an upsert
+     * carrying only an id produced an empty bubble (「插入之后里面的文字被清空了」).
+     * Callers that re-place an item preserve what the fold
      * already knew instead of restating it from memory.
      */
     itemFor: (sessionId, itemId) => queueFor(sessionId).find(

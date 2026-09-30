@@ -1,6 +1,6 @@
 import test from 'node:test';
 import assert from 'node:assert/strict';
-import { toCindyActiveSessions, toCindySessionList, toCindySessionListRow } from '../src/cindy-session-row.js';
+import { agentKindForModel, toCindyActiveSessions, toCindySessionList, toCindySessionListRow } from '../src/cindy-session-row.js';
 
 const ROW = {
   id: 'session-1',
@@ -48,7 +48,7 @@ test('fields the controller reads for grouping and labelling', () => {
   const row = toCindySessionListRow(ROW, { device: DEVICE });
   assert.equal(row.workingDir, 'G:\\Projects\\DSH-cindy-host');
   assert.equal(row.workspaceKind, 'project', 'a session with a working directory groups under its project');
-  assert.equal(row.agentKind, 'pi', 'the wire kind must be one the controller can label');
+  assert.equal(row.agentKind, 'claude-code', 'a session with no confirmed DeepSeek source defaults to Claude');
   assert.equal(row.title, 'Fix the relay handshake');
   assert.equal(row.createdAt, '2026-01-01T00:00:00.000Z');
   assert.equal(row.updatedAt, '2026-01-02T03:04:05.000Z');
@@ -62,6 +62,15 @@ test('reports the session’s own effort, falling back only when it has none', (
   assert.equal(toCindySessionListRow(ROW, { device: DEVICE }).effort, 'default', 'a session that never chose keeps the honest placeholder');
 });
 
+
+
+test('maps DSH permission presets back to Cindy controls', () => {
+  assert.equal(toCindySessionListRow({ ...ROW, permissionMode: 'read-only' }, { device: DEVICE }).permissionMode, 'ask');
+  assert.equal(toCindySessionListRow({ ...ROW, permissionMode: 'workspace-write' }, { device: DEVICE }).permissionMode, 'acceptEdits');
+  assert.equal(toCindySessionListRow({ ...ROW, permissionMode: 'danger-full-access' }, { device: DEVICE }).permissionMode, 'bypassPermissions');
+  assert.equal(toCindySessionListRow({ ...ROW, permissionMode: 'future-mode' }, { device: DEVICE }).permissionMode, 'ask');
+});
+
 test('carries the session’s source beside its model, absent when none was recorded', () => {
   // 控制端把 providerId 与 model 一起存,并用「最近会话」推导新对话草稿的 runtime
   // (`pickRecentSessionRuntime`)。丢掉它 = 下一个对话有模型却没有来源。
@@ -71,6 +80,36 @@ test('carries the session’s source beside its model, absent when none was reco
   // 没有记录来源的会话:字段**缺失**(而不是 null)——控制端把缺失读成「走被控端默认
   // 路由」,而那正是这种会话实际跑的东西。
   assert.equal('providerId' in toCindySessionListRow(ROW, { device: DEVICE }), false);
+});
+
+test('Cindy kind aliases follow the applied provider and model, not the selected platform', () => {
+  const kind = (model, providerId, catalog) => toCindySessionListRow({ ...ROW, model, providerId }, { catalog }).agentKind;
+  assert.equal(kind('gpt-5.6-sol', 'deepseek-official'), 'pi', 'DeepSeek provider wins regardless of model');
+  assert.equal(kind('custom-model', 'deepseek-official'), 'pi');
+  assert.equal(kind('gpt-5.6-sol', 'openai-codex'), 'codex');
+  assert.equal(kind('chatgpt/bridge', 'openai'), 'codex');
+  assert.equal(kind('claude-sonnet-4', 'anthropic'), 'claude-code');
+  assert.equal(kind('gemini-3', 'google'), 'claude-code');
+  assert.equal(kind('gpt-5.6-sol', undefined), 'claude-code', 'unknown source must not be guessed as DeepSeek or GPT');
+  assert.equal(agentKindForModel({ provider: 'openai' }), 'claude-code', 'known non-DeepSeek source with no model uses Claude');
+  assert.equal(agentKindForModel({ provider: 'deepseek-official' }), 'pi', 'known DeepSeek source does not need a model');
+  assert.equal(agentKindForModel({}), 'claude-code', 'no known route uses Claude');
+  const catalog = {
+    default: { provider: 'openai-codex', model: 'gpt-5.6-sol' },
+    groups: [
+      { id: 'deepseek-official', models: [{ id: 'deepseek-chat' }] },
+      { id: 'anthropic', models: [{ id: 'claude-sonnet-4' }] },
+    ],
+  };
+  assert.equal(toCindySessionListRow(ROW, { catalog }).agentKind, 'codex', 'unselected session uses the catalog default');
+  assert.equal(kind('claude-sonnet-4', undefined, catalog), 'claude-code', 'unique catalog group identifies provider');
+  assert.equal(kind('deepseek-chat', undefined, catalog), 'pi');
+  const ambiguous = { groups: [
+    { id: 'deepseek-official', models: [{ id: 'gpt-shared' }] },
+    { id: 'openai', models: [{ id: 'gpt-shared' }] },
+  ] };
+  assert.equal(kind('gpt-shared', undefined, ambiguous), 'claude-code', 'shared model does not establish a DeepSeek source');
+  assert.equal(agentKindForModel({ provider: 'openai', catalog: { default: { provider: 'deepseek-official', model: 'deepseek-flash' } } }), 'claude-code', 'a known source is not replaced by the catalog default');
 });
 
 test('a session with no working directory becomes a dialogue, not a broken project', () => {

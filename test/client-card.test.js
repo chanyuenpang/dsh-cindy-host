@@ -15,7 +15,7 @@ const SLOT = 'settings.section';
  * `window.__ModuleLoader__.load`, run the script, then call the captured
  * factory with a `require` that answers the platform seed words.
  */
-function loadClientBundle() {
+function loadClientBundle(environment = {}) {
   const source = readFileSync(BUNDLE, 'utf8');
   let registration;
   const fakeWindow = {
@@ -26,11 +26,16 @@ function loadClientBundle() {
     },
   };
   // eslint-disable-next-line no-new-func -- the bundle is a classic script by design
-  new Function('window', source)(fakeWindow);
+  new Function('window', 'fetch', 'setInterval', 'clearInterval', source)(
+    fakeWindow,
+    environment.fetch ?? globalThis.fetch,
+    environment.setInterval ?? globalThis.setInterval,
+    environment.clearInterval ?? globalThis.clearInterval,
+  );
   assert.ok(registration, 'the bundle must self-register through window.__ModuleLoader__.load');
 
   const moduleExports = registration.factory((specifier) => {
-    if (specifier === 'react') return React;
+    if (specifier === 'react') return environment.react ?? React;
     if (specifier === 'react/jsx-runtime') return require('react/jsx-runtime');
     throw new Error(`client bundle required an unavailable module: ${specifier}`);
   });
@@ -262,6 +267,7 @@ test('the switch renders off when the settings say so', () => {
   const { slots } = mountDeclared(makeScope({ transportEnabled: false, remoteControlEnabled: false }));
   const html = render(React.createElement(slots.registrations[0].component, null));
   assert.match(html, /aria-checked="false"/);
+  assert.match(html, /手机连接已关闭/);
 });
 
 test('renders nothing operational when the namespace is unavailable', () => {
@@ -378,7 +384,7 @@ test('the switch reports the flipped value, not the current one', () => {
   assert.deepEqual(toggles, [true]);
 });
 
-test('the switch writes both settings spellings through the bound scope', async () => {
+test('the switch writes both settings spellings through the legacy bound scope', async () => {
   const scope = makeScope({ transportEnabled: false });
   const { moduleExports } = loadClientBundle();
   await moduleExports.__internals.writeSwitch(scope, true);
@@ -391,4 +397,169 @@ test('the switch writes both settings spellings through the bound scope', async 
     ['transportEnabled', false],
     ['remoteControlEnabled', false],
   ]);
+});
+
+test('the switch atomically mutates both flags without calling set', async () => {
+  const { writeSwitch } = loadClientBundle().moduleExports.__internals;
+  const calls = [];
+  const scope = {
+    async mutate(ops) { assert.equal(this, scope); calls.push(ops); return true; },
+    set() { assert.fail('atomic controllers must not use individual writes'); },
+  };
+  for (const next of [true, false]) {
+    await writeSwitch(scope, next);
+    assert.deepEqual(calls.at(-1), [
+      { op: 'set', path: ['transportEnabled'], value: next },
+      { op: 'set', path: ['remoteControlEnabled'], value: next },
+    ]);
+  }
+  assert.equal(calls.length, 2);
+});
+
+test('atomic rejection and exceptions propagate without legacy fallback', async () => {
+  const { writeSwitch } = loadClientBundle().moduleExports.__internals;
+  const scope = { mutate: async () => false, set() { assert.fail('must not retry rejected atomic writes'); } };
+  await assert.rejects(writeSwitch(scope, true), /Settings write rejected/);
+  scope.mutate = async () => { throw new Error('offline'); };
+  await assert.rejects(writeSwitch(scope, false), /offline/);
+});
+
+test('legacy writes reject false from either field and stop at rejection', async () => {
+  const { writeSwitch } = loadClientBundle().moduleExports.__internals;
+  for (const rejected of ['transportEnabled', 'remoteControlEnabled']) {
+    const calls = [];
+    const scope = { async set(field) { calls.push(field); return field !== rejected; } };
+    await assert.rejects(writeSwitch(scope, false), /Settings write rejected/);
+    assert.deepEqual(calls, rejected === 'transportEnabled' ? [rejected] : ['transportEnabled', rejected]);
+  }
+});
+
+test('status reads reject HTTP, application, malformed and network failures', async () => {
+  const valid = { state: 'waiting', login: { authenticated: true } };
+  let response;
+  const { readStatus } = loadClientBundle({ fetch: async (url, options) => {
+    assert.equal(url, '/api/dsh-cindy-host/status');
+    assert.equal(options.headers.accept, 'application/json');
+    if (response instanceof Error) throw response;
+    return response;
+  } }).moduleExports.__internals;
+  for (const [ok, body] of [
+    [false, { ok: true, status: valid }],
+    [true, { ok: false, status: valid }],
+    [true, {}], [true, null], [true, { status: null }],
+    [true, { status: {} }], [true, { status: [] }], [true, { status: 'disconnected' }],
+  ]) {
+    response = { ok, json: async () => body };
+    await assert.rejects(readStatus());
+  }
+  response = { ok: true, json: async () => { throw new Error('invalid JSON'); } };
+  await assert.rejects(readStatus(), /invalid JSON/);
+  response = new Error('offline');
+  await assert.rejects(readStatus(), /offline/);
+  response = { ok: true, json: async () => ({ ok: true, status: valid }) };
+  assert.equal(await readStatus(), valid);
+});
+
+/** Run page hooks without a DOM so effects, handlers and subsequent renders are exercised. */
+function pageHarness(scope, fetch) {
+  const states = [];
+  let cursor = 0;
+  let effect;
+  let tick;
+  const react = {
+    ...React,
+    useState(initial) {
+      const index = cursor++;
+      if (!(index in states)) states[index] = initial;
+      return [states[index], (value) => { states[index] = typeof value === 'function' ? value(states[index]) : value; }];
+    },
+    useCallback: (callback) => callback,
+    useSyncExternalStore: (_subscribe, getSnapshot) => getSnapshot(),
+    useEffect: (callback) => { effect = callback; },
+  };
+  const { createCindySettingsPage } = loadClientBundle({
+    react, fetch,
+    setInterval: (callback) => { tick = callback; return 1; },
+    clearInterval() {},
+  }).moduleExports.__internals;
+  const Page = createCindySettingsPage(scope);
+  const tree = () => { cursor = 0; return Page(); };
+  tree();
+  return {
+    tree,
+    html: () => render(tree()),
+    async start() {
+      const cleanup = effect();
+      await new Promise((resolve) => setImmediate(resolve));
+      return cleanup;
+    },
+    poll: () => tick(),
+  };
+}
+
+function findElement(element, predicate) {
+  if (!React.isValidElement(element)) return undefined;
+  if (predicate(element)) return element;
+  for (const child of React.Children.toArray(element.props.children)) {
+    const match = findElement(child, predicate);
+    if (match) return match;
+  }
+}
+
+test('poll failures show an error rather than disconnected, and recover on a valid poll', async () => {
+  let body = { ok: false };
+  const page = pageHarness(makeScope({ transportEnabled: true }), async () => ({ ok: true, json: async () => body }));
+  const cleanup = await page.start();
+  try {
+    assert.match(page.html(), /读取 Host 状态失败/);
+    assert.doesNotMatch(page.html(), /未连接/);
+    body = { ok: true, status: { state: 'connected' } };
+    await page.poll();
+    assert.doesNotMatch(page.html(), /读取 Host 状态失败/);
+    assert.match(page.html(), />已连接</);
+    body = {};
+    await page.poll();
+    assert.match(page.html(), /读取 Host 状态失败/);
+    assert.doesNotMatch(page.html(), />已连接<|未连接/);
+  } finally { cleanup(); }
+});
+
+test('the page surfaces a rejected atomic switch write', async () => {
+  const scope = makeScope({ transportEnabled: false });
+  scope.mutate = async () => false;
+  const page = pageHarness(scope, async () => { throw new Error('unused'); });
+  const toggle = findElement(page.tree(), (element) => element.type.name === 'Switch');
+  toggle.props.onChange(true);
+  await new Promise((resolve) => setImmediate(resolve));
+  assert.match(page.html(), /写入设置失败/);
+  assert.match(page.html(), /aria-checked="false"/);
+  assert.deepEqual(scope.written, []);
+});
+
+test('connected and waiting accounts show only masked identifiers and a working logout', async () => {
+  for (const [state, identifier, masked] of [
+    ['connected', 'person@example.com', 'p***@example.com'],
+    ['waiting', '+8613812345678', '***5678'],
+    ['failed', null, null],
+  ]) {
+    const calls = [];
+    const page = pageHarness(makeScope({ transportEnabled: true }), async (url, options) => {
+      calls.push([url, options]);
+      return { ok: true, json: async () => ({ ok: true, status: { state, login: { authenticated: true, identifier } } }) };
+    });
+    const cleanup = await page.start();
+    try {
+      const html = page.html();
+      assert.match(html, /已登录 Cindy/);
+      assert.equal((html.match(/退出登录/g) ?? []).length, 1);
+      if (identifier) {
+        assert.equal(html.includes(identifier), false);
+        assert.equal(html.includes(masked), true);
+      }
+      const logout = findElement(page.tree(), (element) => element.type === 'button' && element.props.children === '退出登录');
+      await logout.props.onClick();
+      assert.equal(calls.at(-1)[0], '/api/dsh-cindy-host/logout');
+      assert.equal(calls.at(-1)[1].method, 'POST');
+    } finally { cleanup(); }
+  }
 });

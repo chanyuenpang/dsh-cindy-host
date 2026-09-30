@@ -97,16 +97,22 @@ git clone --depth 1 <url> /tmp/verify && grep -r <pattern> /tmp/verify
 | 场景 | 做法 |
 |---|---|
 | 迭代/功能验证 | `npm run sandbox`（3081，独立实例）→ 我自己重启，不打扰用户 |
-| 真机生效 | `node tools/restart-host.mjs --apply`（默认 60s 缓冲，通过 WMI 启动 supervisor） |
+| 真机生效 | `node tools/restart-host.mjs --apply`（默认 60s 缓冲，通过 WMI 启动 supervisor；**先拿到用户同意**，见下） |
 | **别的 agent / 别的项目** | 全局 skill **`dsh-restart`**：`~/.agents/skills/dsh-restart/scripts/restart-dsh.mjs`（同一套逻辑，去掉了仓库依赖；日志在 `~/.agents/logs/dsh-restart/`）。任何 agent 触发「重启 dsh」时都会用到它，规则同样遵守 ADR-0009 |
 
 **重启的硬规则**（写进 ADR-0009）：
 
-1. **必须先告知，并留足被读到的窗口**——默认 `--grace 60`。"与掉线同时到达的提醒不算提醒"。
-2. 重启会**杀掉正在跑的那一轮**；会话日志是持久的，但**没有任何东西会自动续上**——需要一条新消息
+1. **必须先拿到明确同意，再 apply**——先用 `ask_user_question` 问，用户点了同意才执行 `--apply`。
+   「告知」不等于「同意」，倒计时也不是同意：与掉线同时到达的提醒不算提醒。
+2. **必须先告知，并留足被读到的窗口**——默认 `--grace 60`。
+3. **`--apply` 会先清扫整棵 dsh 进程树**（含命令子进程/沙箱线程和上次留下的孤儿），再启动新实例。
+   这是"干净重启"换来的，代价说清楚：**本机每个 dsh 实例的命令子进程都会被停**，别的会话正在跑的命令
+   也会跟着死。不想动就加 `--keep-sandboxes`（只停目标那棵树）。执行前先跑一次干运行，读它打出的
+   `cleanupPids` 名单。
+4. 重启会**杀掉正在跑的那一轮**；会话日志是持久的，但**没有任何东西会自动续上**——需要一条新消息
    唤醒（手机发最稳，因为它不依赖网页 token）。
-3. 新实例会自己打开新标签页（旧页面的 token 失效）。
-4. 失败模式：**DSH 停在那里**，只有人能手动起。日志在 `.sandbox/host-restart.log`（全局 skill 那条路写在
+5. 新实例会自己打开新标签页（旧页面的 token 失效）。
+6. 失败模式：**DSH 停在那里**，只有人能手动起。日志在 `.sandbox/host-restart.log`（全局 skill 那条路写在
    `~/.agents/logs/dsh-restart/host-restart.log`，新实例自己的输出在 `dsh-web.log`，新 token 在其最后一行）。
 
 重启后自检三件事：`/status` 的 `boundaries`（`recovered`/`starting`/`silent`）、`handlerErrors`（应为空

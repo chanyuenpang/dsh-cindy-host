@@ -80,6 +80,23 @@ test('the list channel answers from its cache instead of blocking on a read', as
   await assert.rejects(() => cold(request('local-db:sessions:list')), /aborted due to timeout/);
 });
 
+
+test('the list channel honors Cindy status, limit, and includePinned arguments', async () => {
+  const rows = [
+    { ...ROWS[0], id: 'active-recent', status: 'active', pinnedAt: null },
+    { ...ROWS[1], id: 'archived', status: 'archived', pinnedAt: null },
+    { ...ROWS[1], id: 'active-pinned', status: 'active', pinnedAt: '2026-01-03T00:00:00.000Z' },
+    { ...ROWS[1], id: 'deleted', status: 'deleted', pinnedAt: null },
+  ];
+  const { router } = makeRouter(rows);
+  const active = await router(request('local-db:sessions:list', [1, 'active', { includePinned: true, fresh: true }]));
+  assert.deepEqual(active.payload.result.map((row) => [row.id, row.status]), [['active-recent', 'active'], ['active-pinned', 'active']]);
+  const archived = await router(request('local-db:sessions:list', [1_000, 'archived', { includePinned: true }]));
+  assert.deepEqual(archived.payload.result.map((row) => [row.id, row.status]), [['archived', 'archived']]);
+  const all = await router(request('local-db:sessions:list', [20, 'all']));
+  assert.equal(all.payload.result.some((row) => row.status === 'deleted'), false);
+});
+
 test('a write voids the cached page, so the reply a controller applies is never pre-write', async () => {
   // The patch-meta reply is folded from the same rows the list serves. With a cache in front of
   // it, a stale page would echo the pre-write row — and the controller reads an unchanged row
@@ -109,6 +126,7 @@ test('the supported set is exactly what the router serves', () => {
     'device-link:unsubscribe',
     'file-browser:remote-op',
     'device-link:media:fetch',
+    'device-link:file-peer',
     'fs:list-dir',
     'fs:stat-path',
     'local-db:messages:list',
@@ -149,6 +167,7 @@ test('the supported set is exactly what the router serves', () => {
     'maker:list-agent-skills',
     'maker:list-available-agents',
     'maker:list-desktop-commands',
+    'maker:provider:list',
     'maker:resolve-interaction',
     'maker:scan-at-resources',
     'maker:set-permission-mode',
@@ -441,13 +460,10 @@ test('an accepted steer is visible as steering before it is durable', async () =
   assert.deepEqual(pushed, ['s1'], 'and the projection is pushed, so the bubble has an answer');
 });
 
-test('the newest window carries prompts the Host has accepted but not yet made durable', async () => {
-  // The experience this fixes: send while a turn is running, the row is not in the transcript
-  // yet (DSH splices it at the turn's next step boundary — 0.4 s idle, 42 s worst observed),
-  // reload the session, and the message looks lost even though it is queued and will arrive.
-  // Serving it as a row on the **newest** page makes the Host answer "we have it" — and only
-  // there, because a cursor names a durable row and inventing rows behind it would corrupt
-  // paging.
+test('pending inbox entries never masquerade as durable transcript or view messages', async () => {
+  // The previous host injected these rows to keep pending text visible on reload.
+  // Cindy instead treats every user history clientId as delivered, ignoring the
+  // custom pendingDelivery flag. Both history surfaces must reject that shortcut.
   const pendingRow = {
     id: 's1:pending:c1',
     clientId: 'c1',
@@ -470,14 +486,12 @@ test('the newest window carries prompts the Host has accepted but not yet made d
   });
 
   const newest = await router(request('local-db:messages:list', ['s1', { limit: 20 }]));
-  assert.deepEqual(newest.payload.result.map((row) => row.clientId), ['c1', 's1:m1:0'], 'the pending prompt is the newest thing');
-  assert.equal(newest.payload.result[0].role, 'user');
-  assert.equal(newest.payload.result[0].content.text, '插一句');
+  assert.deepEqual(newest.payload.result, durable, 'pending user rows would falsely settle the mobile queue');
 
   const paged = await router(request('local-db:messages:list', ['s1', { limit: 20, before: 's1:m1:0' }]));
   assert.deepEqual(paged.payload.result.map((row) => row.clientId), ['s1:m1:0'], 'a cursor page is durable rows only');
 
-  // The work-grouped view shows it too, as a readable item on its newest page.
+  // The work-grouped view must not settle a pending prompt either.
   const viewItems = [{ type: 'messages', key: 's1:m1:0', messages: durable }];
   const viewing = createChannelRouter({
     listSessions: async () => ROWS,
@@ -488,11 +502,9 @@ test('the newest window carries prompts the Host has accepted but not yet made d
     subscribers: new Set(),
   });
   const page = await viewing(request('local-db:messages:view', ['s1', {}]));
-  assert.equal(page.payload.result.items.length, 2);
-  assert.equal(page.payload.result.items[1].type, 'messages');
-  assert.equal(page.payload.result.items[1].messages[0].clientId, 'c1');
+  assert.deepEqual(page.payload.result.items, viewItems, 'history view must also contain only consumed messages');
   assert.equal(page.payload.result.nextCursor, 's1:m1:0', 'the cursor still names the last durable item');
-  // An older page never carries it: the prompt is the newest thing, not an old one.
+  // No history page may present unconsumed input as a durable message.
   const older = createChannelRouter({
     listSessions: async () => ROWS,
     resolveCapabilities: () => ({
@@ -1083,9 +1095,8 @@ test('answers the agent roster the phone asks for on every device open', async (
   const { router } = makeRouter();
 
   const agents = await router(request('maker:list-available-agents'));
-  // One harness: DSH's own agent drives every session, so there is nothing to
-  // choose and the roster, the picker, and the rows all agree.
-  assert.deepEqual(agents.payload.result, ['pi']);
+  // Three Cindy aliases for the same DSH runtime.
+  assert.deepEqual(agents.payload.result, ['claude-code', 'codex', 'pi']);
 
   const capabilities = await router(request('maker:get-capabilities', ['pi']));
   assert.equal(capabilities.payload.ok, true);
@@ -1095,23 +1106,65 @@ test('answers the agent roster the phone asks for on every device open', async (
     'planModeSupported', 'supportsModelWindowSwitchGuard', 'supportsSessionAgentSwitch',
   ]);
 
-  // `maker:provider:list` is refused on purpose. The controller only falls back
-  // to `availableModels` when that channel is explicitly unsupported
-  // (`canUseFlatModelFallback` needs `providersUnsupported`, which only
-  // CHANNEL_NOT_ALLOWED sets) — an empty *success* reads as an authoritative
-  // empty catalog and leaves the picker with nothing to show.
   const providers = await router(request('maker:provider:list'));
-  assert.equal(providers.payload.ok, false);
-  assert.equal(providers.payload.error.code, 'CHANNEL_NOT_ALLOWED');
+  assert.equal(providers.payload.ok, true);
+  assert.deepEqual(providers.payload.result, { providers: [], providerOrder: [] });
 });
 
-test('refuses capabilities for a harness this Host does not offer', async () => {
+
+
+test('serves Cindy desktop provider views and maps permission controls', async () => {
+  const writes = [];
+  const catalog = {
+    default: { provider: 'openai-codex', model: 'gpt-x' },
+    routableProviders: ['openai-codex'],
+    groups: [{
+      id: 'openai-codex', name: 'OpenAI',
+      models: [{ id: 'gpt-x', name: 'GPT X', contextWindow: 200_000,
+        reasoning: { efforts: [{ id: 'high', name: 'High' }], defaultEffort: 'high' } }],
+    }],
+  };
+  const router = createChannelRouter({
+    listSessions: async () => ROWS,
+    resolveCapabilities: () => ({
+      modelCatalog: async () => catalog,
+      sessionControls: {
+        permissionNames: () => ['read-only', 'workspace-write', 'danger-full-access', 'custom'],
+        setPermissionMode: async (input) => { writes.push(input); },
+      },
+    }),
+    subscribers: new Set(),
+  });
+
+  const providers = await router(request('maker:provider:list'));
+  assert.equal(providers.payload.ok, true);
+  assert.equal(providers.payload.result.providers[0].models.codex[0].id, 'gpt-x');
+  assert.equal(providers.payload.result.providers[0].models.codex[0].contextWindow, 200_000);
+
+  const capabilities = await router(request('maker:get-capabilities', ['codex']));
+  assert.deepEqual(capabilities.payload.result.permissionModes.map((item) => item.id), [
+    'ask', 'acceptEdits', 'bypassPermissions',
+  ]);
+
+  const changed = await router(request('maker:set-permission-mode', ['a', 'acceptEdits']));
+  assert.equal(changed.payload.ok, true);
+  assert.deepEqual(writes, [{ sessionId: 'a', mode: 'workspace-write' }]);
+  const leaked = await router(request('maker:set-permission-mode', ['a', 'workspace-write']));
+  assert.equal(leaked.payload.error.code, 'BAD_REQUEST', 'raw DSH preset ids are not Cindy controls');
+});
+
+test('all three aliases expose identical DSH capabilities; unknown kinds are refused', async () => {
   const { router } = makeRouter();
-  for (const kind of ['claude-code', 'codex', 'gemini']) {
+  const answers = [];
+  for (const kind of ['claude-code', 'codex', 'pi']) {
     const result = await router(request('maker:get-capabilities', [kind]));
-    assert.equal(result.payload.ok, false, `${kind} is not offered`);
-    assert.equal(result.payload.error.code, 'NOT_AVAILABLE', 'claiming a capability we lack is worse than refusing');
+    assert.equal(result.payload.ok, true, `${kind} must support opening its own session`);
+    answers.push(result.payload.result);
   }
+  assert.deepEqual(answers[0], answers[1]);
+  assert.deepEqual(answers[1], answers[2]);
+  const unknown = await router(request('maker:get-capabilities', ['gemini']));
+  assert.equal(unknown.payload.error.code, 'NOT_AVAILABLE');
 });
 
 test('serves message history, forwarding the phone paging options', async () => {
@@ -1139,6 +1192,35 @@ test('a Host that cannot read history says so instead of returning an empty tran
   assert.equal(result.payload.error.code, 'NOT_AVAILABLE', 'an unavailable capability must not look like "no messages"');
 });
 
+test('create reply and list/get use the actual route instead of the phone platform choice', async () => {
+  let source = { id: 's1', title: 'Task', model: 'gpt-5.6-sol', providerId: 'deepseek-official' };
+  const seen = [];
+  const router = createChannelRouter({
+    listSessions: async () => [source],
+    resolveCapabilities: () => ({
+      modelCatalog: async () => ({ default: { provider: 'openai-codex', model: 'gpt-5.6-sol' }, groups: [] }),
+      createSession: async (options) => {
+        seen.push(options);
+        return { sessionId: 's1', selection: { provider: 'deepseek-official', model: 'gpt-5.6-sol' } };
+      },
+    }),
+    subscribers: new Set(),
+  });
+  await router(request('maker:get-capabilities', ['codex']));
+  const created = await router(request('maker:create-session', [{ agentKind: 'claude-code', model: 'gpt-5.6-sol', providerId: 'deepseek-official' }]));
+  assert.equal(created.payload.result.agentKind, 'pi', 'DeepSeek wins over a GPT-shaped model and phone platform');
+  assert.deepEqual(seen, [{ sessionId: undefined, cwd: undefined, model: 'gpt-5.6-sol', provider: 'deepseek-official' }]);
+  const get = async () => (await router(request('local-db:sessions:get', ['s1']))).payload.result;
+  assert.equal((await get()).agentKind, 'pi');
+  source = { ...source, providerId: 'openai-codex' };
+  // The list cache is invalidated by a successful write, not by an external mutation.
+  await router(request('maker:create-session', [{ agentKind: 'pi' }]));
+  assert.equal((await get()).agentKind, 'codex');
+  source = { ...source, model: 'gemini-3', providerId: 'google' };
+  await router(request('maker:create-session', [{ agentKind: 'codex' }]));
+  assert.equal((await get()).agentKind, 'claude-code');
+});
+
 test('creates a session through DSH and echoes the id the controller preallocated', async () => {
   const seen = [];
   const subscribers = new Set();
@@ -1154,10 +1236,11 @@ test('creates a session through DSH and echoes the id the controller preallocate
   const preallocated = await router(request('maker:create-session', [{ agentKind: 'pi', id: 'client-id-1', workingDir: 'G:\\w' }]));
   assert.equal(preallocated.payload.ok, true);
   assert.equal(preallocated.payload.result.sessionId, 'client-id-1', 'passing the id through avoids a rekey');
-  assert.equal(preallocated.payload.result.agentKind, 'pi');
+  assert.equal(preallocated.payload.result.agentKind, 'claude-code', 'unknown route never claims DeepSeek just because the phone selected Pi');
 
   const generated = await router(request('maker:create-session', [{ agentKind: 'claude-code' }]));
   assert.equal(generated.payload.result.sessionId, 'dsh-generated', 'a create with no id still returns the one DSH made');
+  assert.equal(generated.payload.result.agentKind, 'claude-code');
 
   assert.deepEqual(seen, [
     { sessionId: 'client-id-1', cwd: 'G:\\w' },
@@ -1194,7 +1277,7 @@ test('the runtime the controller picked for a new conversation reaches the Host'
     model: 'gpt-5.6-sol',
     providerId: 'openai-codex',
     effort: 'high',
-    permissionMode: 'read-only',
+    permissionMode: 'ask',
     fastMode: false,
   }]));
 
@@ -1210,7 +1293,7 @@ test('the runtime the controller picked for a new conversation reaches the Host'
   assert.equal(result.payload.result.model, 'gpt-5.6-sol', 'the reply names what the session is actually on');
   assert.equal(result.payload.result.providerId, 'openai-codex');
   assert.equal(result.payload.result.effort, 'high');
-  assert.equal(result.payload.result.permissionMode, 'read-only');
+  assert.equal(result.payload.result.permissionMode, 'ask');
 });
 
 test('a blank picker is not a selection, and one the Host cannot route is refused', async () => {

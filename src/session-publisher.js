@@ -88,6 +88,11 @@ export function publishLifecycle(ws, subscribers, item, record) {
  * @param item - one lifecycle item from the projection sink.
  * @returns the channel and payload, or null when the item says nothing about a turn.
  */
+/** Cindy status events require both the running flag and a displayable string. */
+export function runningStatusEvent(status = 'running') {
+  return { type: 'status', data: { isRunning: true, status } };
+}
+
 export function turnEventFor(item) {
   const sessionId = item?.sessionId;
   if (typeof sessionId !== 'string' || sessionId === '') return null;
@@ -95,8 +100,9 @@ export function turnEventFor(item) {
   switch (item.phase) {
     // A turn (or a wait for the user) is live.
     case 'running':
+      return { channel: 'maker:event', payload: { sessionId, event: runningStatusEvent() } };
     case 'waiting':
-      return { channel: 'maker:event', payload: { sessionId, event: { type: 'status', data: { isRunning: true } } } };
+      return { channel: 'maker:event', payload: { sessionId, event: runningStatusEvent('waiting on input') } };
     // A failure is unambiguous.
     case 'error':
       return { channel: 'maker:event', payload: { sessionId, event: { type: 'done' } } };

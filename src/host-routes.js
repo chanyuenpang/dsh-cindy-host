@@ -11,10 +11,10 @@
  * what the runtime says. The card is a renderer.
  */
 import { randomUUID } from 'node:crypto';
-import { loadSession, clearSession } from './credential-store.js';
+import { loadSession } from './credential-store.js';
 import { rememberedDeviceId } from './host-settings.js';
 import { requestLoginCode, verifyLoginCode, selectLoginAccount } from './cindy-login-flow.js';
-import { adoptSession } from './auth-session.js';
+import { adoptSession, forgetSession } from './auth-session.js';
 
 /** Route prefix; the card hardcodes the same value. */
 export const API_PREFIX = '/api/dsh-cindy-host';
@@ -63,7 +63,12 @@ export async function readJsonBody(req) {
  * @param options - the runtime accessor and an optional diagnostics producer.
  * @returns one handler per route, each owning its own response.
  */
-export function createHostRoutes({ getRuntime, getDiagnostics, getSettings, rememberDeviceId }) {
+export function createHostRoutes({ getRuntime, getDiagnostics, getSettings, rememberDeviceId, auth = {} }) {
+  const loadCredential = auth.loadSession ?? loadSession;
+  const saveCredential = auth.adoptSession ?? adoptSession;
+  const forgetCredential = auth.forgetSession ?? forgetSession;
+  const verifyCredential = auth.verifyLoginCode ?? verifyLoginCode;
+  const selectCredential = auth.selectLoginAccount ?? selectLoginAccount;
   /**
    * The stable Cindy device handle for this Host.
    *
@@ -75,7 +80,7 @@ export function createHostRoutes({ getRuntime, getDiagnostics, getSettings, reme
    * @returns the device id to log in with.
    */
   async function hostDeviceId() {
-    const stored = await loadSession().catch(() => null);
+    const stored = await loadCredential().catch(() => null);
     const fromCredential = typeof stored?.deviceId === 'string' ? stored.deviceId.trim() : '';
     const remembered = typeof getSettings === 'function'
       ? (() => { try { return rememberedDeviceId(getSettings()); } catch { return ''; } })()
@@ -133,8 +138,7 @@ export function createHostRoutes({ getRuntime, getDiagnostics, getSettings, reme
   }
 
   async function handleVerifyCode(req, res, body) {
-    const runtime = getRuntime();
-    const result = await verifyLoginCode({
+    const result = await verifyCredential({
       kind: body.kind,
       identifier: body.identifier,
       code: body.code,
@@ -144,7 +148,9 @@ export function createHostRoutes({ getRuntime, getDiagnostics, getSettings, reme
       sendJson(res, 400, result);
       return;
     }
-    await adoptSession(result.session);
+    const runtime = getRuntime();
+    await runtime?.beginIdentityChange?.();
+    await saveCredential(result.session);
     // A login while the switch is already on must finish the connect the user
     // asked for; with the switch off it only stores the session.
     if (runtime) {
@@ -155,13 +161,14 @@ export function createHostRoutes({ getRuntime, getDiagnostics, getSettings, reme
   }
 
   async function handleSelectAccount(req, res, body) {
-    const runtime = getRuntime();
-    const result = await selectLoginAccount({ loginTicket: body.loginTicket, accountId: body.accountId, deviceId: await hostDeviceId() });
+    const result = await selectCredential({ loginTicket: body.loginTicket, accountId: body.accountId, deviceId: await hostDeviceId() });
     if (!result.ok) {
       sendJson(res, 400, result);
       return;
     }
-    await adoptSession(result.session);
+    const runtime = getRuntime();
+    await runtime?.beginIdentityChange?.();
+    await saveCredential(result.session);
     if (runtime) {
       runtime.status.setLogin({ authenticated: true, required: false });
       await runtime.connect();
@@ -171,7 +178,8 @@ export function createHostRoutes({ getRuntime, getDiagnostics, getSettings, reme
 
   async function handleLogout(req, res) {
     const runtime = getRuntime();
-    await clearSession();
+    await runtime?.beginIdentityChange?.();
+    await forgetCredential();
     if (runtime) await runtime.disconnect();
     sendJson(res, 200, { ok: true, status: runtime ? runtime.getStatus() : null });
   }

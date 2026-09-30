@@ -132,7 +132,8 @@ test('a promoted steer keeps the text of the bubble the user is looking at', asy
   // shows up.
   const projection = await router(request('maker:input:get-projection', ['s1']));
   assert.deepEqual(projection.payload.result.steeringQueueClientIds, ['c1'], 'the row moved to steering');
-  assert.equal((projection.payload.result.pendingQueue ?? []).length, 0, 'and is no longer queued');
+  assert.equal(projection.payload.result.pendingQueue.length, 1, 'promotion is not consumption');
+  assert.equal(projection.payload.result.pendingQueue[0].text, 'queued text', 'reopening still has the pending body');
 
   // What the phone renders the bubble from: the fold's record for that id.
   const held = tracker.itemFor('s1', 'c1');
@@ -474,6 +475,53 @@ test('a refusal that arrives as a rejection is reported, not left floating', asy
   assert.equal(result.payload.ok, false, 'a refused mutation is not reported as done');
   assert.equal(result.payload.error.code, 'session/queue-item-not-found', 'and DSH’s own code travels');
   assert.equal(result.payload.error.message, 'queued item is no longer pending');
+});
+
+test('remove of an already absent durable item reconciles instead of failing phone sync', async () => {
+  const tracker = createInputQueueTracker();
+  tracker.apply({ type: 'queue', sessionId: 's1', items: [item('m1', 'c1', 'gone'), item('m2', 'c2', 'still queued')] });
+  const pushed = [];
+  const refusal = Object.assign(new Error('queued item is no longer pending'), { code: 'session/queue-item-not-found' });
+  const router = createChannelRouter({
+    listSessions: async () => ROWS,
+    resolveCapabilities: () => ({
+      queueControl: { update: async () => { throw refusal; } },
+      queueMirror: tracker,
+      readSessionState: async () => ({ inbox: { 'next-turn': [
+        { id: 'm2', source: { kind: 'user', rpcId: 'c2' }, content: [{ type: 'text', text: 'still queued' }] },
+      ] } }),
+      inputProjection: (sessionId) => tracker.projectionFor(sessionId, SESSION),
+      pushInputProjection: (sessionId) => pushed.push(sessionId),
+    }),
+    subscribers: new Set(),
+  });
+  const result = await router(request('maker:input:remove', ['s1', 'c1']));
+  assert.equal(result.payload.ok, true);
+  assert.deepEqual(result.payload.result.pendingQueue.map((row) => row.clientId), ['c2']);
+  assert.deepEqual(tracker.queueFor('s1').map((row) => row.rpcId), ['c2']);
+  assert.equal(pushed.at(-1), 's1', 'watchers receive the authoritative queue');
+});
+
+test('remove still refuses when the durable inbox holds the requested item', async () => {
+  const tracker = createInputQueueTracker();
+  tracker.apply({ type: 'queue', sessionId: 's1', items: [item('m1', 'c1', 'still queued')] });
+  const refusal = Object.assign(new Error('queued item is no longer pending'), { code: 'session/queue-item-not-found' });
+  const router = createChannelRouter({
+    listSessions: async () => ROWS,
+    resolveCapabilities: () => ({
+      queueControl: { update: async () => { throw refusal; } },
+      queueMirror: tracker,
+      readSessionState: async () => ({ inbox: { 'next-turn': [
+        { id: 'm1', source: { kind: 'user', rpcId: 'c1' }, content: [{ type: 'text', text: 'still queued' }] },
+      ] } }),
+      inputProjection: (sessionId) => tracker.projectionFor(sessionId, SESSION),
+    }),
+    subscribers: new Set(),
+  });
+  const result = await router(request('maker:input:remove', ['s1', 'c1']));
+  assert.equal(result.payload.ok, false);
+  assert.equal(result.payload.error.code, 'session/queue-item-not-found');
+  assert.equal(tracker.hasItem('s1', 'c1'), true);
 });
 
 test('the same refusal from a steer is reported instead of answered with true', async () => {

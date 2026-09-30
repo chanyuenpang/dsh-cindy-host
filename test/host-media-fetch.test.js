@@ -1,10 +1,15 @@
 import test from 'node:test';
 import assert from 'node:assert/strict';
+import { mkdtemp, rm, writeFile } from 'node:fs/promises';
+import { tmpdir } from 'node:os';
+import { join } from 'node:path';
+import { FILE_INLINE_MAX_BYTES, FILE_PEER_MAX_BYTES } from '../src/file-peer-protocol.js';
 import {
   INLINE_ORIGINAL_MAX_BYTES,
   MEDIA_FETCH_MAX_BYTES,
   THUMBNAIL_INLINE_MAX_BYTES,
   createLocalMediaFetcher,
+  createLocalFileResolver,
   isBlockedMediaPath,
   isInsideDirectory,
   isThumbnailableMime,
@@ -285,4 +290,140 @@ test('the same file is staged once, until it changes or the controller says othe
   const first = await aging(aged);
   const second = await aging(aged);
   assert.notEqual(first.result.ossKey, second.result.ossKey, 'a zero ttl means no reuse');
+});
+
+const fileUrl = (path = 'G:\\work\\file.txt', root = 'G:\\work') =>
+  `xdt-file://open?path=${encodeURIComponent(path)}&workdir=${encodeURIComponent(root)}`;
+
+// Metadata-only doubles deliberately do not allocate the large payloads they describe.
+const metadataFs = (size) => ({
+  realpath: async (path) => path,
+  stat: async () => ({ size, isFile: () => true }),
+});
+
+test('shared resolver exports authorization metadata and honors host and caller limits', async () => {
+  const fs = metadataFs(MEDIA_FETCH_MAX_BYTES + 1);
+  assert.equal((await createLocalFileResolver(fs)(fileUrl())).code, 'BAD_REQUEST');
+  const peer = createLocalFileResolver({ ...fs, maxBytes: FILE_PEER_MAX_BYTES });
+  const result = await peer(fileUrl());
+  assert.equal(result.ok, true);
+  assert.equal(result.real, 'G:\\work\\file.txt');
+  assert.equal(result.info.size, MEDIA_FETCH_MAX_BYTES + 1);
+  assert.equal(result.mimeType, 'text/plain');
+  assert.equal(result.cap, FILE_PEER_MAX_BYTES);
+  assert.equal((await peer(fileUrl() + '&maxBytes=20')).code, 'BAD_REQUEST');
+  assert.equal((await peer(fileUrl() + '&maxBytes=0')).code, 'BAD_REQUEST');
+  assert.equal((await peer(fileUrl() + '&maxBytes=9999999999')).cap, FILE_PEER_MAX_BYTES);
+  assert.equal((await createLocalFileResolver({ ...metadataFs(FILE_PEER_MAX_BYTES + 1), maxBytes: FILE_PEER_MAX_BYTES })(fileUrl())).code, 'BAD_REQUEST');
+  const small = await createLocalFileResolver(metadataFs(1))(fileUrl() + '&maxBytes=7');
+  assert.equal(small.cap, 7);
+});
+
+test('shared resolver realpaths both roots and targets and rejects sensitive/nonregular paths', async () => {
+  const fs = fakeFs({
+    'G:\\work': { real: 'G:\\real', directory: true, bytes: Buffer.alloc(0) },
+    'G:\\work\\file.txt': { real: 'G:\\real\\file.txt', bytes: Buffer.from('x') },
+    'G:\\real\\file.txt': { bytes: Buffer.from('x') },
+    'G:\\work\\escape': { real: 'G:\\outside\\secret', bytes: Buffer.from('x') },
+    'G:\\work\\secret': { real: 'G:\\real\\.env', bytes: Buffer.from('x') },
+  });
+  const resolver = createLocalFileResolver(fs);
+  assert.equal((await resolver(fileUrl())).ok, true, 'canonical root authorizes canonical target');
+  assert.equal((await resolver(fileUrl('G:\\work\\escape'))).code, 'FORBIDDEN');
+  assert.equal((await resolver(fileUrl('G:\\work\\secret'))).code, 'FORBIDDEN');
+  assert.equal((await resolver('xdt-file://open?path=G%3A%5Cwork%5Cfile.txt')).code, 'BAD_REQUEST');
+  assert.equal((await resolver(fileUrl('G:\\work\\file.txt', 'G:\\missing'))).code, 'FORBIDDEN');
+  const nonregular = createLocalFileResolver({ ...metadataFs(0), stat: async () => ({ size: 0, isDirectory: () => false, isFile: () => false }) });
+  assert.equal((await nonregular(fileUrl())).code, 'BAD_REQUEST', 'devices/FIFOs/sockets are not files');
+  assert.equal((await createLocalFileResolver({ ...metadataFs(0), blocked: ['file.txt'] })(fileUrl())).code, 'FORBIDDEN');
+});
+
+test('prepareOnly returns metadata above 64 KiB without reading, opening or uploading', async () => {
+  const unexpected = async () => assert.fail('metadata preparation must not read or upload');
+  for (const size of [FILE_INLINE_MAX_BYTES + 1, MEDIA_FETCH_MAX_BYTES + 1, FILE_PEER_MAX_BYTES]) {
+    const fetcher = createLocalMediaFetcher({ ...metadataFs(size), open: unexpected, readFile: unexpected, uploader: unexpected });
+    assert.deepEqual(await fetcher({ url: fileUrl(), prepareOnly: true }), {
+      ok: true, result: { ossKey: '', size, mimeType: 'text/plain', transferRequired: true },
+    });
+    const noUploader = createLocalMediaFetcher({ ...metadataFs(size), open: unexpected, readFile: unexpected });
+    assert.equal((await noUploader({ url: fileUrl(), prepareOnly: true })).ok, true);
+    assert.equal((await fetcher({ url: fileUrl() + '&maxBytes=42', prepareOnly: true })).code, 'BAD_REQUEST');
+  }
+  const capped = createLocalMediaFetcher({ ...metadataFs(FILE_INLINE_MAX_BYTES + 1), prepareMaxBytes: FILE_INLINE_MAX_BYTES, open: unexpected });
+  assert.equal((await capped({ url: fileUrl(), prepareOnly: true })).code, 'BAD_REQUEST');
+  const oversized = createLocalMediaFetcher(metadataFs(FILE_PEER_MAX_BYTES + 1));
+  assert.equal((await oversized({ url: fileUrl(), prepareOnly: true })).code, 'BAD_REQUEST');
+});
+
+test('prepareOnly inlines regular files including empty and exactly 64 KiB without OSS', async (t) => {
+  const root = await mkdtemp(join(tmpdir(), 'host-media-prepare-'));
+  t.after(() => rm(root, { recursive: true, force: true }));
+  const fetcher = createLocalMediaFetcher({ readFile: async () => assert.fail('must use bounded reads') });
+  for (const size of [0, 1, FILE_INLINE_MAX_BYTES]) {
+    const path = join(root, `file-${size}.txt`);
+    const bytes = Buffer.alloc(size, 42);
+    await writeFile(path, bytes);
+    assert.deepEqual(await fetcher({ url: fileUrl(path, root), prepareOnly: true }), {
+      ok: true, result: { ossKey: '', size, mimeType: 'text/plain', inlineBase64: bytes.toString('base64') },
+    });
+  }
+  assert.equal((await fetcher({ url: fileUrl(root, root), prepareOnly: true })).code, 'BAD_REQUEST');
+});
+
+test('prepareOnly bounds growth reads and rejects truncation, replacement, mutation and read failures', async () => {
+  for (const mode of ['growth', 'truncation', 'replacement', 'mutation', 'error', 'nonregular', 'path-replacement']) {
+    const size = FILE_INLINE_MAX_BYTES;
+    const info = { size, ino: 1, mtimeMs: 1, isFile: () => true };
+    let closed = false;
+    let statCalls = 0;
+    let readBytes = 0;
+    const fetcher = createLocalMediaFetcher({
+      realpath: async (path) => path,
+      stat: async () => (++statCalls > 1 && mode === 'path-replacement' ? { ...info, ino: 2 } : info),
+      readFile: async () => assert.fail('unbounded read'),
+      open: async () => ({
+        stat: async () => {
+          if (mode === 'replacement') return { ...info, ino: 2 };
+          if (mode === 'nonregular') return { ...info, isFile: () => false };
+          return mode === 'mutation' && readBytes > 0 ? { ...info, mtimeMs: 2 } : info;
+        },
+        read: async (buffer, offset, length, position) => {
+          assert.equal(buffer.length, size + 1);
+          assert.equal(position, offset);
+          if (mode === 'error') throw new Error('read failed');
+          const available = mode === 'growth' ? size + 100_000 : mode === 'truncation' ? size - 1 : size;
+          const bytesRead = Math.max(0, Math.min(length, 777, available - position));
+          buffer.fill(1, offset, offset + bytesRead);
+          readBytes += bytesRead;
+          return { bytesRead };
+        },
+        close: async () => { closed = true; },
+      }),
+    });
+    const result = await fetcher({ url: fileUrl(), prepareOnly: true });
+    assert.equal(result.code, 'INTERNAL', mode);
+    assert.equal(closed, true, mode);
+    assert.ok(readBytes <= size + 1, mode);
+  }
+});
+
+test('prepareOnly ignores thumbnails and preserves the legacy OSS budget and cache', async () => {
+  const bytes = Buffer.from('hello');
+  let uploads = 0;
+  const fetcher = createLocalMediaFetcher({
+    ...metadataFs(bytes.length),
+    readFile: async () => bytes,
+    open: async () => assert.fail('legacy does not use preparation reads'),
+    uploader: async () => ({ ok: true, key: `key-${++uploads}` }),
+  });
+  const request = { url: fileUrl(), prepareOnly: true, thumbnail: true };
+  assert.equal((await fetcher(request)).result.ossKey, 'key-1');
+  assert.equal((await fetcher(request)).result.ossKey, 'key-1');
+  assert.equal((await fetcher({ ...request, skipCache: true })).result.ossKey, 'key-2');
+  const noUploader = createLocalMediaFetcher(metadataFs(0));
+  assert.equal((await noUploader(request)).code, 'NOT_AVAILABLE');
+  assert.equal((await noUploader({ url: '' })).code, 'BAD_REQUEST');
+  const oversized = createLocalMediaFetcher({ ...metadataFs(MEDIA_FETCH_MAX_BYTES + 1), uploader: async () => assert.fail('oversize upload'), readFile: async () => assert.fail('oversize read') });
+  assert.equal((await oversized(request)).code, 'BAD_REQUEST');
+  assert.equal((await oversized({ url: fileUrl() })).code, 'BAD_REQUEST');
 });

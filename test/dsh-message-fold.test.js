@@ -3,6 +3,8 @@ import assert from 'node:assert/strict';
 import { isHarnessNotice, promptRpcIdOf, foldSessionEvent, pageRows, createMessageCounter, createMessageReader, entryForTodoWrite, NEWEST_WINDOW_ROWS, NEWEST_WINDOW_TEXT_BYTES } from '../src/dsh-message-fold.js';
 import { toCindyMessages } from '../src/cindy-message-row.js';
 
+const textOf = (row) => typeof row.content === 'string' ? row.content : row.content?.text;
+
 test('names the controller id of a prompt that just became durable', () => {
   // This is the moment DSH's inbox drops the entry, so it is the moment the
   // controller's optimistic 队列中 row has to be retired.
@@ -78,14 +80,14 @@ test('pages back from a row id, which is the cursor the controller really sends'
     { message: { id: 'm4', role: 'assistant', content: [{ type: 'text', text: 'four' }] }, createdAt: '2026-01-01T00:00:03.000Z' },
   ], { sessionId: 's1' });
   // Newest first, which is the controller's paging order.
-  assert.deepEqual(rows.map((row) => row.content.text), ['four', 'three', 'two', 'one']);
+  assert.deepEqual(rows.map(textOf), ['four', 'three', 'two', 'one']);
 
   const first = pageRows(rows, { limit: 2 });
-  assert.deepEqual(first.map((row) => row.content.text), ['four', 'three']);
+  assert.deepEqual(first.map(textOf), ['four', 'three']);
 
   const anchor = first[first.length - 1].id;
   const second = pageRows(rows, { limit: 2, before: anchor });
-  assert.deepEqual(second.map((row) => row.content.text), ['two', 'one'], 'strictly older than the named row');
+  assert.deepEqual(second.map(textOf), ['two', 'one'], 'strictly older than the named row');
   assert.equal(second.some((row) => first.some((seen) => seen.id === row.id)), false, 'a page is never re-served');
 
   const third = pageRows(rows, { limit: 2, before: second[second.length - 1].id });
@@ -94,7 +96,7 @@ test('pages back from a row id, which is the cursor the controller really sends'
   // An id this Host cannot place must not degrade into "the newest page again":
   // that is exactly the failure the user saw, and it silently re-serves rows.
   const unknown = pageRows(rows, { limit: 2, before: 's1:never-seen:0' });
-  assert.deepEqual(unknown.map((row) => row.content.text), ['two', 'one'], 'the oldest page we have');
+  assert.deepEqual(unknown.map(textOf), ['two', 'one'], 'the oldest page we have');
 });
 
 test('counts rows the same way the transcript read does', async () => {
@@ -117,7 +119,7 @@ test('counts rows the same way the transcript read does', async () => {
     },
   ], { sessionId: 's1' });
   assert.equal(rows.length, 3);
-  assert.deepEqual(rows.map((row) => row.content.text), ['t', 'a', 'q']);
+  assert.deepEqual(rows.map(textOf), ['t', 'a', 'q']);
 });
 
 test('the transcript is folded once, then served from the live stream', async () => {
@@ -145,7 +147,7 @@ test('the transcript is folded once, then served from the live stream', async ()
   assert.equal(await reader.count('s1'), 1);
   const first = await reader('s1', { limit: 20 });
   assert.equal(reads, 1, 'the count seeded the cache instead of folding a second time');
-  assert.deepEqual(first.map((row) => row.content.text), ['one']);
+  assert.deepEqual(first.map(textOf), ['one']);
 
   // A second page for the same session must not touch the log again.
   await reader('s1', { limit: 20, before: first[0].id });
@@ -162,7 +164,7 @@ test('the transcript is folded once, then served from the live stream', async ()
   assert.equal(appended, true);
   assert.equal(reads, 1);
   const page = await reader('s1', { limit: 20 });
-  assert.deepEqual(page.map((row) => row.content.text), ['two', 'one'], 'newest first');
+  assert.deepEqual(page.map(textOf), ['two', 'one'], 'newest first');
   assert.equal(await reader.count('s1'), 2, 'the count sees the appended row');
 
   // A gap in the stream, a repeated seq (rewind), or an unknown seq drops the cache:
@@ -177,6 +179,232 @@ test('the transcript is folded once, then served from the live stream', async ()
   assert.equal(reader.stats().sessions, 0, 'the stale transcript was dropped, not patched');
   await reader('s1', { limit: 20 });
   assert.equal(reads, 2, 'the drop costs exactly one re-seed');
+});
+
+function deferredSeed() {
+  let resolve;
+  let reject;
+  const promise = new Promise((yes, no) => { resolve = yes; reject = no; });
+  return { promise, resolve, reject };
+}
+
+function seedSnapshot(text, seq = 1) {
+  return { events: [{ type: 'assistant/message', seq, time: seq * 1_000, surfaceOp: 'append',
+    data: { message: { id: `m${seq}`, role: 'assistant', content: [{ type: 'text', text }] } } }] };
+}
+
+test('concurrent count, whole view and page share one transcript seed', async () => {
+  const seed = deferredSeed();
+  let reads = 0;
+  const reader = createMessageReader({ readSessionLog: () => { reads++; return seed.promise; } });
+  const count = reader.count('s1');
+  const whole = reader.all('s1');
+  const page = reader('s1', { limit: 20 });
+  await Promise.resolve();
+  assert.equal(reads, 1, 'three read surfaces share the same full log replay');
+  assert.equal(reader.stats().seeding, 1);
+  seed.resolve(seedSnapshot('shared'));
+  const [total, allRows, pageRows] = await Promise.all([count, whole, page]);
+  assert.equal(total, 1);
+  assert.deepEqual(allRows.map(textOf), ['shared']);
+  assert.deepEqual(pageRows, allRows);
+  assert.deepEqual(reader.stats(), { sessions: 1, rows: 1, seeding: 0 });
+  await reader.all('s1');
+  assert.equal(reads, 1, 'settled rows remain cached, not a settled promise');
+  assert.equal(reader.invalidate('s1'), true);
+  await reader.all('s1');
+  assert.equal(reads, 2, 'invalidation after settlement really re-reads');
+});
+
+test('seed singleflight is per session, not a global read lock', async () => {
+  const first = deferredSeed();
+  const second = deferredSeed();
+  const reads = [];
+  const reader = createMessageReader({ readSessionLog: (id) => {
+    reads.push(id);
+    return id === 's1' ? first.promise : second.promise;
+  } });
+  const pending = reader.all('s1');
+  const independent = reader.all('s2');
+  await Promise.resolve();
+  assert.deepEqual(reads, ['s1', 's2']);
+  second.resolve(seedSnapshot('second'));
+  assert.equal(textOf((await independent)[0]), 'second', 'another session need not wait');
+  assert.equal(reader.stats().seeding, 1);
+  first.resolve(seedSnapshot('first'));
+  await pending;
+  assert.equal(reader.stats().seeding, 0);
+});
+
+test('a rejected shared seed fails all readers and releases the flight for retry', async () => {
+  const seed = deferredSeed();
+  let reads = 0;
+  const reader = createMessageReader({ readSessionLog: () => {
+    reads++;
+    return reads === 1 ? seed.promise : seedSnapshot('recovered');
+  } });
+  const results = Promise.allSettled([reader.count('s1'), reader.all('s1'), reader('s1')]);
+  await Promise.resolve();
+  assert.equal(reads, 1);
+  const failure = new Error('unknown session');
+  seed.reject(failure);
+  for (const result of await results) {
+    assert.equal(result.status, 'rejected');
+    assert.equal(result.reason, failure, 'NOT_FOUND does not become an empty success');
+  }
+  assert.deepEqual(reader.stats(), { sessions: 0, rows: 0, seeding: 0 });
+  const [total, whole] = await Promise.all([reader.count('s1'), reader.all('s1')]);
+  assert.equal(total, 1);
+  assert.equal(textOf(whole[0]), 'recovered');
+  assert.equal(reads, 2, 'retry also shares one flight');
+});
+
+test('a live event during a shared seed prevents caching without duplicating the read', async () => {
+  const seed = deferredSeed();
+  let reads = 0;
+  const reader = createMessageReader({ readSessionLog: () => {
+    reads++;
+    return reads === 1 ? seed.promise : seedSnapshot('after event', 2);
+  } });
+  const whole = reader.all('s1');
+  await Promise.resolve();
+  assert.equal(reader.noteEvent('s1', seedSnapshot('after event', 2).events[0]), false);
+  const count = reader.count('s1');
+  const page = reader('s1');
+  seed.resolve(seedSnapshot('before event'));
+  await Promise.all([whole, count, page]);
+  assert.equal(reads, 1);
+  assert.deepEqual(reader.stats(), { sessions: 0, rows: 0, seeding: 0 }, 'raced snapshot is not reused');
+  const [fresh, total] = await Promise.all([reader.all('s1'), reader.count('s1')]);
+  assert.equal(textOf(fresh[0]), 'after event');
+  assert.equal(total, 1);
+  assert.equal(reads, 2);
+});
+
+test('explicit invalidation during a seed prevents caching even without a replacement read', async () => {
+  const seed = deferredSeed();
+  let reads = 0;
+  const reader = createMessageReader({ readSessionLog: () => {
+    reads++;
+    return reads === 1 ? seed.promise : seedSnapshot('fresh');
+  } });
+  const old = reader.all('s1');
+  await Promise.resolve();
+  assert.equal(reader.invalidate('s1'), false, 'return value still describes cached rows removed');
+  seed.resolve(seedSnapshot('old'));
+  await old;
+  assert.deepEqual(reader.stats(), { sessions: 0, rows: 0, seeding: 0 });
+  assert.equal(textOf((await reader.all('s1'))[0]), 'fresh');
+  assert.equal(reads, 2);
+});
+
+test('an old seed completion cannot clear a replacement seed live-event invalidation', async () => {
+  const oldSeed = deferredSeed();
+  const newSeed = deferredSeed();
+  let reads = 0;
+  const reader = createMessageReader({ readSessionLog: () => {
+    reads++;
+    return reads === 1 ? oldSeed.promise : reads === 2 ? newSeed.promise : seedSnapshot('current', 3);
+  } });
+  const old = reader.all('s1');
+  await Promise.resolve();
+  reader.invalidate('s1');
+  const replacement = reader.all('s1');
+  await Promise.resolve();
+  reader.noteEvent('s1', seedSnapshot('current', 3).events[0]);
+  oldSeed.resolve(seedSnapshot('old'));
+  await old;
+  assert.equal(reader.stats().seeding, 1);
+  newSeed.resolve(seedSnapshot('raced', 2));
+  await replacement;
+  assert.deepEqual(reader.stats(), { sessions: 0, rows: 0, seeding: 0 }, 'new flight keeps its own dirty marker');
+  assert.equal(textOf((await reader.all('s1'))[0]), 'current');
+  assert.equal(reads, 3);
+});
+
+for (const oldFails of [false, true]) {
+  for (const oldFinishesFirst of [false, true]) {
+    test(`invalidated seed cannot own a newer flight (old fails=${oldFails}, finishes first=${oldFinishesFirst})`, async () => {
+      const oldSeed = deferredSeed();
+      const newSeed = deferredSeed();
+      let reads = 0;
+      const reader = createMessageReader({ readSessionLog: () => {
+        reads++;
+        return reads === 1 ? oldSeed.promise : newSeed.promise;
+      } });
+      const old = reader.all('s1');
+      const oldResult = Promise.allSettled([old]);
+      await Promise.resolve();
+      reader.invalidate('s1');
+      const fresh = reader.all('s1');
+      await Promise.resolve();
+      assert.equal(reads, 2, 'post-invalidation reader must not join the old snapshot');
+      const finishOld = () => oldFails
+        ? oldSeed.reject(new Error('old read failed'))
+        : oldSeed.resolve(seedSnapshot('old'));
+      if (oldFinishesFirst) {
+        finishOld();
+        await oldResult;
+        assert.deepEqual(reader.stats(), { sessions: 0, rows: 0, seeding: 1 }, 'old finally cannot delete new flight');
+        const joined = reader.count('s1');
+        await Promise.resolve();
+        assert.equal(reads, 2, 'later caller still joins the newer flight');
+        newSeed.resolve(seedSnapshot('fresh', 2));
+        assert.equal(await joined, 1);
+      } else {
+        newSeed.resolve(seedSnapshot('fresh', 2));
+        await fresh;
+        assert.equal(reader.noteEvent('s1', seedSnapshot('appended', 3).events[0]), true);
+        finishOld();
+      }
+      await fresh;
+      const [settled] = await oldResult;
+      assert.equal(settled.status, oldFails ? 'rejected' : 'fulfilled');
+      const expected = oldFinishesFirst ? ['fresh'] : ['appended', 'fresh'];
+      assert.deepEqual((await reader.all('s1')).map(textOf), expected,
+        'old completion must not overwrite fresh rows or live append');
+      assert.equal(reads, 2);
+      assert.equal(reader.stats().seeding, 0);
+    });
+  }
+}
+
+test('a failed transcript seed is retried and successful replay is cached', async () => {
+  let reads = 0;
+  const reader = createMessageReader({ readSessionLog: async () => {
+    if (++reads === 1) throw new Error('transcript is not readable yet');
+    return { events: [{ type: 'assistant/message', seq: 1, time: 1_000, surfaceOp: 'append',
+      data: { message: { id: 'm1', role: 'assistant', content: [{ type: 'text', text: 'recovered' }] } } }] };
+  } });
+  await assert.rejects(reader.all('new-session'), /not readable yet/);
+  assert.deepEqual(reader.stats(), { sessions: 0, rows: 0, seeding: 0 }, 'failure is not an authoritative empty transcript');
+  const recovered = await reader.all('new-session');
+  assert.deepEqual(recovered.map(textOf), ['recovered']);
+  assert.equal(await reader.count('new-session'), 1);
+  assert.equal(reads, 2, 'only the successful replay is reused');
+});
+
+test('unknown transcript reads keep rejecting across every cached read surface', async () => {
+  let reads = 0;
+  const reader = createMessageReader({ readSessionLog: async () => {
+    reads++;
+    throw new Error('unknown session');
+  } });
+  await assert.rejects(reader.all('missing'), /unknown session/);
+  await assert.rejects(reader('missing', { limit: 20 }), /unknown session/);
+  await assert.rejects(reader.count('missing'), /unknown session/);
+  assert.equal(reads, 3, 'NOT_FOUND must not become a successful empty read on retry');
+  assert.deepEqual(reader.stats(), { sessions: 0, rows: 0, seeding: 0 });
+});
+
+test('a successfully read empty transcript is still a cacheable known blank', async () => {
+  let reads = 0;
+  const reader = createMessageReader({ readSessionLog: async () => { reads++; return { events: [] }; } });
+  assert.deepEqual(await reader.all('known-blank'), []);
+  assert.deepEqual(await reader('known-blank', { limit: 20 }), []);
+  assert.equal(await reader.count('known-blank'), 0);
+  assert.equal(reads, 1, 'empty and failed are distinct seed outcomes');
+  assert.deepEqual(reader.stats(), { sessions: 1, rows: 0, seeding: 0 });
 });
 
 test('an event for a session that was never read is ignored, not cached half-way', async () => {
@@ -265,7 +493,7 @@ test('the newest page is filled to the controller window, and older pages are no
   const reader = createMessageReader({ readSessionLog: async () => ({ events }) });
   const newest = await reader('s1', { limit: 20 });
   assert.equal(newest.length, NEWEST_WINDOW_ROWS, 'the newest page is filled to the row cap');
-  assert.equal(newest[0].content.text, 'row-249', 'and it is still the newest rows');
+  assert.equal(textOf(newest[0]), 'row-249', 'and it is still the newest rows');
 
   const older = await reader('s1', { limit: 20, before: newest[newest.length - 1].id });
   assert.equal(older.length, 20, 'a cursor page is answered with exactly the asked limit');
@@ -295,13 +523,13 @@ test('a text-heavy newest page is cut to the byte budget, at a message boundary'
   const bytes = Buffer.byteLength(JSON.stringify(page), 'utf8');
   assert.ok(bytes <= NEWEST_WINDOW_TEXT_BYTES, `page carried ${bytes} bytes`);
   assert.ok(page.length < 20, 'the byte budget bound the page before the row cap did');
-  assert.equal(page[0].content.text.startsWith('row-19-'), true, 'the newest row is still first');
+  assert.equal(textOf(page[0]).startsWith('row-19-'), true, 'the newest row is still first');
 
   // The rows the budget left behind are exactly what the next cursor page serves, so
   // none of them became unreachable.
   const rest = await reader('s1', { limit: 20, before: page[page.length - 1].id });
   assert.equal(rest.length, 20 - page.length);
-  assert.equal(rest[0].content.text.startsWith(`row-${19 - page.length}-`), true);
+  assert.equal(textOf(rest[0]).startsWith(`row-${19 - page.length}-`), true);
 });
 
 

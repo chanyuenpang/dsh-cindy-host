@@ -10,8 +10,8 @@
  * fields each role reads are defined by the phone's own normalizer
  * (`apps/mobile/src/session/messageNormalize.ts`), not by this file:
  *
- *   assistant / user  content: { text }              read as `parsed.text`
- *   thinking          content: { text, durationMs? } read as `content.text`
+ *   assistant / user  content: string (or `{ text, files }` for attachments)
+ *   thinking          content: string
  *   tool_use          content: { toolName, input }   read by `parseMessageToolUse`
  *   tool_result       content: anything previewable  read by `contentToPreview`
  */
@@ -350,18 +350,17 @@ export function toCindyMessageRows(message, { sessionId, createdAt, now = () => 
         // Reasoning models emit empty text blocks for usage only; the phone's
         // normalizer drops them, but not emitting them at all is cheaper.
         if (typeof block.text !== 'string' || block.text === '') return;
+        const carriesAttachments = attachments.length > 0 && !attachmentsCarried;
         rows.push({
           ...base,
-          content: {
-            text: block.text,
-            ...(attachments.length > 0 && !attachmentsCarried ? { files: attachments } : {}),
-          },
+          // Desktop stringifies objects before rendering assistant markdown; use native prose strings.
+          content: carriesAttachments ? { text: block.text, files: attachments } : block.text,
         });
-        attachmentsCarried = attachmentsCarried || attachments.length > 0;
+        attachmentsCarried = attachmentsCarried || carriesAttachments;
         return;
       case 'reasoning':
         if (typeof block.text !== 'string' || block.text === '') return;
-        rows.push({ ...base, content: { text: block.text } });
+        rows.push({ ...base, content: block.text });
         return;
       case 'tool-call':
         rows.push({

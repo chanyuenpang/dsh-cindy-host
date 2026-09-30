@@ -72,6 +72,41 @@ test('no stored credential is a missing login, not a deletion', async () => {
   assert.deepEqual(credentials.calls, []);
 });
 
+test('an unavailable default credential store reports repair rather than missing login', async () => {
+  const result = await restoreSession({
+    credentialStoreAvailable: () => false,
+    refreshStoredSession: async () => assert.fail('must not refresh'),
+    saveSession: async () => assert.fail('must not save'),
+  });
+  assert.equal(result.ok, false);
+  assert.equal(result.reason, 'CREDENTIAL_STORE_UNAVAILABLE');
+  assert.match(result.message, /keytar/);
+  assert.match(result.message, /重启 DSH/);
+  assert.doesNotMatch(result.message, /还没有 Cindy 登录态|登录态已过期/);
+});
+
+test('an explicit availability port stops before loading or mutating an injected store', async () => {
+  const result = await restoreSession({
+    credentialStoreAvailable: () => false,
+    loadSession: async () => assert.fail('must not read an unavailable store'),
+    refreshStoredSession: async () => assert.fail('must not refresh'),
+    saveSession: async () => assert.fail('must not save'),
+    clearSession: async () => assert.fail('must not clear'),
+  });
+  assert.equal(result.reason, 'CREDENTIAL_STORE_UNAVAILABLE');
+});
+
+test('an available empty store still reports missing login', async () => {
+  const credentials = store(null);
+  const result = await restoreSession({
+    ...credentials,
+    credentialStoreAvailable: () => true,
+    refreshStoredSession: async () => assert.fail('must not refresh without a credential'),
+  });
+  assert.equal(result.reason, 'missing');
+  assert.deepEqual(credentials.calls, []);
+});
+
 test('an explicit logout is the only thing that deletes the credential', async () => {
   const credentials = store(STORED);
   await forgetSession({ clearSession: credentials.clearSession });

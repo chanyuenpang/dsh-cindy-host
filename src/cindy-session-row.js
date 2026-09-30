@@ -21,16 +21,33 @@
  * business and is deliberately absent.
  */
 
-/**
- * The harness this Host reports for every session.
- *
- * DSH's internal agent identity is erased at this boundary. The wire value is
- * `pi`, Cindy's native agent: the controller's `MobileAgentKind` is a closed
- * union (`'claude-code' | 'codex' | 'pi'`), and a kind outside it has no label,
- * no capabilities entry, and no picker entry on the phone. The roster in
- * `cindy-channels.js` names the same single kind.
- */
-const DSH_AGENT_KIND = 'pi';
+import { toCindyPermissionMode } from './host-models.js';
+
+/** Cindy wire aliases for the one DSH harness; never use these to route a model. */
+export function agentKindForModel({ model, provider, catalog } = {}) {
+  let resolvedModel = typeof model === 'string' && model.trim() !== '' ? model.trim() : null;
+  let resolvedProvider = typeof provider === 'string' && provider.trim() !== '' ? provider.trim() : null;
+  if (resolvedModel === null && resolvedProvider === null) {
+    const fallback = catalog?.default;
+    resolvedModel = typeof fallback?.model === 'string' && fallback.model !== '' ? fallback.model : null;
+    resolvedProvider = typeof fallback?.provider === 'string' && fallback.provider !== '' ? fallback.provider : null;
+  } else if (resolvedProvider === null) {
+    // The default route applies only to its own model. A model shared by two
+    // providers cannot be classified without the session's source.
+    if (catalog?.default?.model === resolvedModel) {
+      resolvedProvider = catalog.default.provider ?? null;
+    } else {
+      const matches = (Array.isArray(catalog?.groups) ? catalog.groups : [])
+        .filter((group) => Array.isArray(group?.models) && group.models.some((candidate) => candidate?.id === resolvedModel));
+      if (matches.length === 1) resolvedProvider = matches[0].id;
+    }
+  }
+  // Pi is reserved for a confirmed DeepSeek source, even if its model is unknown.
+  if (typeof resolvedProvider === 'string' && /^deepseek(?:$|[-_./])/i.test(resolvedProvider)) return 'pi';
+  if (resolvedModel === null || typeof resolvedProvider !== 'string' || resolvedProvider === '') return 'claude-code';
+  if (/^(?:gpt(?:$|[-_./])|chatgpt(?:$|[-_./]))/i.test(resolvedModel)) return 'codex';
+  return 'claude-code';
+}
 const DSH_MODEL = 'pi';
 const DSH_EFFORT = 'default';
 const DSH_PERMISSION_MODE = 'default';
@@ -49,7 +66,7 @@ function titleOf(value) {
  * @param options - injectable clock and this Host's relay identity.
  * @returns the flat `RemoteSession` the controller stores.
  */
-export function toCindySessionListRow(item, { now = () => new Date(), device, defaultModel } = {}) {
+export function toCindySessionListRow(item, { now = () => new Date(), device, defaultModel, catalog } = {}) {
   const id = String(item.id);
   const updatedAt = item.updatedAt ?? now().toISOString();
   const createdAt = item.createdAt ?? updatedAt;
@@ -69,7 +86,7 @@ export function toCindySessionListRow(item, { now = () => new Date(), device, de
     // reaches here. A row that carries none is active, which is what every row was
     // before the flags existed.
     status: item.status === 'archived' || item.status === 'deleted' ? item.status : 'active',
-    agentKind: DSH_AGENT_KIND,
+    agentKind: agentKindForModel({ model: item.model ?? defaultModel, provider: item.providerId, catalog }),
     // The controller looks the current model up by id in the catalog it fetched
     // (`availableModels.find(item => item.id === session.model)`), so a
     // placeholder here leaves the picker with nothing selected even when the
@@ -94,7 +111,7 @@ export function toCindySessionListRow(item, { now = () => new Date(), device, de
     // projection, so the composer shows the mode actually in force rather than a
     // placeholder that no picker entry matches.
     permissionMode: typeof item.permissionMode === 'string' && item.permissionMode !== ''
-      ? item.permissionMode
+      ? toCindyPermissionMode(item.permissionMode)
       : DSH_PERMISSION_MODE,
     fastMode: false,
     workingDir,
