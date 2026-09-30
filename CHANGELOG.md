@@ -3,6 +3,55 @@
 本文件记录**用户可见**的变化与**每次发布验证过的 DSH 版本**。格式遵循
 [Keep a Changelog](https://keepachangelog.com/zh-CN/1.1.0/)，版本号遵循语义化版本。
 
+## [0.1.16] - 2026-09-30
+
+验证环境：DSH **0.2.0-rc.2**（桌面端）与 **0.1.5-rc.2**（Web profile）—— 同一份产物。
+
+### Fixed
+
+- **客户端半边不再阻塞激活（0.2 桌面端因此起不来的那个缺陷）。** `lib/client.js` 的模块级
+  `inject` 原本是 `["slots", "settingsScope"]`。`settingsScope` 是 **0.1.x** 的客户端设置服务；
+  **0.2 把它换成了 `configForms` + `settingsSchema`**（同一个包 `dsh-client-ui-settings`）。
+  模块级 `inject` 是**阻塞**依赖：服务永不出现 → 客户端半边永不激活 → 0.2 把它报成唯一未激活
+  条目并**拒绝继续启动**。
+  （对照：better-tasks 用非阻塞的 `ctx.inject(['settingsScope'], cb)`，服务缺席只是那个回调不执行，
+  插件照常激活。同一个名字，写法不同，后果就不同。）
+- **设置访问改为两代兼容且非阻塞。** 模块级 `inject` 现在只有 `slots`；设置控制器由两条
+  **非阻塞**分支解析，先到者胜：
+  - 0.2 → `ctx.inject(["configForms"], …)` + `configForms.get(entryId)`
+  - 0.1.x → `ctx.inject(["settingsScope"], …)` + `settingsScope.bind({ namespace })`
+
+  两个控制器暴露同一套面（`getSnapshot()` / `subscribe()` / `set(field, value)`），快照形状也都是
+  `{status, value, base, user, revision, writable, mode}`，所以页面与 `writeSwitch` 无需分支。
+  两代服务互斥（0.1.x 只有前者、0.2 只有后者），即使将来某代同时提供也不会重复注册。
+
+### 客户端服务提供方审计（实测，非推断）
+
+扫 `@deepseek-ai/*/lib/client.js` 全量客户端 bundle（0.2：71 个；0.1.5：55 个），
+按 `super(ctx, "…")` / `provide("…")` 提取提供方：
+
+| 服务 | 0.2.0-rc.2 | 0.1.5-rc.2 |
+|---|---|---|
+| `slots` | 提供方 `dsh-client-ui-renderer` | 提供方 `dsh-client-ui-renderer` |
+| `settingsScope` | **无提供方** | 提供方 `dsh-client-ui-settings` |
+| `configForms` | 提供方 `dsh-client-ui-settings` | **无提供方** |
+
+因此产物里的模块级 `inject = ["slots"]` 在两条线上都有提供方 → 客户端半边在两条线上都会激活。
+`ctx.inject([...], cb)` 也是 0.2 客户端面的标准写法（`ui-agent-preset` / `ui-approval` / `ui-chat` /
+`ui-commands` / `ui-conversation` / `ui-input-trigger` 等至少 6 个内盒插件在用）。
+
+### 发布验证
+
+- 单元测试 **684 通过 / 1 跳过 / 0 失败**。`test/client-card.test.js` 16/16，含两个新增用例：
+  0.2 经 `configForms.get(entryId)` 注册出同一个页面（同一 section id / order，开关跟随控制器快照），
+  以及"两代设置服务都不存在时仍能激活、只是不注册页面"。
+- 真机启动（独立 `DSH_HOME`）：0.2 与 0.1.5 两侧均 `add exit=0`、`dsh.profile.bundles` 已登记、
+  `rows disabled 0 / bundles skipped 0 / pending 0`、`GET /api/dsh-cindy-host/status` → 200。
+- **诚实标注证据边界**：客户端半边的"激活"发生在浏览器里，沙盒 boot 自检覆盖不到。本轮给的
+  间接证据是 ①产物模块级 `inject` 只含 `slots`（单测直接断言），②`slots` 在两侧都有真实提供方
+  （上面的全量扫描），③设置服务的用法与 0.2 内盒插件一致（`ui-theme`: `ctx.configForms.get(NS)`），
+  ④`ctx.inject([...], cb)` 是 0.2 客户端面的标准用法。真实浏览器里的最终确认仍需在桌面端页面里看一眼。
+
 ## [0.1.15] - 2026-09-30
 
 验证环境：DSH **0.2.0-rc.2**（桌面版 `@deepseek-ai/dsh-desktop-runtime`，Electron 44 / Node 24.18.1）

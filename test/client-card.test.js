@@ -91,30 +91,78 @@ function makeScope(value, overrides = {}) {
   };
 }
 
-/** Mount `apply` against a fake plugin context, without declaring any slot yet. */
-function mount(scope, slots = makeSlots()) {
-  const captured = { bound: null, slots };
-  const ctx = {
-    settingsScope: {
-      bind(spec) {
-        captured.bound = spec;
-        return scope;
+/**
+ * The settings-service double for one DSH generation.
+ *
+ * The two names are mutually exclusive in the field: 0.1.x provides `settingsScope`
+ * (whose `bind({ namespace })` returns a scope), 0.2 provides `configForms` (whose
+ * `get(entryId)` returns the controller). The bundle must resolve whichever exists
+ * through a **non-blocking** `ctx.inject`, so the harness models exactly that: only a
+ * service this deployment provides ever runs the callback.
+ * @param kind - which generation's service to provide.
+ * @param scope - the controller both shapes hand back.
+ * @returns the provided services and a record of what the callback captured.
+ */
+function provideSettings(kind, scope) {
+  const captured = { bound: null };
+  if (kind === 'none') return { captured, services: {} };
+  if (kind === 'configForms') {
+    return {
+      captured,
+      services: {
+        configForms: {
+          get(entryId) {
+            captured.bound = { entryId };
+            return scope;
+          },
+        },
+      },
+    };
+  }
+  return {
+    captured,
+    services: {
+      settingsScope: {
+        bind(spec) {
+          captured.bound = spec;
+          return scope;
+        },
       },
     },
+  };
+}
+
+/** Mount `apply` against a fake plugin context, without declaring any slot yet. */
+function mount(scope, slots = makeSlots(), kind = 'settingsScope') {
+  const { captured, services } = provideSettings(kind, scope);
+  const injected = [];
+  const ctx = {
     slots,
     effect(run) {
       return run();
     },
+    /**
+     * Non-blocking, like Cordis: a service this deployment does not provide simply
+     * never runs its callback. A module-level `inject` is the blocking form, and the
+     * harness deliberately has no way to satisfy one.
+     */
+    inject(names, run) {
+      const [name] = names;
+      if (!Object.hasOwn(services, name)) return () => {};
+      injected.push(name);
+      run({ ...services });
+      return () => {};
+    },
   };
   const { moduleExports } = loadClientBundle();
   moduleExports.apply(ctx);
-  return { captured, moduleExports };
+  return { captured, moduleExports, injected, provided: Object.keys(services) };
 }
 
 /** Mount and let the Plugins tab publish the slot, as it does in the real app. */
-function mountDeclared(scope) {
+function mountDeclared(scope, kind = 'settingsScope') {
   const slots = makeSlots();
-  const mounted = mount(scope, slots);
+  const mounted = mount(scope, slots, kind);
   slots.declare(SLOT);
   return { ...mounted, slots };
 }
@@ -145,9 +193,17 @@ test('follows the slot declaration when it arrives before the card', () => {
 
 test('the bundle registers one settings page under its own namespace', () => {
   const scope = makeScope({});
-  const { captured, moduleExports, slots } = mountDeclared(scope);
-  assert.equal(moduleExports.inject.includes('slots'), true);
-  assert.equal(moduleExports.inject.includes('settingsScope'), true);
+  const { captured, moduleExports, slots, injected } = mountDeclared(scope);
+  // The module-level list may only name services **every** supported DSH provides.
+  // 0.1.x provides `settingsScope` and 0.2 provides `configForms`; a blocking entry on
+  // either name is exactly what kept this half from activating on the other generation
+  // (0.2 reported it as the entry that refused to come up).
+  assert.deepEqual(moduleExports.inject, ['slots']);
+  assert.equal(moduleExports.inject.includes('settingsScope'), false, 'a 0.2 deployment does not provide settingsScope');
+  assert.equal(moduleExports.inject.includes('configForms'), false, 'a 0.1.x deployment does not provide configForms');
+  // Resolved through the non-blocking form instead, which is why an absent provider is
+  // survivable.
+  assert.deepEqual(injected, ['settingsScope']);
   assert.deepEqual(captured.bound, { namespace: 'dsh-cindy-host' });
   assert.equal(slots.registrations.length, 1);
   const options = slots.registrations[0].options;
@@ -159,6 +215,32 @@ test('the bundle registers one settings page under its own namespace', () => {
   assert.equal(options.order > 20, true, 'sits after agent-presets (order 20)');
   assert.equal(options.label(), moduleExports.__internals.TEXT.title);
   assert.equal(typeof slots.registrations[0].component, 'function');
+});
+
+test('0.2: resolves the same page through configForms.get(entryId)', () => {
+  const scope = makeScope({ transportEnabled: true });
+  const { captured, moduleExports, slots, injected, provided } = mountDeclared(scope, 'configForms');
+  assert.deepEqual(provided, ['configForms']);
+  assert.deepEqual(injected, ['configForms']);
+  assert.deepEqual(captured.bound, { entryId: 'dsh-cindy-host' });
+  assert.equal(slots.registrations.length, 1);
+  assert.equal(slots.registrations[0].options.id, 'dsh-cindy-host', 'same section id on both generations');
+  assert.equal(slots.registrations[0].options.order, moduleExports.__internals.SECTION_ORDER);
+  const html = render(React.createElement(slots.registrations[0].component, null));
+  assert.match(html, /role="switch"/);
+  assert.match(html, /aria-checked="true"/, 'the switch mirrors the controller snapshot on 0.2 too');
+});
+
+test('a deployment with neither settings service still activates and simply shows no page', () => {
+  const slots = makeSlots();
+  const { moduleExports, injected, provided } = mount(makeScope({}), slots, 'none');
+  slots.declare(SLOT);
+  assert.deepEqual(provided, [], 'this deployment provides neither name');
+  assert.deepEqual(injected, [], 'neither non-blocking inject may fire');
+  assert.equal(slots.registrations.length, 0, 'without a settings controller the page must not register');
+  // The point of the fix: activation needs `slots` alone, so nothing here may throw or
+  // hang waiting for a service that will never arrive.
+  assert.deepEqual(moduleExports.inject, ['slots']);
 });
 
 test('registers no plugin card, so the Plugins tab shows no duplicate', () => {
