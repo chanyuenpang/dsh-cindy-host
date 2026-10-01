@@ -618,8 +618,8 @@ Then, against `http://127.0.0.1:3081`:
 
 ```
 GET  /api/dsh-cindy-host/status      → {"ok":true,"installed":true,"status":{…}}
-GET  /?token=…                       → window.__DSH_BOOT__ lists dsh-cindy-host-demo
-GET  /plugins/??dsh-cindy-host-demo/client.js&rev=…  → the card bundle
+GET  /?token=…                       → window.__DSH_BOOT__ lists dsh-cindy-host
+GET  /plugins/??dsh-cindy-host/client.js&rev=…  → the card bundle
 ```
 
 ### The assembled Host, not the unit tests

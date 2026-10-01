@@ -33,6 +33,7 @@ function loadClientBundle(environment = {}) {
     environment.clearInterval ?? globalThis.clearInterval,
   );
   assert.ok(registration, 'the bundle must self-register through window.__ModuleLoader__.load');
+  assert.equal(registration.id, 'dsh-cindy-host', 'client module identity must match the npm bundle name');
 
   const moduleExports = registration.factory((specifier) => {
     if (specifier === 'react') return environment.react ?? React;

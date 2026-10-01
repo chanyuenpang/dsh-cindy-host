@@ -1,4 +1,4 @@
-# DSH Cindy Host Demo
+# DSH Cindy Host
 
 A DSH-to-Cindy host adapter. The console demo projects a DSH conversation list and safe lifecycle/status activity to a replaceable sink; the DSH bundle additionally carries the Cindy session, the DeviceLink relay, and the 「Cindy 手机连接」 settings card that lets the Cindy mobile client reach this Host.
 
@@ -8,7 +8,7 @@ A DSH-to-Cindy host adapter. The console demo projects a DSH conversation list a
 
 ```bash
 # 从 npm 安装当前发布版本
-bunx @deepseek-ai/dsh plugin --profile web add dsh-cindy-host-demo
+bunx @deepseek-ai/dsh plugin --profile web add dsh-cindy-host
 
 # pnpm 10 需要显式批准 keytar 的构建脚本
 bunx @deepseek-ai/dsh plugin --profile web approve-builds
@@ -103,7 +103,7 @@ With Gate 2 running, two Host surfaces answer over loopback:
 GET /api/dsh-cindy-host/status   # the card's only source of truth
 ```
 
-The card itself is served as the `dsh-cindy-host-demo` entry of
+The card itself is served as the `dsh-cindy-host` entry of
 `window.__DSH_BOOT__`; `npm test` renders it with React so its markup and state
 rules are covered without a browser.
 
@@ -146,7 +146,7 @@ rules are covered without a browser.
 
 - `node_modules/`；
 - `.sandbox/` —— 沙箱用的 DSH home，带它自己的凭据与会话存储。
-  注意：`.sandbox/dsh-home/profiles/<profile>/node_modules/dsh-cindy-host-demo` 是指向本仓库的
+  注意：`.sandbox/dsh-home/profiles/<profile>/node_modules/dsh-cindy-host` 是指向本仓库的
   **junction**（不是副本），所以任何**跟随链接递归**的工具（`git status --ignored`、部分索引器）
   会绕圈并报 `Filename too long`。普通 `git add/status` 因为整目录被忽略不会进去；不要据此
   「清理」出一个递归副本，磁盘上并没有重复的仓库。

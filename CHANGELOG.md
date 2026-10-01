@@ -3,6 +3,20 @@
 本文件记录**用户可见**的变化与**每次发布验证过的 DSH 版本**。格式遵循
 [Keep a Changelog](https://keepachangelog.com/zh-CN/1.1.0/)，版本号遵循语义化版本。
 
+## [0.1.20] - 2026-10-01
+
+### Changed
+
+- npm/DSH bundle 包名由 `dsh-cindy-host-demo` 正式迁移为 `dsh-cindy-host`；项目已不是 demo。
+- `package.json`/lock、`cordis.patch.yml` bundle name、Web `ModuleLoader` id、安装与发布说明同步使用新名。
+- 业务身份保持不变：Cordis row id、server plugin name、settings namespace 和 HTTP API prefix 继续是 `dsh-cindy-host`，现有设置与 Cindy 登录状态无需迁移。
+- 旧 npm 包不删除，迁移验证成功后对全版本标记 deprecated 并指向新包，仍可精确安装旧版本回滚。
+
+### Migration
+
+- desktop Profile 必须把 dependency、`dsh.profile.bundles`、lockfile、node_modules、Cordis patch/composed config 一次替换为新名；不得让新旧包同时加载。
+- 旧 `plugin-releases/dsh-cindy-host-demo/*` 历史产物只读保留；新产物存放于 `plugin-releases/dsh-cindy-host/0.1.20`。
+
 ## [0.1.19] - 2026-10-01
 
 ### Fixed

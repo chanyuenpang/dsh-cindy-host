@@ -21,7 +21,7 @@
 ```yaml
 - insert:
     - id: dsh-cindy-host
-      name: dsh-cindy-host-demo
+      name: dsh-cindy-host
       inject: [settings]
 ```
 
@@ -36,14 +36,14 @@
 dsh plugin --profile <profile> add <本仓库路径>
 
 # b) tarball（不发 registry 也能分发）
-npm pack                       # 产出 dsh-cindy-host-demo-<version>.tgz
-dsh plugin --profile <profile> add ./dsh-cindy-host-demo-<version>.tgz
+npm pack                       # 产出 dsh-cindy-host-<version>.tgz
+dsh plugin --profile <profile> add ./dsh-cindy-host-<version>.tgz
 
 # c) registry（**0.1.2 起这是正式渠道**）
-dsh plugin --profile <profile> add dsh-cindy-host-demo@<version>
+dsh plugin --profile <profile> add dsh-cindy-host@<version>
 ```
 
-装完后 profile 的 `package.json` 里会出现 `dsh.profile.bundles` 含 `dsh-cindy-host-demo`，
+装完后 profile 的 `package.json` 里会出现 `dsh.profile.bundles` 含 `dsh-cindy-host`，
 依赖形态分别为 `link:` / `file:` / 版本区间。**生效仍然需要重启 `dsh web`**（见 `doc/releasing.md` §4）。
 
 ## 3. 发布前的硬前提
@@ -88,7 +88,7 @@ dsh plugin --profile <profile> add dsh-cindy-host-demo@<version>
 [ ] 3. package.json：private=false、files 白名单、dependencies 里没有内部路径依赖
 [ ] 4. npm pack --dry-run → 人眼过一遍文件清单（不得出现 .sandbox/、凭据、日志、.claw/runtime）
 [ ] 5. 干净 profile 安装验证：Gate 1 compose 通过；Gate 2 起得来、无登录提示、卡片作为
-       window.__DSH_BOOT__ 的 dsh-cindy-host-demo 条目被服务
+       window.__DSH_BOOT__ 的 dsh-cindy-host 条目被服务
 [ ] 6. 发布：npm publish（或私有 registry / 仅发 tarball）
 [ ] 7. 装到真机 profile → 按 doc/releasing.md §4 重启（先告知、留 60s）→ 真机复测本轮针对的现象
 [ ] 8. 打 tag 并把 tag 推到远端，便于回滚与追溯
@@ -234,9 +234,9 @@ entry 当作致命错误（整个 profile 起不来）。`0.1.1` 就是 compose 
 - **未发 registry（tarball 分发）**：装回上一个 tarball 即可，最干净。0.1.1 的实例正是这条：
   它是 GitHub Release 附件而不是 registry 版本，所以"撤版"只需要一条说明加一个修复版本
   （0.1.2），不需要动 registry。
-- **已发 npm**：`npm deprecate dsh-cindy-host-demo@<bad> "原因"` 并立刻发一个修复版本；
+- **已发 npm**：`npm deprecate dsh-cindy-host@<bad> "原因"` 并立刻发一个修复版本；
   `npm unpublish` 有 72 小时窗口且被 registry 策略限制，不要把它当成回滚方案。
-- **插件侧**：`dsh plugin --profile <p> add dsh-cindy-host-demo@<上一个版本>` + 重启。
+- **插件侧**：`dsh plugin --profile <p> add dsh-cindy-host@<上一个版本>` + 重启。
 - 回滚后仍要留下痕迹：`.claw/adr` 里追加 `Decision evolution`（为什么发坏了、下次怎么防）。
 
 ## 7. 检查清单（可直接复制）
@@ -251,7 +251,7 @@ entry 当作致命错误（整个 profile 起不来）。`0.1.1` 就是 compose 
 [ ] 装完 profile-local @deepseek-ai 计数 == 0（没把某一代 DSH 拖进去）
 [ ] compose 通过 **并且真的启动**，GET /api/dsh-cindy-host/status → 200 installed=true
       （只做 compose 不算数：缺一个具名导出同样能 compose 通过，却在加载时让整个 profile 起不来）
-[ ] 发布：`npm publish --access public`，再用 `npm view dsh-cindy-host-demo version` 读回确认
+[ ] 发布：`npm publish --access public`，再用 `npm view dsh-cindy-host version` 读回确认
       （刚发布后几十秒内可能 404，那是复制延迟，不是失败）；同时打 tag 推远端
 [ ] **从 registry 再装一次**到干净 home 并启动成功（发布渠道自己也要走一遍验收，不能只验本地 tarball）
 [ ] 真机：告知 → 60s → 重启 → 复测现象
