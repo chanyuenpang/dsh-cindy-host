@@ -3,6 +3,20 @@
 本文件记录**用户可见**的变化与**每次发布验证过的 DSH 版本**。格式遵循
 [Keep a Changelog](https://keepachangelog.com/zh-CN/1.1.0/)，版本号遵循语义化版本。
 
+## [0.1.19] - 2026-10-01
+
+### Fixed
+
+- Cindy 会话发现列表不再同步没有真实非空标题的会话，因此不会再出现由 Host 合成的 “Untitled DSH task”。过滤依据是 title 事实，不是显示文案字符串。
+- 首次 title 读取失败、缺项或空白时，未知行保持隐藏；一旦已有有效 title，后续临时失败继续使用 last-known-good，不会让正常任务从列表闪退。
+- `local-db:sessions:get` 的精确读取保持不变：新建 draft 在第一条 prompt 生成标题前仍可由 create/get/enqueue 流程访问，只是不进入发现列表。
+- 有界 title warm-up 的发现语义改为“当前已确认标题的批次先显示，后台补齐后续批次”，继续避免大型 profile 的列表超时。
+
+### 验证
+
+- 完整单元与契约测试：**755 通过 / 1 跳过 / 0 失败**。
+- 通道审计：**54 served / 142 declined / 0 unclassified**。
+
 ## [0.1.18] - 2026-10-01
 
 验证环境：DSH **0.2.0-rc.2**（桌面端）与 **0.1.5-rc.2**（Web profile），Node **24.12.0**；要求 Node >=22，werift 固定 **0.24.4**。

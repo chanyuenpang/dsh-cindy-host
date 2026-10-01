@@ -214,10 +214,10 @@ test('a listing folds one bounded batch of titles and warms the rest behind it',
   release();
   const rows = await pending;
 
-  // The answer carries the newest batch — the rows the controller shows first — and every
-  // visible session is still in the list.
-  assert.equal(rows.filter((row) => row.title !== undefined).length, 8);
-  assert.equal(rows.length, 100);
+  // Discovery exposes only the newest batch whose real titles are known; the
+  // background warm-up makes the rest visible on the next poll.
+  assert.equal(rows.length, 8);
+  assert.ok(rows.every((row) => typeof row.title === 'string'));
   assert.equal(rows[0].title, 'title s0', 'the newest rows are the ones that get a title first');
 
   // The rest arrive behind the answer, and the next read folds nothing at all.
@@ -334,7 +334,7 @@ test('attaches titles when a reader is supplied', async () => {
   assert.equal(row.title, 'Fix the relay');
 });
 
-test('a failing title reader costs the title, not the list', async () => {
+test('a failing first title read keeps unknown rows out of discovery', async () => {
   const source = createSessionControllerSource({
     sessionController: makeController([{ sessionId: 's1', updatedAt: 1, running: false }]),
     subscribe: makeSubscribe(),
@@ -343,8 +343,24 @@ test('a failing title reader costs the title, not the list', async () => {
     },
   });
   const rows = await source.listSessions();
-  assert.equal(rows.length, 1);
-  assert.equal(rows[0].title, undefined);
+  assert.deepEqual(rows, [], 'unknown is not a real title and must not become Untitled DSH task');
+});
+
+test('filters genuinely untitled rows from list but preserves exact draft reads', async () => {
+  const items = [
+    { sessionId: 'named', updatedAt: 2, running: false, blank: false },
+    { sessionId: 'untitled', updatedAt: 1, running: false, blank: false },
+  ];
+  const source = createSessionControllerSource({
+    sessionController: makeController(items),
+    subscribe: makeSubscribe(),
+    readSessionSummary: async (id) => items.find((item) => item.sessionId === id),
+    readTitles: async (ids) => new Map(ids.flatMap((id) => id === 'named' ? [[id, 'Named task']] : [])),
+  });
+  assert.deepEqual((await source.listSessions()).map((row) => row.id), ['named']);
+  const exact = await source.getSession('untitled');
+  assert.equal(exact.id, 'untitled');
+  assert.equal(exact.title, undefined, 'new-session create/get may address a draft before it is titled');
 });
 
 test('translates every host lifecycle event into an activity item', () => {

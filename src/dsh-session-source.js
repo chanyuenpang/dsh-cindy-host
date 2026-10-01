@@ -390,7 +390,12 @@ export function createSessionControllerSource({
       return row;
     },
     async listSessions() {
-      return projectItems(await listItems());
+      const rows = await projectItems(await listItems());
+      // A current sessionQuery title reader is the authority for sidebar discovery.
+      // Hide rows that have never produced a real title; exact getSession remains
+      // available for a freshly created draft before its first prompt names it.
+      if (typeof readTitles !== 'function') return rows;
+      return rows.filter((row) => typeof row.title === 'string' && row.title.trim() !== '');
     },
 
     /**

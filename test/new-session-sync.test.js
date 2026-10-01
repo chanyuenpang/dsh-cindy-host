@@ -29,10 +29,16 @@ function makeSeam() {
       if (!records.has(id)) throw new Error('missing transcript');
       return { events: [] };
     },
+    async readTitleSnapshots(ids) {
+      return ids.flatMap((id) => {
+        const title = records.get(id)?.header?.title;
+        return typeof title === 'string' ? [{ sessionId: id, status: 'fulfilled', value: { title: { title } } }] : [];
+      });
+    },
   };
   const controller = {
     list: async () => ({ items: [...records.keys()].map(id => summary(id, { blank: true })) }),
-    create: async ({ sessionId }) => { records.set(sessionId, {}); return { sessionId }; },
+    create: async ({ sessionId }) => { records.set(sessionId, { header: { title: `Task ${sessionId}` } }); return { sessionId }; },
   };
   const services = { sessionController: controller, sessionQuery: query };
   const seam = buildDshSource({ get: name => services[name], on: () => () => {}, inject: () => () => {} }, 'sessionController');
