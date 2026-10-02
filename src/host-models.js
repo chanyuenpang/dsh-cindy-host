@@ -160,7 +160,7 @@ export function toPermissionOptions(names) {
 }
 
 /**
- * Project DSH's provider-grouped catalog into Cindy desktop's ProviderView wire shape.
+ * Project DSH's provider-grouped catalog into Cindy desktop/mobile ProviderView wire shape.
  * Routing credentials never cross this boundary; every Cindy harness alias reaches the
  * same DSH catalog, so each provider exposes the same models under all aliases.
  */
@@ -173,8 +173,11 @@ export function toProviderList(catalog, agentKinds = []) {
     const models = [];
     for (const model of Array.isArray(group.models) ? group.models : []) {
       if (typeof model?.id !== 'string' || model.id === '') continue;
-      const contextWindow = Number(model.contextWindow);
-      if (!Number.isFinite(contextWindow) || contextWindow <= 0) continue;
+      // Current DSH catalogs omit contextWindow. It is display metadata, not
+      // route eligibility: 0 means unknown in Cindy and hides the capacity label.
+      // Never discard a routable model or invent a positive capacity for it.
+      const window = Number(model.contextWindow);
+      const contextWindow = Number.isFinite(window) && window > 0 ? window : 0;
       const efforts = Array.isArray(model?.reasoning?.efforts)
         ? model.reasoning.efforts.map((effort) => effort?.id).filter((id) => typeof id === 'string' && id !== '')
         : [];
@@ -198,6 +201,10 @@ export function toProviderList(catalog, agentKinds = []) {
       name: typeof group.name === 'string' && group.name !== '' ? group.name : group.id,
       agents,
       connected: routable.has(group.id),
+      // Cindy registry requires routing[agent] to exist before a runtime is selectable.
+      // Empty markers advertise our aliases without inventing a wire protocol or
+      // exposing DSH execution details (endpoints, credentials, or headers).
+      routing: Object.fromEntries(agents.map((agent) => [agent, {}])),
       models: Object.fromEntries(agents.map((agent) => [agent, models.map((model) => ({ ...model }))])),
     });
   }

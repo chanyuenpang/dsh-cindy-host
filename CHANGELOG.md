@@ -3,6 +3,20 @@
 本文件记录**用户可见**的变化与**每次发布验证过的 DSH 版本**。格式遵循
 [Keep a Changelog](https://keepachangelog.com/zh-CN/1.1.0/)，版本号遵循语义化版本。
 
+## [0.1.21] - 2026-10-02
+
+### Fixed
+
+- 修复桌面供应商目录上线后手机模型选择器为空：`maker:provider:list` 为每个已广告的 DSH agent 别名补齐 `routing[agent]: {}` 可用性标记。仍只由 DSH catalog 决定 connected 和模型清单，不发送 endpoint、认证信息或 headers，不臆造 wireProtocol。
+- 补充投影/通道回归与可选的真实 Cindy registry、分段列表、统一选择器跨仓契约测试；设置 `CINDY_SOURCE_ROOT` 后运行 `node --test test/host-models-cindy-contract.test.js`（需支持 registerHooks/TypeScript stripping 的 Node）。覆盖旧响应复现空列表、新建/已有会话、多来源、不可连接/禁用 runtime 和目录读取失败。
+- 运行期补证：当前 DSH `buildModelCatalog` 不输出 `contextWindow`，旧投影把所有缺失窗口的模型丢弃，导致能力列表有模型而 provider 列表为空。缺失/无效窗口现在以 `0` 表示未知展示容量，不作为模型准入条件；跨仓测试改为真实的无窗口目录结构。
+
+### 验证
+
+- 完整单元与契约测试：**759 通过 / 1 跳过 / 0 失败**，包含真实 Cindy 消费端及无 contextWindow 的 DSH 目录结构。
+- 运行中的 desktop Host 返回 **2 个供应商 / 7 个模型**；真实 HTTP 响应经过 Cindy 新建/已有会话筛选均得到 7 个可选项。用户已确认手机端模型列表恢复。
+- 保留桌面供应商目录和真实 DSH 模型路由；不增加客户端专用模型表。
+
 ## [0.1.20] - 2026-10-01
 
 ### Changed

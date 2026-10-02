@@ -1157,6 +1157,7 @@ test('serves Cindy desktop provider views and maps permission controls', async (
   const providers = await router(request('maker:provider:list'));
   assert.equal(providers.payload.ok, true);
   assert.equal(providers.payload.result.providers[0].models.codex[0].id, 'gpt-x');
+  assert.deepEqual(providers.payload.result.providers[0].routing, { 'claude-code': {}, codex: {}, pi: {} });
   assert.equal(providers.payload.result.providers[0].models.codex[0].contextWindow, 200_000);
 
   const capabilities = await router(request('maker:get-capabilities', ['codex']));

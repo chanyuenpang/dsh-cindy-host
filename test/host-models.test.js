@@ -91,7 +91,47 @@ test('projects the DSH catalog into Cindy desktop provider views', () => {
     id: 'deepseek-chat', name: 'DeepSeek Chat', contextWindow: 128_000,
     efforts: ['low', 'high'], defaultEffort: 'low', supportsFastMode: false, defaultEnabled: true,
   });
-  assert.equal('routing' in result.providers[0], false, 'provider credentials and endpoints never cross');
+  assert.deepEqual(result.providers[0].routing, { 'claude-code': {}, codex: {}, pi: {} },
+    'Cindy requires a runtime presence marker, not execution routing details');
+});
+
+test('missing or invalid context capacity never removes a catalog model', () => {
+  for (const contextWindow of [undefined, null, 0, -1, NaN, Infinity, 'unknown']) {
+    const input = { routableProviders: ['p'], groups: [{ id: 'p', models: [{ id: 'm', name: 'Model', contextWindow }] }] };
+    const result = toProviderList(input, ['pi']);
+    assert.equal(result.providers.length, 1);
+    assert.equal(result.providers[0].connected, true);
+    assert.equal(result.providers[0].models.pi[0].id, 'm');
+    assert.equal(result.providers[0].models.pi[0].contextWindow, 0);
+  }
+});
+
+test('provider runtime markers contain no execution details and remain isolated', () => {
+  const input = catalog();
+  input.groups[0].routing = { codex: { endpoint: 'private-endpoint', auth: 'private-key', headers: { Authorization: 'private-header' } } };
+  const result = toProviderList(input, ['codex', 'pi', 'codex', '', null]);
+  for (const provider of result.providers) {
+    assert.deepEqual(Object.keys(provider).sort(), ['agents', 'connected', 'id', 'models', 'name', 'routing']);
+    assert.deepEqual(provider.agents, ['codex', 'pi']);
+    assert.deepEqual(provider.routing, { codex: {}, pi: {} });
+    assert.deepEqual(Object.keys(provider.models), provider.agents);
+  }
+  assert.equal(JSON.stringify(result).includes('private-'), false);
+  result.providers[0].routing.codex.disabled = true;
+  assert.deepEqual(result.providers[0].routing.pi, {});
+  assert.deepEqual(result.providers[1].routing.codex, {});
+  assert.deepEqual(toProviderList(input, ['codex']).providers[0].routing.codex, {});
+});
+
+test('runtime markers do not connect unroutable providers or invent empty catalog models', () => {
+  const input = catalog();
+  input.routableProviders = ['deepseek'];
+  const result = toProviderList(input, ['claude-code', 'codex', 'pi']);
+  assert.deepEqual(result.providers.map((p) => p.connected), [true, false]);
+  assert.deepEqual(result.providers[1].routing, { 'claude-code': {}, codex: {}, pi: {} });
+  assert.deepEqual(toProviderList({ groups: [], routableProviders: [] }, ['pi']), { providers: [], providerOrder: [] });
+  assert.deepEqual(toProviderList(undefined, ['pi']), { providers: [], providerOrder: [] });
+  assert.deepEqual(toProviderList(input, []).providers[0].routing, {});
 });
 
 test('maps permission controls in both directions without leaking DSH preset ids', () => {
