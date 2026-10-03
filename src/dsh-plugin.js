@@ -12,6 +12,7 @@ import { createAttachmentMaterializer } from './host-attachments.js';
 import { createGoalWriter } from './host-goals.js';
 import { startHost } from './host.js';
 import { refusalError } from './cindy-channels.js';
+import { enrichModelCatalog } from './host-model-catalog.js';
 import { hydrateImageAttachments } from './cindy-message-row.js';
 import { API_PREFIX, createHostRoutes } from './host-routes.js';
 
@@ -957,7 +958,19 @@ export function buildDshSource(ctx, serviceName, options = {}) {
        * asks once per device: an empty catalog does not look like a missing
        * feature, it looks like a Host with nothing to offer.
        */
-      modelCatalog: () => sessionController.modelCatalog(),
+      modelCatalog: async () => {
+        const catalog = await sessionController.modelCatalog();
+        const llm = controls.llm;
+        const enriched = await enrichModelCatalog(catalog,
+          typeof llm?.resolveModelInfo === 'function' ? llm.resolveModelInfo.bind(llm) : undefined);
+        if (enriched?.contextFailures?.length) {
+          ctx.logger?.warn?.('Cindy model context metadata unavailable', {
+            count: enriched.contextFailures.length,
+            codes: [...new Set(enriched.contextFailures.map((item) => item.code))],
+          });
+        }
+        return enriched;
+      },
       /**
        * Make sure a session has a live agent, and say whether it does.
        *

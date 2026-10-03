@@ -608,6 +608,29 @@ test('a source context with no session controller refuses goal writes', async ()
   assert.equal(result.code, 'NOT_AVAILABLE');
 });
 
+test('picker catalog enriches exact route capacity from the injected LLM owner', async () => {
+  const raw = { default: { provider: 'one', model: 'same' }, routableProviders: ['one', 'two'],
+    groups: ['one', 'two'].map((id) => ({ id, models: [{ id: 'same', name: 'Same' }] })) };
+  const asked = [];
+  const built = buildDshSource(makeCtx({
+    sessionController: { list: async () => [], modelCatalog: async () => raw },
+    sessionQuery: { listSessions: async () => [] },
+    llm: { async resolveModelInfo(provider, id, signal) {
+      asked.push([provider, id]);
+      assert.ok(signal instanceof AbortSignal);
+      return { provider, id, context: { contextWindow: provider === 'one' ? 128000 : 256000 },
+        defaultMaxTokens: 4096, privateEndpoint: 'must-not-cross' };
+    } },
+  }), 'sessionController');
+  const catalog = await built.modelCatalog();
+  assert.deepEqual(catalog.groups.map((g) => g.models[0].contextWindow), [128000, 256000]);
+  assert.deepEqual(asked.sort(), [['one', 'same'], ['two', 'same']]);
+  assert.equal(JSON.stringify(catalog).includes('must-not-cross'), false);
+  assert.equal('contextWindow' in raw.groups[0].models[0], false, 'never mutate DSH catalog data');
+  assert.deepEqual(catalog.default, raw.default);
+  assert.deepEqual(catalog.routableProviders, raw.routableProviders);
+});
+
 test('resolves the provider a chosen model belongs to from the catalog', async () => {
   // The controller sends a model id and usually no provider: its model option
   // has no provider field, because the catalog flattens models out of their

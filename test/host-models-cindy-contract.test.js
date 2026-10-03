@@ -5,11 +5,13 @@ import { pathToFileURL } from 'node:url';
 import { resolve } from 'node:path';
 import { toProviderList } from '../src/host-models.js';
 import { createChannelRouter, DSH_AGENT_KINDS } from '../src/cindy-channels.js';
+import { buildDshSource } from '../src/dsh-plugin.js';
+import { loadCindyModelConsumers } from './support/cindy-model-consumers.js';
 
 // Optional cross-repository check against real Cindy consumers, not a copied predicate.
 // CINDY_SOURCE_ROOT=<checkout> node --test test/host-models-cindy-contract.test.js
 // Requires a Node runtime with registerHooks and native TypeScript stripping.
-test('Host wire providers survive real Cindy registry and unified picker derivation', {
+test('Host wire providers survive shared Cindy registry derivation (not desktop ingress)', {
   skip: !process.env.CINDY_SOURCE_ROOT && 'Set CINDY_SOURCE_ROOT to test the real Cindy consumers',
 }, async () => {
   const { registerHooks } = await import('node:module');
@@ -78,4 +80,70 @@ test('Host wire providers survive real Cindy registry and unified picker derivat
   } finally {
     hooks.deregister();
   }
+});
+
+test('one source/router response survives real desktop ingress and mobile cache before selection', {
+  skip: !process.env.CINDY_SOURCE_ROOT && 'Set CINDY_SOURCE_ROOT to test both real client ingress paths',
+}, async () => {
+  const client = await loadCindyModelConsumers(process.env.CINDY_SOURCE_ROOT);
+  const device = 'host-contract';
+  try {
+    const catalog = { default: { provider: 'a', model: 'same' }, routableProviders: ['a', 'b'],
+      groups: ['a', 'b', 'offline'].map(id => ({ id, name: id, models: [{ id: 'same', name: 'Same',
+        reasoning: { efforts: [{id: 'low'}, {id: 'high'}], defaultEffort: 'high' } }] })) };
+    const oldWire = JSON.stringify(toProviderList(catalog, DSH_AGENT_KINDS));
+    const oldDesktop = client.parseDesktopProviders(JSON.parse(oldWire));
+    assert.equal(client.unifiedModelEntries(oldDesktop).length, 0, '0.1.21 fails at desktop ingress, not shared registry');
+    const oldMobile = await client.fetchMobileProviders(device, async () => JSON.parse(oldWire));
+    assert.equal(client.unifiedModelEntries(oldMobile).length, 2, 'the same payload works on mobile');
+    client.evictMobileProviders(device);
+
+    let catalogFails = false;
+    const calls = [];
+    const services = {
+      sessionController: { list: async () => [], modelCatalog: async () => {
+        if (catalogFails) throw new Error('catalog failed'); return catalog;
+      } },
+      sessionQuery: { listSessions: async () => [] },
+      llm: { async resolveModelInfo(provider, id) {
+        calls.push([provider, id]);
+        return { provider, id, context: { contextWindow: provider === 'a' ? 128000 : 256000 } };
+      } },
+    };
+    const ctx = { get: name => services[name], on: () => () => {}, effect: run => run(),
+      inject(names, callback) { if (names.every(name => services[name])) callback(ctx); return () => {}; } };
+    const source = buildDshSource(ctx, 'sessionController');
+    const router = createChannelRouter({ listSessions: async () => [], subscribers: new Set(),
+      resolveCapabilities: () => ({ modelCatalog: source.modelCatalog }),
+    });
+    const request = { id: 'real-ingress', src: 'client', type: 'invoke',
+      payload: { channel: 'maker:provider:list', args: [] } };
+    const replyJson = JSON.stringify(await router(request));
+    const desktopEnvelope = JSON.parse(replyJson).payload;
+    const mobileEnvelope = JSON.parse(replyJson).payload;
+    assert.equal(desktopEnvelope.ok, true);
+    assert.equal(mobileEnvelope.ok, true);
+    const desktop = client.parseDesktopProviders(desktopEnvelope.result);
+    const mobile = await client.fetchMobileProviders(device, async () => mobileEnvelope.result);
+    assert.equal(calls.length, 3, 'one metadata read per route, not per alias');
+    for (const scope of ['draft', 'session']) {
+      const deskRows = client.unifiedModelEntries({ ...desktop, scope });
+      const phoneRows = client.unifiedModelEntries({ ...mobile, scope });
+      const keys = rows => rows.map(r => [r.providerId, r.modelId]);
+      assert.deepEqual(keys(deskRows), [['a', 'same'], ['b', 'same']]);
+      assert.deepEqual(keys(deskRows), keys(phoneRows));
+      for (const rows of [deskRows, phoneRows]) for (const row of rows) {
+        assert.deepEqual(row.candidates, DSH_AGENT_KINDS);
+        for (const alias of row.candidates) {
+          assert.equal(row.capabilities[alias].wireModelId, 'same');
+          assert.equal(row.capabilities[alias].contextWindow, row.providerId === 'a' ? 128000 : 256000);
+        }
+      }
+    }
+    // A newly read catalog failure remains a failure, never a ready empty replacement.
+    catalogFails = true;
+    const failure = await router(request);
+    assert.equal(failure.payload.ok, false);
+    assert.equal(failure.payload.error.code, 'NOT_AVAILABLE');
+  } finally { client.evictMobileProviders(device); client.dispose(); }
 });
