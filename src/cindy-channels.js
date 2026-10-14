@@ -1041,6 +1041,7 @@ export function createChannelRouter({
         wrote = true;
       }
 
+      let deleteAcknowledgement;
       const writesMeta = patch.status !== undefined || patch.pinnedAt !== undefined;
       if (writesMeta) {
         const applyFlags = capabilities.applySessionFlags;
@@ -1053,6 +1054,13 @@ export function createChannelRouter({
         const echoed = {};
         if (patch.status !== undefined) echoed.status = applied.status;
         if (patch.pinnedAt !== undefined) echoed.pinnedAt = applied.pinnedAt;
+        // Deleting an already absent source session is still a successful hide once
+        // its flags are saved. The phone needs only the fields it wrote; do not
+        // fabricate a full session or extend this acknowledgement to mixed edits.
+        if (patch.status === 'deleted' && applied.status === 'deleted'
+          && Object.keys(patch).every((key) => key === 'status' || key === 'pinnedAt')) {
+          deleteAcknowledgement = { id: sessionId, ...echoed };
+        }
         if (typeof capabilities.publishSessionMeta === 'function') capabilities.publishSessionMeta(sessionId, echoed);
       }
 
@@ -1061,6 +1069,7 @@ export function createChannelRouter({
       // unchanged row as "revert my edit" (that is how these buttons looked dead once already).
       if (wrote) invalidateSessionRows();
       const row = await sessionRow(sessionId);
+      if (row === undefined && deleteAcknowledgement !== undefined) return invokeResult(request, deleteAcknowledgement);
       return row === undefined ? invokeError(request, 'NOT_FOUND', `No DSH session ${sessionId}`) : invokeResult(request, row);
     }
 

@@ -325,6 +325,82 @@ test('archive, delete and pin are answered with the row the controller will stor
   assert.equal(missing.payload.error.code, 'BAD_REQUEST');
 });
 
+test('deleting a missing session is idempotent and echoes persisted metadata', async () => {
+  const persisted = [];
+  const pushed = [];
+  const flags = createSessionFlags({ persist: async (snapshot) => persisted.push(snapshot) });
+  const router = createChannelRouter({
+    listSessions: async () => [],
+    subscribers: new Set(),
+    resolveCapabilities: () => ({
+      applySessionFlags: (id, patch) => flags.apply(id, patch),
+      publishSessionMeta: (id, patch) => pushed.push({ id, ...patch }),
+    }),
+  });
+  for (const patch of [{ status: 'deleted' }, { status: 'deleted', pinnedAt: null }]) {
+    const reply = await router(request('local-db:sessions:patch-meta', ['missing', patch]));
+    assert.equal(reply.payload.ok, true);
+    assert.deepEqual(reply.payload.result, { id: 'missing', ...patch });
+  }
+  assert.deepEqual(persisted, [
+    { missing: { status: 'deleted' } },
+    { missing: { status: 'deleted' } },
+  ]);
+  assert.deepEqual(pushed, [
+    { id: 'missing', status: 'deleted' },
+    { id: 'missing', status: 'deleted', pinnedAt: null },
+  ]);
+});
+
+test('missing-session deletion does not swallow persistence or read failures', async () => {
+  for (const failure of ['persist', 'read']) {
+    const pushed = [];
+    const flags = createSessionFlags({ persist: async () => {
+      if (failure === 'persist') throw new Error('persist failed');
+    } });
+    const router = createChannelRouter({
+      listSessions: async () => { throw new Error('read failed'); },
+      subscribers: new Set(),
+      resolveCapabilities: () => ({
+        applySessionFlags: (id, patch) => flags.apply(id, patch),
+        publishSessionMeta: (id, patch) => pushed.push({ id, ...patch }),
+      }),
+    });
+    await assert.rejects(
+      router(request('local-db:sessions:patch-meta', ['missing', { status: 'deleted' }])),
+      new RegExp(`${failure} failed`),
+    );
+    if (failure === 'persist') assert.deepEqual(pushed, [], 'a failed save must not publish success');
+  }
+});
+
+test('missing-session non-delete and mixed patches retain NOT_FOUND', async () => {
+  const flags = createSessionFlags();
+  const router = createChannelRouter({
+    listSessions: async () => [],
+    subscribers: new Set(),
+    resolveCapabilities: () => ({ applySessionFlags: (id, patch) => flags.apply(id, patch) }),
+  });
+  for (const patch of [
+    { status: 'archived' }, { status: 'active' }, { pinnedAt: null },
+    { title: 'Renamed' }, { status: 'deleted', title: 'Renamed' },
+  ]) {
+    const reply = await router(request('local-db:sessions:patch-meta', ['missing', patch]));
+    assert.equal(reply.payload.ok, false);
+    assert.equal(reply.payload.error.code, 'NOT_FOUND');
+  }
+});
+
+test('missing-session delete acknowledgement requires the effective deleted status', async () => {
+  const router = createChannelRouter({
+    listSessions: async () => [],
+    subscribers: new Set(),
+    resolveCapabilities: () => ({ applySessionFlags: async () => ({ status: 'active', pinnedAt: null }) }),
+  });
+  const reply = await router(request('local-db:sessions:patch-meta', ['missing', { status: 'deleted' }]));
+  assert.equal(reply.payload.error.code, 'NOT_FOUND');
+});
+
 test('a Host without the flag store refuses the write rather than reverting it silently', async () => {
   // A profile that composes no flag store (a bare router, as the fail-closed tests
   // build) has no way to honour 删除/归档/置顶. `NOT_AVAILABLE` says "no capability",
