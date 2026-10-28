@@ -1,5 +1,12 @@
 # Changelog
 
+## 0.1.29 — 2026-10-29
+
+- Publish from a clean, committed Git source tree; preserve the accepted 0.1.28 runtime behavior.
+- Make native Android queue/ACK and durable-outbox regression tests offline and repository-contained.
+- Pin upstream Cindy test sources with Apache-2.0 LICENSE and NOTICE; exclude all fixtures from the npm package.
+- Synchronize the dependency lock and version-aware isolated smoke helper; retain current DSH SDK peers without forced upgrades.
+
 ## 0.1.28 — 2026-10-28
 
 - Fix busy input confirmation on both controllers: DSH admission no longer removes an actual pending inbox row from later projections.

@@ -4,13 +4,17 @@ A Host-side adapter connecting current Cindy clients to DeepSeek Harness.
 
 ## Requirements and installation
 
-Version 0.1.27 targets the verified **DSH 0.2.1-rc.3** service contracts, with **Node.js >=22.16**. Its DSH peer versions are pinned to this carrier to prevent an installer from mixing a newer prerelease SDK into the running host. The verified Desktop runtime includes Node.js 24.21. Install through the Desktop DSH plugin manager. CLI-managed profiles can use:
+Version 0.1.29 targets the verified **DSH 0.2.1-rc.3** service contracts, with **Node.js >=22.16**. Its DSH peer versions are pinned to this carrier to prevent an installer from mixing a newer prerelease SDK into the running host. The verified Desktop runtime includes Node.js 24.21. Install through the Desktop DSH plugin manager. CLI-managed profiles can use:
 
 ```sh
-dsh plugin --profile <profile> add dsh-cindy-host@0.1.28
+dsh plugin --profile <profile> add dsh-cindy-host@0.1.29
 ```
 
 Reload the Host plugin after installation. A full DSH restart is separate. Keep existing Cindy sign-in, device identity and settings; do not run two Host processes with the same identity.
+
+## 0.1.29: reproducible repository release
+
+Runtime behavior is unchanged from the phone- and desktop-accepted 0.1.28. This release synchronizes the verified source, dependency lock and offline native-client contract fixtures into Git. The pinned third-party fixtures are test-only and excluded from the npm package.
 
 ## 0.1.28: busy enqueue confirmation
 
