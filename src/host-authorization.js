@@ -14,6 +14,8 @@
  *    which is exactly the trap this file now documents.
  */
 
+import { HOST_APP_VERSION } from './host-version.js';
+
 const CHANNELS = ['device-link:subscribe', 'local-db:sessions:list'];
 
 /**
@@ -43,7 +45,7 @@ export function acceptLink(frame, acceptedControllers, capabilities = HOST_CAPAB
     id: frame.id,
     dst: frame.src,
     payload: {
-      appVersion: '0.1.0',
+      appVersion: HOST_APP_VERSION,
       allowlistHash: computeAllowlistHash(),
       ...(capabilities.length === 0 ? {} : { capabilities: [...capabilities] }),
     },

@@ -1,5 +1,17 @@
-import test from 'node:test'; import assert from 'node:assert/strict'; import { DEFAULT_HOST_SETTINGS, validateHostSettings, rememberedDeviceId } from '../src/host-settings.js';
+import test from 'node:test'; import assert from 'node:assert/strict'; import { DEFAULT_HOST_SETTINGS, validateHostSettings, rememberedDeviceId, hostDeviceName } from '../src/host-settings.js';
 test('defaults transport to disabled and validates explicit controller authorization settings',()=>{assert.equal(DEFAULT_HOST_SETTINGS.transportEnabled,false); assert.doesNotThrow(()=>validateHostSettings({transportEnabled:false,remoteControlEnabled:true,controllers:{phone:{state:'authorized'}}})); assert.throws(()=>validateHostSettings({transportEnabled:false,remoteControlEnabled:true,controllers:{phone:{state:'unknown'}}}));});
+
+test('host names preserve legacy defaults and validate single-line Unicode labels', () => {
+  assert.equal(hostDeviceName({}), 'DSH Host');
+  assert.equal(hostDeviceName(DEFAULT_HOST_SETTINGS), 'DSH Host');
+  assert.equal(hostDeviceName({ deviceName: ' 工作站 🖥️ ' }), '工作站 🖥️');
+  for (const deviceName of ['', 'DSH Host', '家用电脑', 'a'.repeat(64), '🖥'.repeat(32)]) {
+    assert.doesNotThrow(() => validateHostSettings({ ...DEFAULT_HOST_SETTINGS, deviceName }));
+  }
+  for (const deviceName of [null, 12, '  ', 'a'.repeat(65), '🖥'.repeat(33), 'a\nb', 'a\tb', '\u0000hi', 'hi\u0085']) {
+    assert.throws(() => validateHostSettings({ ...DEFAULT_HOST_SETTINGS, deviceName }));
+  }
+});
 
 test('remembers the relay device id, because the credential can disappear', () => {
   // A phone links to the Host's *device id*, not to its credential. Credentials

@@ -19,6 +19,10 @@
  *    missing `pong`s as a dead socket.
  */
 import WebSocket from 'ws';
+import { join as joinDeliveryPath } from 'node:path';
+import { createHash as deliveryHash } from 'node:crypto';
+import { openInputDeliveryStore, deliveryError } from './host-input-delivery-store.js';
+import { createInputDeliveryCoordinator } from './host-input-delivery.js';
 import { realpath as realpathImpl, stat as statImpl } from 'node:fs/promises';
 import { extname as extnameImpl, resolve as resolvePathImpl } from 'node:path';
 import { restoreSession } from './auth-session.js';
@@ -33,7 +37,8 @@ import { publishLifecycle, runningStatusEvent, turnEventFor } from './session-pu
 import { acceptLink } from './host-authorization.js';
 import { AuthorizationPolicy } from './authorization-policy.js';
 import { HostStatus } from './host-status.js';
-import { DEFAULT_HOST_SETTINGS } from './host-settings.js';
+import { DEFAULT_HOST_SETTINGS, DEFAULT_HOST_DEVICE_NAME, hostDeviceName } from './host-settings.js';
+import { createDeviceNameSync } from './host-device-name.js';
 import { createSessionFlags } from './session-flags.js';
 import { MAX_ATTACHMENT_BYTES } from './host-attachments.js';
 import { createMediaRefResolver, createMediaReleaser, createMediaUploader, mediaApiBaseUrl, isAttachmentOssRef } from './host-media.js';
@@ -48,7 +53,7 @@ import { createExportOwner } from './host-export-owner.js';
 import { createTransferDiagnostics } from './host-transfer-diagnostics.js';
 import { normalizeAuthBaseUrl } from './cindy-login-flow.js';
 import { RECONNECT_STABLE_RESET_MS, computeReconnectDelayMs } from './host-reconnect.js';
-import { MAX_FRAME_BYTES, fitInvokeResultToFrame, frameByteLength } from './host-frame-budget.js';
+import { MAX_FRAME_BYTES, FRAME_BUDGET_BYTES, fitInvokeResultToFrame, frameByteLength } from './host-frame-budget.js';
 
 /** Mainland DeviceLink relay. The settings card never guesses this value. */
 export const RELAY_WS_URL = 'wss://device-link.cindy.com.cn/api/device-link/ws';
@@ -69,9 +74,11 @@ export const HEARTBEAT_INTERVAL_MS = 20_000;
  */
 export const HEARTBEAT_MISS_LIMIT = 3;
 
-export const HOST_DEVICE_NAME = 'DSH Host';
+export const HOST_DEVICE_NAME = DEFAULT_HOST_DEVICE_NAME;
 export const HOST_PLATFORM = 'desktop';
-export const HOST_APP_VERSION = '0.1.0';
+import { deleteAccountDevice } from './host-device-delete.js';
+import { HOST_APP_VERSION, HOST_PLUGIN_VERSION } from './host-version.js';
+export { HOST_APP_VERSION } from './host-version.js';
 
 /** Default socket factory; tests inject their own. */
 function openRelaySocket(session, url = RELAY_WS_URL) {
@@ -332,6 +339,13 @@ export async function startHost(initialSource, settings = DEFAULT_HOST_SETTINGS,
   const status = new HostStatus({ now });
 
   let current = settings;
+  const deviceNameSync = createDeviceNameSync({ url: deviceListUrl(relayUrl), fetchImpl });
+  deviceNameSync.reset(current?.deviceName?.trim() || null);
+  function syncDeviceName() {
+    deviceNameSync.update({ name: current?.deviceName?.trim() || null,
+      session: active && ws !== null && boundSocketGeneration === generation &&
+        (current?.transportEnabled || current?.remoteControlEnabled) && status.ownDeviceId ? session : null, deviceId: status.ownDeviceId });
+  }
   let source = initialSource;
   let active = false;
   let connecting = null; // Generation owning the in-flight connect, not a global latch.
@@ -808,16 +822,52 @@ export async function startHost(initialSource, settings = DEFAULT_HOST_SETTINGS,
    * fixes every such row at once; failures are silent because a missing name
    * only costs a nicer label, never a connection.
    */
+  let directoryEpoch = 0;
+  const pendingDeletes = new Set();
+  async function deleteDevice(deviceId) {
+    if (pendingDeletes.has(deviceId)) return { ok: false, statusCode: 409, message: '设备正在删除' };
+    let owner = session;
+    const epoch = generation;
+    if (stopped || !active) return { ok: false, statusCode: 409, message: '请先连接 Cindy Host' };
+    pendingDeletes.add(deviceId);
+    try {
+      const result = await deleteAccountDevice({
+        deviceId, session: owner, snapshot: status.snapshot(),
+        getSnapshot: () => status.snapshot(), url: deviceListUrl(relayUrl), fetchImpl,
+        refreshSession: async captured => {
+          if (stopped || !active || generation !== epoch || session !== captured) return null;
+          const refreshed = await refreshSessionForMedia();
+          if (!refreshed || stopped || !active || generation !== epoch ||
+              !session || session.deviceId !== captured.deviceId || session.authBaseUrl !== captured.authBaseUrl) return null;
+          owner = session;
+          return session;
+        },
+      });
+      if (stopped || generation !== epoch || session !== owner) return { ok: false, statusCode: 409, message: '连接身份已改变，请刷新设备列表' };
+      if (result.ok) {
+        directoryEpoch++;
+        acceptedControllers.delete(deviceId);
+        subscribers.delete(deviceId);
+        status.removeDevice(deviceId);
+        status.refreshConnectionState();
+      }
+      return result;
+    } finally {
+      pendingDeletes.delete(deviceId);
+    }
+  }
+
   async function refreshDeviceDirectory() {
     if (session === null) return;
     const myGeneration = generation;
+    const readEpoch = directoryEpoch;
     let answer;
     try {
       answer = await listDevices(session, relayUrl);
     } catch {
       return;
     }
-    if (stopped || !active || myGeneration !== generation) return;
+    if (stopped || !active || myGeneration !== generation || readEpoch !== directoryEpoch) return;
     const rows = Array.isArray(answer?.devices) ? answer.devices : [];
     for (const row of rows) {
       if (row === null || typeof row !== 'object') continue;
@@ -1008,6 +1058,7 @@ export async function startHost(initialSource, settings = DEFAULT_HOST_SETTINGS,
    * @param payload - the channel's payload.
    */
   function pushSessionUpdate(sessionId, channel, payload) {
+    if (channel === 'maker:input:projection' && activeDelivery) payload = activeDelivery.currentProjection(sessionId, [], payload);
     const devices = sessionSubscribers.get(sessionId);
     const watchers = devices === undefined ? 0 : devices.size;
     const reachable = devices === undefined ? 0 : [...devices].filter((deviceId) => !offlineDevices.has(deviceId)).length;
@@ -1074,6 +1125,11 @@ export async function startHost(initialSource, settings = DEFAULT_HOST_SETTINGS,
    * chip instead of the picture.
    */
   async function pushSessionMessage(sessionId, message) {
+    if (message?.role === 'user' && activeDelivery?.owns(sessionId, message.clientId)) {
+      await new Promise(resolve => queueMicrotask(resolve));
+      const proof = await activeDelivery.projection(sessionId, { deliveryClientIds: [message.clientId] });
+      if (proof.deliveryReceipts[0]?.state !== 'accepted') return;
+    }
     try {
       // `options.resolveCapabilities` is the plugin's provider — the only source of the hydrator.
       // (Reading it through the router's own `resolveCapabilities` is not possible from here: that
@@ -1113,6 +1169,56 @@ export async function startHost(initialSource, settings = DEFAULT_HOST_SETTINGS,
   function sessionRowFor(sessionId) {
     return sessionRowCache.get(sessionId);
   }
+
+  let deliveryNamespace = options.inputDeliveryNamespace ?? null;
+  var activeDelivery = null;
+  const deliveryInstances = new Set();
+  let deliveryLastError = null;
+  function getInputDelivery() {
+    if (!options.inputDeliveryDirectory) return null;
+    if (!deliveryNamespace) throw deliveryError('DELIVERY_NOT_AVAILABLE', 'Waiting for the authenticated Host account');
+    if (activeDelivery) return activeDelivery;
+    const namespace = deliveryNamespace;
+    const currentBackend = () => {
+      const backend = options.resolveCapabilities?.().inputDeliveryBackend;
+      if (!backend || !backend.available()) throw deliveryError('DELIVERY_NOT_AVAILABLE', 'Durable DSH delivery backend is unavailable');
+      return backend;
+    };
+    currentBackend();
+    const file = joinDeliveryPath(options.inputDeliveryDirectory, deliveryHash('sha256').update(namespace).digest('hex') + '.sqlite');
+    const store = openInputDeliveryStore({ file, namespace });
+    const coordinator = createInputDeliveryCoordinator({
+      store,
+      backend: {
+        prepare: (sid, row, opts) => currentBackend().prepare(sid, row, { ...opts, resolveAttachmentRef }),
+        evidence: sid => currentBackend().evidence(sid),
+        dispatch: entry => currentBackend().dispatch(entry, { releaseAttachmentRef: key => deliveryNamespace === namespace ? releaseAttachmentRef(key) : Promise.resolve() }),
+        remove: (sid, id) => currentBackend().remove(sid, id),
+        promote: (sid, id) => currentBackend().promote(sid, id),
+        recoverColdInbox: (sid, entries) => currentBackend().recoverColdInbox(sid, entries),
+      },
+      baseProjection: sid => inputQueue.projectionFor(sid, sessionRowFor(sid)),
+      validateProjection: projection => frameByteLength({ v: 1, kind: 'invoke-result', id: 'delivery', dst: 'controller', payload: { ok: true, result: projection } }) <= FRAME_BUDGET_BYTES - 24576,
+      onChange: sid => {
+        if (activeDelivery !== coordinator || deliveryNamespace !== namespace || stopped) return;
+        pushSessionUpdate(sid, 'maker:input:projection', coordinator.currentProjection(sid));
+        pushHistoryViewChanged(sid);
+      },
+      onError: error => { deliveryLastError = { at: new Date().toISOString(), code: error?.code ?? 'DELIVERY_FAILURE', message: String(error?.message ?? error).slice(0, 300) }; },
+    });
+    deliveryInstances.add(coordinator);
+    activeDelivery = coordinator;
+    coordinator.recover();
+    return coordinator;
+  }
+  function bindDeliveryNamespace(namespace) {
+    if (deliveryNamespace === namespace) return;
+    deliveryNamespace = namespace;
+    const previous = activeDelivery; activeDelivery = null;
+    if (previous) void previous.close().then(() => deliveryInstances.delete(previous)).catch(error => recordHandlerError('input-delivery-close', error));
+  }
+  const deliveryTimer = options.inputDeliveryDirectory ? setInterval(() => { if (!stopped) activeDelivery?.recover(); }, 1000) : null;
+  deliveryTimer?.unref?.();
 
   const routeInvoke = createChannelRouter({
     getSession: async (sessionId) => {
@@ -1184,7 +1290,8 @@ export async function startHost(initialSource, settings = DEFAULT_HOST_SETTINGS,
         // plugin owns the attachment reader, and a row must be renderable in the frame that
         // carries it (see `pushSessionMessage`).
         hydrateImages: provided.hydrateImages,
-      inputProjection: (sessionId, pending) => inputQueue.projectionFor(sessionId, sessionRowFor(sessionId), pending ?? null),
+      inputDelivery: getInputDelivery,
+      inputProjection: (sessionId, pending) => { const base = inputQueue.projectionFor(sessionId, sessionRowFor(sessionId), pending ?? null); return activeDelivery ? activeDelivery.currentProjection(sessionId, [], base) : base; },
       queuedRow: ({ clientId, text, sessionId }) => queuedRowFromController({ clientId, text, session: sessionRowFor(sessionId) }),
       goalStatus: (sessionId) => toGoalStatusPayload(sessionId, projections.goalOf(sessionId)),
       /**
@@ -1283,7 +1390,7 @@ export async function startHost(initialSource, settings = DEFAULT_HOST_SETTINGS,
     now,
     // Every row must name the device it came from, or the phone's home filter
     // drops it as soon as the user selects this Host.
-    getDevice: () => ({ deviceId: status.ownDeviceId, deviceName: HOST_DEVICE_NAME }),
+    getDevice: () => ({ deviceId: status.ownDeviceId, deviceName: hostDeviceName(current) }),
   });
 
   /**
@@ -1866,11 +1973,14 @@ export async function startHost(initialSource, settings = DEFAULT_HOST_SETTINGS,
         }
         const payload = frame.payload ?? {};
         status.setHost({
+          deviceName: hostDeviceName(current),
           deviceId: typeof payload.deviceId === 'string' ? payload.deviceId : null,
           userId: typeof payload.userId === 'string' ? payload.userId : null,
           protocolVersion: typeof payload.serverProtocolVersion === 'number' ? payload.serverProtocolVersion : null,
         });
+        if (typeof payload.userId === 'string' && typeof payload.deviceId === 'string') bindDeliveryNamespace([mediaBase, normalizeAuthBaseUrl(socketSession?.authBaseUrl), payload.userId, payload.deviceId].join('|'));
         status.setState('waiting');
+        syncDeviceName();
         // The relay itself accepted us, which is the first moment "online" is true —
         // so this is where the reconnect ladder starts forgetting failed attempts.
         markConnectionStable();
@@ -2037,7 +2147,7 @@ export async function startHost(initialSource, settings = DEFAULT_HOST_SETTINGS,
         v: PROTOCOL_VERSION,
         kind: 'hello',
         payload: {
-          deviceName: HOST_DEVICE_NAME,
+          deviceName: hostDeviceName(current),
           platform: HOST_PLATFORM,
           appVersion: HOST_APP_VERSION,
           // The relay refuses to route link-open/invoke to a target that did not
@@ -2148,6 +2258,7 @@ export async function startHost(initialSource, settings = DEFAULT_HOST_SETTINGS,
   async function disconnect({ keepSwitch = false, preserveExports = false } = {}) {
     if (!preserveExports) exportOwner.invalidate();
     generation += 1;
+    deviceNameSync.reset(current?.deviceName?.trim() || null);
     filePeer.closeAll();
     stopHeartbeat();
     // A pending view invalidation has no socket to reach once this returns; firing it later
@@ -2207,6 +2318,10 @@ export async function startHost(initialSource, settings = DEFAULT_HOST_SETTINGS,
     if (stopped) return;
     const previous = current;
     current = next;
+    const nameChanged = previous?.deviceName !== next?.deviceName;
+    const host = status.snapshot().host;
+    if (host && nameChanged) status.setHost({ ...host, deviceName: hostDeviceName(next) });
+    if (nameChanged) syncDeviceName();
     // The settings section is the durable home of the archive/delete/pin flags, so
     // every settings change is also a chance for another instance (or a hand edit)
     // to have moved them. `replace` never writes back — see `session-flags.js`.
@@ -2242,6 +2357,9 @@ export async function startHost(initialSource, settings = DEFAULT_HOST_SETTINGS,
     active = false;
     await disconnect();
     await fileExports.stop();
+    if (deliveryTimer !== null) clearInterval(deliveryTimer);
+    await Promise.all([...deliveryInstances].map(coordinator => coordinator.close()));
+    deliveryInstances.clear(); activeDelivery = null;
     status.setState('disconnected');
   }
 
@@ -2254,7 +2372,8 @@ export async function startHost(initialSource, settings = DEFAULT_HOST_SETTINGS,
     acceptedControllers,
     policy,
     status,
-    getStatus: () => status.snapshot(),
+    getStatus: () => ({ ...status.snapshot(), pluginVersion: HOST_PLUGIN_VERSION, nameSync: deviceNameSync.snapshot(), inputDelivery: { ready: activeDelivery !== null, version: activeDelivery ? 1 : null, pending: activeDelivery?.diagnostics().slice(0, 30) ?? [], lastError: deliveryLastError } }),
+    deleteDevice,
     subscribeStatus: (listener) => status.subscribe(listener),
     /** The most recent invokes this Host served, for the status route's diagnostics. */
     getInvokeLog: () => invokeLog.slice(),
@@ -2385,7 +2504,7 @@ export async function startHost(initialSource, settings = DEFAULT_HOST_SETTINGS,
     retireQueuedItem: (sessionId, controllerId) => {
       if (typeof sessionId !== 'string' || sessionId === '') return;
       if (typeof controllerId !== 'string' || controllerId === '') return;
-      inputQueue.mirror(sessionId, controllerId, { kind: 'remove' });
+      inputQueue.retire(sessionId, controllerId);
       pushSessionUpdate(sessionId, 'maker:input:projection', inputQueue.projectionFor(sessionId, sessionRowFor(sessionId)));
     },
     /** Begin a controller approval and expose its cancellable pending handle. */

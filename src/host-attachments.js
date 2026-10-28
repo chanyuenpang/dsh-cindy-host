@@ -87,7 +87,7 @@ export function imageMediaTypeOf(attachment) {
  *   `consumed` being the staging keys whose bytes were taken, for the caller to
  *   release once the prompt has landed.
  */
-export function createAttachmentMaterializer({ fileSystem, fileUploads, resolveAttachmentRef, maxBytes = MAX_ATTACHMENT_BYTES } = {}) {
+export function createAttachmentMaterializer({ fileSystem, fileUploads, resolveAttachmentRef, maxBytes = MAX_ATTACHMENT_BYTES, captureOnly = false } = {}) {
   /** Read one whole file through the composed filesystem, or say why not. */
   async function readWholeFile(path) {
     if (fileSystem === undefined || fileSystem === null) return { ok: false, reason: 'no-filesystem' };
@@ -125,6 +125,7 @@ export function createAttachmentMaterializer({ fileSystem, fileUploads, resolveA
    * depend on where the bytes came from.
    */
   async function partFor({ buffer, name, mediaType, agent, signal }) {
+    if (captureOnly) return { part: { name, mediaType, data: buffer.toString('base64') } };
     if (mediaType !== null) return { part: { type: 'image', mediaType, data: buffer.toString('base64'), name } };
     if (typeof fileUploads?.upload !== 'function') return { dropped: 'no-upload-service' };
     try {

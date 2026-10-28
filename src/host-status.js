@@ -21,6 +21,8 @@
  * never shows a terminal failure for an ordinary network loss.
  */
 
+import { HOST_APP_VERSION } from './host-version.js';
+
 /** Ordered state vocabulary; also the wire vocabulary of the status route. */
 export const CONNECTION_STATES = Object.freeze(['disconnected', 'authenticating', 'connecting', 'waiting', 'connected', 'failed']);
 
@@ -149,7 +151,7 @@ export class HostStatus {
       return;
     }
     this.#ownDeviceId = typeof host.deviceId === 'string' ? host.deviceId : null;
-    this.#publish({ host: { deviceName: 'DSH Host', platform: 'desktop', appVersion: '0.1.0', online: true, protocolVersion: null, userId: null, ...host } });
+    this.#publish({ host: { deviceName: 'DSH Host', platform: 'desktop', appVersion: HOST_APP_VERSION, online: true, protocolVersion: null, userId: null, ...host } });
   }
 
   /** Insert or merge one device row, preserving fields the patch omits. */

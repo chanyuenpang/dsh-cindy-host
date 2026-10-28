@@ -261,7 +261,7 @@ test('renders the switch, the state, the device section and the host id', () => 
   assert.match(html, /role="switch"/);
   assert.match(html, /aria-checked="true"/, 'the switch mirrors the settings value');
   assert.match(html, /未连接/, 'no status poll has answered yet');
-  assert.match(html, /已连接设备/);
+  assert.match(html, /账号设备/);
 });
 
 test('the switch renders off when the settings say so', () => {
@@ -374,6 +374,31 @@ test('renders each device with its name, platform and id', () => {
   assert.equal(platformText('win32'), 'Windows');
   assert.equal(platformText('linux'), 'Linux');
   assert.equal(platformText('plan9'), 'plan9');
+});
+
+test('device deletion requires explicit confirmation and remains offline-only', () => {
+  let confirming = false;
+  const { moduleExports } = loadClientBundle({ react: { ...React, useState: () => [confirming, (next) => { confirming = next; }] } });
+  const { DeviceRow } = moduleExports.__internals;
+  const deleted = [];
+  const device = { deviceId: 'old-phone', name: 'Phone', online: false };
+  const draw = (extra = {}) => DeviceRow({ device, onDelete: (id) => deleted.push(id), ...extra });
+  const buttons = (tree) => {
+    if (!tree || typeof tree !== 'object') return [];
+    return [...(tree.type === 'button' ? [tree] : []), ...React.Children.toArray(tree.props?.children).flatMap(buttons)];
+  };
+  buttons(draw())[0].props.onClick();
+  assert.deepEqual(deleted, []);
+  assert.equal(buttons(draw()).length, 2);
+  buttons(draw())[1].props.onClick();
+  assert.equal(confirming, false);
+  buttons(draw())[0].props.onClick();
+  buttons(draw())[0].props.onClick();
+  assert.deepEqual(deleted, ['old-phone']);
+  assert.equal(buttons(draw({ busy: true }))[0].props.disabled, true);
+  assert.equal(buttons(draw({ device: { ...device, online: true } }))[0].props.disabled, true);
+  assert.equal(buttons(draw({ device: { deviceId: 'unknown' } }))[0].props.disabled, true);
+  assert.equal(buttons(draw({ onDelete: undefined })).length, 0);
 });
 
 test('the switch reports the flipped value, not the current one', () => {
@@ -563,4 +588,92 @@ test('connected and waiting accounts show only masked identifiers and a working 
       assert.equal(calls.at(-1)[1].method, 'POST');
     } finally { cleanup(); }
   }
+});
+
+test('host name editor is available offline and writes only the trimmed name setting', async () => {
+  const scope = makeScope({ transportEnabled: false, deviceName: '原主机' });
+  const { slots, moduleExports } = mountDeclared(scope);
+  const html = render(React.createElement(slots.registrations[0].component));
+  assert.match(html, /主机名称/);
+  assert.match(html, /value="原主机"/);
+  assert.match(html, /maxLength="64"/);
+  assert.match(html, /保存名称/);
+  await moduleExports.__internals.writeHostName(scope, '  工作站 🖥  ');
+  assert.deepEqual(scope.written, [['deviceName', '工作站 🖥']]);
+  for (const invalid of ['', '  ', 'a'.repeat(65), 'a\nb', 'a\tb']) {
+    await assert.rejects(() => moduleExports.__internals.writeHostName(scope, invalid));
+  }
+  assert.equal(scope.written.length, 1);
+  const failing = makeScope({}, { writable: true });
+  failing.set = async () => { throw new Error('disk'); };
+  await assert.rejects(() => moduleExports.__internals.writeHostName(failing, 'new'), /disk/);
+});
+
+test('name form preserves drafts across polls, prevents duplicate saves, and retains failed edits', async () => {
+  const states = [];
+  const refs = [];
+  let cursor = 0;
+  let refCursor = 0;
+  const { moduleExports } = loadClientBundle({ react: { ...React,
+    useState(initial) {
+      const index = cursor++;
+      if (!(index in states)) states[index] = initial;
+      return [states[index], value => { states[index] = value; }];
+    },
+    useRef(initial) {
+      const index = refCursor++;
+      return refs[index] ??= { current: initial };
+    },
+  } });
+  let value = '原主机';
+  const scope = makeScope({});
+  let reject;
+  scope.set = (field, next) => {
+    scope.written.push([field, next]);
+    return new Promise((resolve, fail) => { reject = fail; });
+  };
+  const draw = () => {
+    cursor = 0; refCursor = 0;
+    return moduleExports.__internals.HostNameForm({ scope, value, writable: true });
+  };
+  const input = tree => tree.props.children[0].props.children[1];
+  input(draw()).props.onChange({ target: { value: ' 新主机 ' } });
+  assert.equal(input(draw()).props.value, ' 新主机 ');
+  value = '来自另一个窗口的名称';
+  assert.equal(input(draw()).props.value, ' 新主机 ', 'snapshots cannot erase an unsaved draft');
+  const form = draw();
+  const saving = form.props.onSubmit({ preventDefault() {} });
+  await form.props.onSubmit({ preventDefault() {} });
+  assert.equal(scope.written.length, 1, 'rapid double submit must not duplicate writes');
+  assert.equal(input(draw()).props.disabled, true);
+  reject(new Error('disk'));
+  await saving;
+  assert.equal(input(draw()).props.value, ' 新主机 ');
+  assert.match(render(draw()), /保存失败/);
+  assert.doesNotMatch(render(draw()), /主机名称已保存到本机/);
+  scope.set = async (field, next) => { value = next; scope.written.push([field, next]); };
+  await draw().props.onSubmit({ preventDefault() {} });
+  assert.equal(input(draw()).props.value, '新主机');
+  assert.match(render(draw()), /主机名称已保存到本机/);
+});
+
+test('name editor disables writes in read-only scopes and distinguishes failed cloud sync', () => {
+  const { moduleExports } = loadClientBundle();
+  const { HostNameForm } = moduleExports.__internals;
+  const html = render(React.createElement(HostNameForm, {
+    scope: makeScope({}), value: '主机', writable: false, sync: { state: 'failed', name: '主机' },
+  }));
+  assert.match(html, /<input[^>]*disabled/);
+  assert.match(html, /<button[^>]*disabled/);
+  assert.match(html, /本机名称已保存，但 Cindy 同步失败/);
+  const pending = render(React.createElement(HostNameForm, {
+    scope: makeScope({}), value: '主机', writable: true, sync: { state: 'pending', name: '主机' },
+  }));
+  assert.match(pending, /连接 Cindy 后会同步名称/);
+});
+
+
+test('host-name writes treat DSH 0.2 false as rejection', async () => {
+  const { writeHostName } = loadClientBundle().moduleExports.__internals;
+  await assert.rejects(() => writeHostName({ set: async () => false }, 'new name'));
 });

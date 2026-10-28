@@ -275,7 +275,18 @@ export function fitInvokeResultToFrame({ reply, request, channel, budgetBytes = 
   }
   const placeholders = placeholderRows(rows);
   for (let keep = placeholders.length - 1; keep > 0; keep -= 1) {
-    const sliced = sliceRowsAtMessageBoundary(placeholders, keep);
+    let sliced;
+    if (channel === 'local-db:messages:around' || channel === 'local-db:messages:around-client-id') {
+      const identity = request?.payload?.args?.[1];
+      const anchor = placeholders.findIndex(row => (channel.endsWith('around-client-id') ? row?.clientId : row?.id) === identity);
+      if (anchor < 0) break;
+      let from = Math.max(0, Math.min(anchor - Math.floor((keep - 1) / 2), placeholders.length - keep));
+      let to = from + keep;
+      const same = (a, b) => typeof a?.id === 'string' && typeof b?.id === 'string' && /:[0-9]+$/.test(a.id) && /:[0-9]+$/.test(b.id) && a.id.replace(/:[0-9]+$/, '') === b.id.replace(/:[0-9]+$/, '');
+      while (from > 0 && same(placeholders[from - 1], placeholders[from])) from--;
+      while (to < placeholders.length && same(placeholders[to - 1], placeholders[to])) to++;
+      sliced = placeholders.slice(from, to);
+    } else sliced = sliceRowsAtMessageBoundary(placeholders, keep);
     const trimmed = sliced.map((row) => (row === null || typeof row !== 'object' ? row : { ...row, agentMeta: markRowsTrimmed(row.agentMeta, placeholders.length) }));
     const payload = { ...original, result: trimmed };
     const bytes = measure(payload);

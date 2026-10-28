@@ -130,6 +130,8 @@ test('the supported set is exactly what the router serves', () => {
     'fs:list-dir',
     'fs:stat-path',
     'local-db:messages:list',
+    'local-db:messages:around',
+    'local-db:messages:around-client-id',
     'local-db:messages:view',
     'local-db:messages:view-intent',
     'local-db:messages:work-details',

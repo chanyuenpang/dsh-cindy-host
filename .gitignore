@@ -1,5 +1,10 @@
 # dependencies
 node_modules/
+.release/
+*.log
+*.sqlite
+*.sqlite-shm
+*.sqlite-wal
 
 # the sandbox DSH home: it carries its own credentials and session storage
 .sandbox/

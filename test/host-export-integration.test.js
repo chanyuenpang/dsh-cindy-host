@@ -316,6 +316,39 @@ test('same-owner presign 401 uses pinned fake auth refresh and retries once with
   assert.equal(f.runtime.getStatus().host.userId, 'user-a');
 });
 
+test('device deletion renews expired credentials through the pinned Host owner', async t => {
+  let stored = { ...SESSION }, refreshes = 0, saves = 0;
+  const requests = [];
+  const f = await fixture(t, { options: {
+    listDevices: async () => [],
+    fetch: async (url, init = {}) => {
+      if (init.method !== 'DELETE') return response([]);
+      requests.push(init);
+      return requests.length === 1 ? response({}, 401) : response({ deleted: true, deviceId: 'old-peer' });
+    },
+    exportCredentialOptions: { ports: {
+      loadSession: async () => ({ ...stored }),
+      saveSession: async next => { saves++; stored = { ...next }; },
+      refreshStoredSession: async captured => {
+        refreshes++;
+        assert.deepEqual(captured, SESSION);
+        return { ok: true, session: ROTATED };
+      },
+    } },
+  } });
+  f.runtime.status.upsertDevice('old-peer', { online: false });
+  const result = await f.runtime.deleteDevice('old-peer');
+  assert.equal(result.ok, true, JSON.stringify(result));
+  assert.equal(refreshes, 1);
+  assert.equal(saves, 1);
+  assert.equal(requests.length, 2);
+  assert.equal(requests[1].headers.Authorization, 'Bearer ' + ROTATED.accessToken);
+  assert.equal(f.runtime.getStatus().devices.some(row => row.deviceId === 'old-peer'), false);
+  assert.equal(f.resolves, 1);
+  assert.equal(f.sockets.length, 1);
+  assert.equal(f.socket().closed, 0);
+});
+
 test('revoking one controller does not abort account refresh shared by another export', async t => {
   const api = deferred(), entered = deferred();
   let stored = { ...SESSION }, signal, refreshes = 0;

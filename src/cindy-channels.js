@@ -9,10 +9,9 @@
  *
  * Everything outside that subset answers `CHANNEL_NOT_ALLOWED`, which is exactly
  * what a Cindy controlled device answers for a channel it does not serve. That
- * is a feature of the protocol: the controller treats it as "this device has no
- * such capability" and degrades, rather than waiting for a reply that never
- * comes. A channel we silently accepted and then failed would be worse — the
- * phone would show a broken feature instead of an absent one.
+ * is a permanent refusal, not proof of a working fallback. Only optional
+ * features with a verified caller fallback may use that boundary; the latest
+ * default input/durable-outbox path must be implemented end to end.
  */
 import { agentKindForModel, toCindyActiveSessions, toCindySessionList, toCindySessionListRow } from './cindy-session-row.js';
 import { toAgentCapabilities, toCindyPermissionMode, toDshPermissionMode, toNewMakerDefaults, toPermissionOptions, toProviderList } from './host-models.js';
@@ -20,6 +19,12 @@ import { queueItemsFromInbox } from './host-input-queue.js';
 import { toAgentSkills, toAgentCommands, toAtResources } from './host-palette.js';
 import { toGoalStatusPayload } from './host-goals.js';
 import { hostAttachmentsOf } from './host-attachments.js';
+import { historyLocateOptions, locateCommittedMessages, capReferenceRows } from './host-history-locate.js';
+
+async function deliveryReply(request, operation) {
+  try { return invokeResult(request, await operation()); }
+  catch (error) { return invokeError(request, typeof error?.code === 'string' ? error.code : 'DELIVERY_FAILURE', String(error?.message ?? error)); }
+}
 
 /** The phone's own unsubscribe channel, paired with subscribe. */
 const SUBSCRIBE = 'device-link:subscribe';
@@ -211,6 +216,8 @@ export const SUPPORTED_CHANNELS = Object.freeze([
   'local-db:sessions:list',
   'local-db:sessions:get',
   'local-db:messages:list',
+  'local-db:messages:around',
+  'local-db:messages:around-client-id',
   'local-db:sessions:patch-meta',
   'maker:create-session',
   'maker:send',
@@ -627,6 +634,24 @@ export function createChannelRouter({
         }
       }
       return invokeResult(request, row);
+    }
+
+    if (channel === 'local-db:messages:around' || channel === 'local-db:messages:around-client-id') {
+      const capabilities = capabilitiesNow();
+      if (typeof args[0] !== 'string' || !args[0] || typeof args[1] !== 'string' || !args[1]) return invokeError(request, 'INVALID_PARAMS', 'sessionId and message identity must be nonempty strings');
+      const sessionId = args[0];
+      if (capabilities.sessionHidden?.(sessionId) === true) return invokeError(request, 'NOT_FOUND', 'Session does not exist');
+      if (typeof capabilities.readAllMessages !== 'function') return invokeError(request, 'NOT_AVAILABLE', 'This Host cannot read committed message history');
+      try {
+        const byClientId = channel === 'local-db:messages:around-client-id';
+        const options = historyLocateOptions(byClientId ? args[2] : {radius: args[2]?.radius});
+        const rows = locateCommittedMessages(await capabilities.readAllMessages(sessionId), {sessionId, identity: args[1], byClientId, radius: options.radius});
+        const hydrated = typeof capabilities.hydrateImages === 'function' ? await capabilities.hydrateImages(rows) : rows;
+        return invokeResult(request, capReferenceRows(hydrated, options.contentCharLimit));
+      } catch (error) {
+        if (error?.code === 'NOT_FOUND' || error?.code === 'INVALID_PARAMS' || error?.code === 'NOT_AVAILABLE') return invokeError(request, error.code, error.message);
+        throw error;
+      }
     }
 
     if (channel === 'local-db:messages:list') {
@@ -1081,6 +1106,12 @@ export function createChannelRouter({
       const sessionId = String(args[0] ?? '');
       if (sessionId === '') return invokeError(request, 'BAD_REQUEST', `${channel} needs a session id`);
 
+      if (typeof capabilities.inputDelivery === 'function') {
+        let delivery;
+        try { delivery = capabilities.inputDelivery(); } catch (error) { return deliveryReply(request, () => { throw error; }); }
+        if (delivery) return deliveryReply(request, () => channel === 'maker:input:steer' ? delivery.steer(sessionId, args[1], args[2] ?? {}) : delivery.accept(sessionId, args[1], args[2] ?? {}));
+      }
+
       // A `steer` naming an item DSH already holds is a **promotion** of that
       // queued item, not a new message: the controller sends the queued row back
       // with `removeFromQueue`. Re-sending its text would duplicate it, which is
@@ -1288,6 +1319,19 @@ export function createChannelRouter({
       const control = capabilities.queueControl;
       const clientId = typeof args[1] === 'string' ? args[1] : (typeof args[1]?.clientId === 'string' ? args[1].clientId : null);
 
+      let durableQueue = null;
+      if (typeof capabilities.inputDelivery === 'function') {
+        try { durableQueue = capabilities.inputDelivery(); } catch (error) { return deliveryReply(request, () => { throw error; }); }
+      }
+      if (durableQueue && ['maker:input:remove', 'maker:input:clear-session', 'maker:input:update-text', 'maker:input:update-content'].includes(channel)) {
+        return deliveryReply(request, async () => {
+          const delivery = durableQueue;
+          if (channel === 'maker:input:clear-session') return delivery.clear(sessionId);
+          if (channel === 'maker:input:remove') return delivery.cancel(sessionId, clientId);
+          return delivery.edit(sessionId, clientId, args[2]);
+        });
+      }
+
       // Controller-owned queue UI state. The controller sets it here and reads it
       // back out of the projection, so it must be recorded rather than ignored.
       if (channel === 'maker:input:set-expanded') {
@@ -1318,7 +1362,7 @@ export function createChannelRouter({
         // is exactly what the controller asks for: it only ever sends
         // `keepQueue: true` (see `stopOptionsForProjection`).
         try {
-          control.cancel({ sessionId });
+          await control.cancel({ sessionId });
         } catch (error) {
           return invokeError(request, 'THREW', String(error?.message ?? error));
         }
@@ -1406,6 +1450,9 @@ export function createChannelRouter({
       const sessionId = String(args[0] ?? '');
       const clientId = typeof args[1] === 'string' ? args[1] : null;
       if (sessionId === '' || clientId === null) return invokeError(request, 'BAD_REQUEST', 'maker:input:move needs a session and an item id');
+      if (typeof capabilities.inputDelivery === 'function') {
+        try { if (capabilities.inputDelivery()) return invokeError(request, 'NOT_AVAILABLE', 'DSH has no public durable inbox reorder operation'); } catch (error) { return deliveryReply(request, () => { throw error; }); }
+      }
       // Reordering is presentation: DSH's inbox keeps its own order and a
       // reordered row would snap back on the next frame, so this Host records
       // the new order locally and says nothing it cannot keep.
@@ -1433,6 +1480,12 @@ export function createChannelRouter({
       const clientId = typeof args[1]?.clientId === 'string' && args[1].clientId !== ''
         ? args[1].clientId
         : (typeof args[2]?.clientId === 'string' && args[2].clientId !== '' ? args[2].clientId : null);
+      const capabilities = capabilitiesNow();
+      if (typeof capabilities.inputDelivery === 'function') {
+        let delivery;
+        try { delivery = capabilities.inputDelivery(); } catch (error) { return deliveryReply(request, () => { throw error; }); }
+        if (delivery) return deliveryReply(request, async () => { await delivery.accept(sessionId, { clientId: clientId ?? request.id, text: text ?? '', files: sendAttachments }, args[2] ?? {}); return { accepted: true }; });
+      }
       const sent = await send({
         sessionId,
         text: text ?? '',
@@ -1577,6 +1630,11 @@ export function createChannelRouter({
     if (channel === 'maker:input:get-projection') {
       const capabilities = capabilitiesNow();
       const sessionId = String(args[0] ?? '');
+      if (typeof capabilities.inputDelivery === 'function') {
+        let delivery;
+        try { delivery = capabilities.inputDelivery(); } catch (error) { return deliveryReply(request, () => { throw error; }); }
+        if (delivery) return deliveryReply(request, () => delivery.projection(sessionId, args[1]));
+      }
       // Read what DSH actually holds before falling back to the fold: a fold that
       // never heard a `queue` frame reports an empty queue, which is how the
       // controller came to keep a 队列中 row for a message the agent had answered.

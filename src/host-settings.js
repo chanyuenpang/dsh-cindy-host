@@ -5,7 +5,7 @@ export const SETTINGS_NAMESPACE = 'dsh-cindy-host';
 // `sessionFlags` is the one section a *controller* writes: DSH has no archived,
 // deleted or pinned session state, so the phone's 删除/归档/置顶 are this Host's own
 // bookkeeping and they have to survive a restart (see `session-flags.js`).
-export const DEFAULT_HOST_SETTINGS = Object.freeze({ transportEnabled: false, remoteControlEnabled: false, controllers: {}, deviceId: '', sessionFlags: {} });
+export const DEFAULT_HOST_SETTINGS = Object.freeze({ transportEnabled: false, remoteControlEnabled: false, controllers: {}, deviceId: '', deviceName: '', sessionFlags: {} });
 
 /**
  * The Host's own relay identity, when it has one.
@@ -22,9 +22,25 @@ export function rememberedDeviceId(value) {
   return typeof value?.deviceId === 'string' ? value.deviceId.trim() : '';
 }
 
+export const DEFAULT_HOST_DEVICE_NAME = 'DSH Host';
+export const MAX_HOST_DEVICE_NAME_LENGTH = 64;
+
+/** Empty is the legacy/default sentinel; explicit names are single-line labels. */
+export function validateHostDeviceName(value) {
+  if (typeof value !== 'string' || /[\u0000-\u001f\u007f-\u009f]/.test(value) ||
+      (value !== '' && (!value.trim() || value.trim().length > MAX_HOST_DEVICE_NAME_LENGTH))) {
+    throw new Error('Invalid DSH Cindy Host device name');
+  }
+}
+
+export function hostDeviceName(settings) {
+  return (typeof settings?.deviceName === 'string' && settings.deviceName.trim()) || DEFAULT_HOST_DEVICE_NAME;
+}
+
 export function validateHostSettings(value) {
   if (!value || typeof value !== 'object' || typeof value.transportEnabled !== 'boolean' || typeof value.remoteControlEnabled !== 'boolean' || !value.controllers || typeof value.controllers !== 'object') throw new Error('Invalid DSH Cindy Host settings');
   if (value.deviceId !== undefined && typeof value.deviceId !== 'string') throw new Error('Invalid DSH Cindy Host settings');
+  if (value.deviceName !== undefined) validateHostDeviceName(value.deviceName);
   for (const [id, entry] of Object.entries(value.controllers)) {
     if (!id || !entry || !['authorized', 'revoked'].includes(entry.state)) throw new Error('Invalid controller authorization');
   }

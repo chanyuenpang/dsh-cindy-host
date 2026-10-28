@@ -1,5 +1,8 @@
 import Schema from '@deepseek-ai/schemastery';
 import { createRequire } from 'node:module';
+import { homedir } from 'node:os';
+import { join } from 'node:path';
+import { createDshInputDeliveryBackend } from './dsh-input-delivery.js';
 import { DEFAULT_HOST_SETTINGS, SETTINGS_NAMESPACE, validateHostSettings } from './host-settings.js';
 import { DshHostSource } from './dsh-host-source.js';
 import { createSessionControllerSource } from './dsh-session-source.js';
@@ -55,6 +58,7 @@ const HostSettingsSchema = Schema.object({
   remoteControlEnabled: Schema.boolean().default(DEFAULT_HOST_SETTINGS.remoteControlEnabled),
   controllers: Schema.dict(ControllerSchema).default({}),
   deviceId: Schema.string().default(DEFAULT_HOST_SETTINGS.deviceId),
+  deviceName: Schema.string().default(DEFAULT_HOST_SETTINGS.deviceName),
   sessionFlags: Schema.dict(SessionFlagSchema).default({}),
 });
 
@@ -653,10 +657,21 @@ export function buildDshSource(ctx, serviceName, options = {}) {
      * (`readMessages.all`), so the two views can never disagree about what the session
      * contains — and neither of them re-reads the log to answer.
      */
+    const deliveryServices = { sessions: undefined, persistence: undefined, agents: undefined };
+    ctx.inject(['sessions', 'sessionPersistence', 'agents'], deliveryCtx => {
+      deliveryServices.sessions = deliveryCtx.get('sessions'); deliveryServices.persistence = deliveryCtx.get('sessionPersistence'); deliveryServices.agents = deliveryCtx.get('agents');
+      return () => { deliveryServices.sessions = undefined; deliveryServices.persistence = undefined; deliveryServices.agents = undefined; };
+    });
+    const inputDeliveryBackend = createDshInputDeliveryBackend({
+      getServices: () => ({ ...deliveryServices, fileSystem: ctx.get('fs'), fileUploads: controls.fileUploads }),
+      sessionController,
+      getSession: (sessionId) => sessionSource.getSession(sessionId),
+    });
+    const committedRows = (sessionId) => inputDeliveryBackend.available() ? inputDeliveryBackend.readRows(sessionId) : readMessages.all(sessionId);
     const historyView = readMessages === undefined
       ? undefined
       : createHistoryViewController({
-        rows: (sessionId) => readMessages.all(sessionId),
+        rows: committedRows,
         // The turn state has to be **wired** here; the controller's own default is `() => false`.
         // That default is why a running turn was never marked `isStreaming`, which cost two things
         // at once and looked like a client problem both times: the phone drew no live card, and
@@ -707,6 +722,8 @@ export function buildDshSource(ctx, serviceName, options = {}) {
     return {
       kind: 'session-controller',
       readMessages,
+      readAllMessages: readMessages === undefined ? undefined : committedRows,
+      inputDeliveryBackend,
       countMessages,
       historyView,
       // Reported through the status route: "the photo does not render" has three
@@ -1344,6 +1361,8 @@ export function buildDiagnostics({ runtime, sourceKind, seam, listingDiagnostics
 export function capabilityProvider(sources) {
   return {
     readMessages: sources.readMessages,
+    readAllMessages: sources.readAllMessages,
+    inputDeliveryBackend: sources.inputDeliveryBackend,
     countMessages: sources.countMessages,
     // The work-grouped history window the controller reaches for once it has seen
     // `history-view-v1`; without this forwarding the three channels would answer
@@ -1725,6 +1744,7 @@ export function apply(ctx, config) {
       // The controller's archive/delete/pin writes go straight to this plugin's
       // settings section, so the whole flag store reloads with the process.
       persistSessionFlags: sessionFlagsWriter(ctx.settings, settingsNamespace(SETTINGS_NAMESPACE)),
+      inputDeliveryDirectory: join(process.env.DSH_PROFILE_DIR || join(process.env.DSH_HOME || join(homedir(), '.dsh'), 'profiles', process.env.DSH_PROFILE || 'desktop'), 'state', 'dsh-cindy-host'),
     });
     // Settings can change while startHost awaits authentication. Reconcile the
     // latest snapshot after the runtime exists instead of dropping that update.

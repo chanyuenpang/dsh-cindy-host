@@ -60,6 +60,83 @@ async function runtimeWithSocket(options = {}) {
   return { runtime, socket };
 }
 
+test('device deletion removes only confirmed records and ignores stale owner completion', async () => {
+  let release;
+  const { runtime } = await runtimeWithSocket({
+    resolveSession: async () => ({ ok: true, session: { deviceId: 'host-handle', accessToken: 'test' } }),
+    listDevices: async () => ({ devices: [] }),
+    fetch: () => new Promise(resolve => { release = resolve; }),
+  });
+  try {
+    runtime.status.upsertDevice('old', { online: false });
+    const first = runtime.deleteDevice('old');
+    release({ ok: true, json: async () => ({ deviceId: 'old', deleted: true }) });
+    assert.equal((await first).ok, true);
+    assert.equal(runtime.getStatus().devices.some(row => row.deviceId === 'old'), false);
+    runtime.status.upsertDevice('old', { online: false });
+    const second = runtime.deleteDevice('old');
+    await runtime.stop();
+    runtime.status.upsertDevice('old', { online: false });
+    release({ ok: true, json: async () => ({ deviceId: 'old', deleted: true }) });
+    assert.equal((await second).ok, false);
+    assert.equal(runtime.getStatus().devices.some(row => row.deviceId === 'old'), true);
+  } finally { await runtime.stop(); }
+});
+
+test('custom names survive restart and sync without reconnecting', async () => {
+  let settings = { ...ON, deviceName: '工作站 🖥️', deviceId: 'host-handle' };
+  const sockets = [];
+  const patches = [];
+  const options = {
+    resolveSession: async () => ({ ok: true, session: { deviceId: 'host-handle', accessToken: 'private' } }),
+    openSocket: () => { const socket = new FakeSocket(); sockets.push(socket); return socket; },
+    heartbeatMs: 0,
+    listDevices: async () => ({ devices: [] }),
+    fetch: async (url, init) => {
+      patches.push({ url, name: JSON.parse(init.body).name });
+      return { ok: true, json: async () => ({ deviceId: 'host-handle', name: JSON.parse(init.body).name }) };
+    },
+  };
+  let runtime = await startHost(new FixtureDshSource(), settings, options);
+  try {
+    let socket = sockets.at(-1);
+    socket.emit('open');
+    assert.equal(socket.last('hello').payload.deviceName, settings.deviceName);
+    socket.frame({ v: 1, kind: 'hello-ack', payload: { deviceId: 'host-handle', userId: 'account' } });
+    await new Promise(setImmediate);
+    assert.equal(runtime.getStatus().host.deviceName, settings.deviceName);
+    assert.equal(runtime.getStatus().nameSync.state, 'synced');
+    const before = sockets.length;
+    settings = { ...settings, deviceName: '新主机' };
+    await runtime.updateSettings(settings);
+    await new Promise(setImmediate);
+    assert.equal(sockets.length, before, 'rename must not interrupt the relay');
+    assert.equal(socket.closed, false);
+    assert.equal(runtime.getStatus().host.deviceName, '新主机');
+    assert.equal(runtime.getStatus().host.deviceId, 'host-handle');
+    assert.equal(patches.at(-1).name, '新主机');
+    assert.match(patches.at(-1).url, /\/devices\/host-handle$/);
+    await runtime.stop();
+    runtime = await startHost(new FixtureDshSource(), settings, options);
+    socket = sockets.at(-1);
+    socket.emit('open');
+    assert.equal(socket.last('hello').payload.deviceName, '新主机');
+    assert.equal(runtime.getStatus().nameSync.state, 'pending');
+  } finally { await runtime.stop(); }
+});
+
+test('offline name edits do not authenticate or use the network', async () => {
+  const runtime = await startHost(new FixtureDshSource(), OFF, {
+    resolveSession: async () => { throw new Error('must not authenticate'); },
+    fetch: async () => { assert.fail('must not use network'); },
+  });
+  try {
+    await runtime.updateSettings({ ...OFF, deviceName: '离线主机' });
+    assert.deepEqual(runtime.getStatus().nameSync, { state: 'pending', name: '离线主机' });
+    assert.equal(runtime.getStatus().host, null);
+  } finally { await runtime.stop(); }
+});
+
 test('connects nothing while the phone switch is off', async () => {
   let opened = false;
   const runtime = await startHost(new FixtureDshSource(), OFF, {
@@ -159,6 +236,49 @@ test('announces controllability so the relay will route the phone, then links it
     await runtime.stop();
   }
 });
+
+for (const channel of ['maker:input:enqueue', 'maker:input:steer']) {
+  test(channel + ' cannot resurrect a queue spinner after durable consumption beat its ACK', async () => {
+    const source = new FixtureDshSource();
+    source.sessions = [{ id: 'mobile', title: 'Mobile', cwd: '/work', running: true }];
+    const socket = new FakeSocket();
+    let runtime;
+    runtime = await startHost(source, ON, {
+      resolveSession: async () => ({ ok: true, session: { deviceId: 'self' } }),
+      openSocket: () => socket, heartbeatMs: 0, listDevices: async () => ({ devices: [] }),
+      resolveCapabilities: () => ({
+        isSessionRunning: () => true,
+        readSessionState: async () => ({ inbox: { 'next-turn': [], 'next-step': [] } }),
+        sendMessage: async ({ sessionId, requestId }) => {
+          // The real plugin calls this when user/message carries the prompt rpcId.
+          // DSH can deliver that event before prompt() and the enqueue ACK return.
+          runtime.retireQueuedItem(sessionId, requestId);
+          return { ok: true };
+        },
+      }),
+    });
+    try {
+      socket.emit('open');
+      socket.frame({ v: 1, kind: 'hello-ack', payload: { deviceId: 'self', userId: 'account' } });
+      socket.frame({ v: 1, kind: 'invoke', id: 'seed', src: 'phone', payload: { channel: 'local-db:sessions:list', args: [] } });
+      await new Promise(setImmediate);
+      // Observe the session projection, exactly as the mobile session does.
+      socket.frame({ v: 1, kind: 'invoke', id: 'subscribe', src: 'phone', payload: { channel: 'device-link:subscribe', args: [{ topics: ['session:mobile'] }] } });
+      await new Promise(setImmediate);
+      socket.frame({ v: 1, kind: 'invoke', id: 'send', src: 'phone', payload: { channel, args: ['mobile', { clientId: 'followup', text: 'second message' }] } });
+      await new Promise(setImmediate);
+      const reply = socket.sent.find(frame => frame.kind === 'invoke-result' && frame.id === 'send');
+      assert.equal(reply.payload.ok, true);
+      if (channel.endsWith('enqueue')) assert.deepEqual(reply.payload.result.pendingQueue, [], 'consumed is not queued');
+      const projections = socket.sent.filter(frame => frame.kind === 'push' && frame.payload.channel === 'maker:input:projection');
+      assert.ok(projections.length > 0);
+      for (const frame of projections) {
+        assert.deepEqual(frame.payload.payload.pendingQueue, [], 'late ACK must not re-add a delivered message');
+        assert.deepEqual(frame.payload.payload.steeringQueueClientIds, [], 'mobile must not keep spinning on a consumed steer');
+      }
+    } finally { await runtime.stop(); }
+  });
+}
 
 test('serves an allowlisted invoke and links a listing-only controller', async () => {
   const { runtime, socket } = await runtimeWithSocket();

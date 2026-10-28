@@ -21,6 +21,9 @@ const DSH_MODEL = 'pi';
 const DSH_EFFORT = 'default';
 const DSH_PERMISSION_MODE = 'default';
 
+/** Bound recent durable-consumption evidence; this is not a second queue store. */
+export const RETIRED_INPUT_LIMIT = 2048;
+
 /**
  * The session's working directory, from whichever row shape was handed in.
  *
@@ -93,8 +96,10 @@ export function toQueuedRemoteMessage(item, session) {
     permissionMode: DSH_PERMISSION_MODE,
     workingDir,
     createOpts,
-    // The controller's validator requires a user-role chat message.
-    chatMessage: { role: 'user', clientId, content },
+    // This is a rendered ChatMessage, not the agent's raw SDK content blocks.
+    // Desktop promotes it directly into the transcript as the queue drains;
+    // its quote/navigation parsers require a string. Keep rich persistence above.
+    chatMessage: { role: 'user', clientId, content: text },
   };
 }
 
@@ -132,7 +137,7 @@ export function queuedRowFromController({ clientId, text, session }) {
     permissionMode: DSH_PERMISSION_MODE,
     workingDir,
     createOpts,
-    chatMessage: { role: 'user', clientId, content: [{ type: 'text', text: value }] },
+    chatMessage: { role: 'user', clientId, content: value },
   };
 }
 
@@ -145,6 +150,22 @@ export function createInputQueueTracker() {
   const queues = new Map();
   /** sessionId -> SessionJob[] */
   const jobs = new Map();
+  // Durable consumption can beat prompt acceptance/ACK and stale control reads.
+  // Keep proof long enough that those late observations cannot revive a spinner.
+  const retired = new Map();
+  const retirementKey = (sessionId, clientId) => JSON.stringify([sessionId, clientId]);
+  const isRetired = (sessionId, clientId) => retired.has(retirementKey(sessionId, clientId));
+  const itemRetired = (sessionId, item) => isRetired(sessionId,
+    typeof item?.rpcId === 'string' && item.rpcId !== '' ? item.rpcId : String(item?.id ?? ''));
+
+  function retire(sessionId, clientId) {
+    if (typeof sessionId !== 'string' || !sessionId || typeof clientId !== 'string' || !clientId) return;
+    const key = retirementKey(sessionId, clientId);
+    retired.delete(key);
+    retired.set(key, true);
+    while (retired.size > RETIRED_INPUT_LIMIT) retired.delete(retired.keys().next().value);
+    mirror(sessionId, clientId, { kind: 'remove' });
+  }
   /**
    * sessionId -> controller-owned queue UI state.
    *
@@ -230,7 +251,7 @@ export function createInputQueueTracker() {
   function markItem(sessionId, item, placement) {
     if (typeof sessionId !== 'string' || sessionId === '') return;
     const id = item?.id === undefined || item?.id === null ? null : String(item.id);
-    if (id === null) return;
+    if (id === null || itemRetired(sessionId, item)) return;
     const items = queues.get(sessionId) ?? [];
     const others = items.filter((entry) => String(entry?.id) !== id);
     queues.set(sessionId, [...others, { ...item, id, placement }]);
@@ -274,7 +295,8 @@ export function createInputQueueTracker() {
 
   /** Rebuild one session's queue state. */
   function setItems(sessionId, items) {
-    if (Array.isArray(items) && items.length > 0) queues.set(sessionId, items);
+    const pending = Array.isArray(items) ? items.filter((item) => !itemRetired(sessionId, item)) : [];
+    if (pending.length > 0) queues.set(sessionId, pending);
     else queues.delete(sessionId);
   }
 
@@ -291,7 +313,7 @@ export function createInputQueueTracker() {
       queues.clear();
       jobs.clear();
       for (const [sessionId, items] of Object.entries(frame.value?.queues ?? {})) {
-        if (Array.isArray(items)) queues.set(sessionId, items);
+        setItems(sessionId, items);
       }
       for (const [sessionId, entries] of Object.entries(frame.value?.jobs ?? {})) {
         if (Array.isArray(entries)) jobs.set(sessionId, entries);
@@ -340,7 +362,7 @@ export function createInputQueueTracker() {
     const seen = new Set();
     for (const item of source) {
       const row = toQueuedRemoteMessage(item, session);
-      if (row === null) continue;
+      if (row === null || isRetired(sessionId, row.clientId)) continue;
       seen.add(row.clientId);
       // DSH next-step (steering) is still an inbox wait, not a consumed message.
       // Cindy supports the same id in both fields: the body survives re-entry
@@ -348,7 +370,7 @@ export function createInputQueueTracker() {
       if (item?.placement === 'queued' || item?.placement === 'steering') pendingQueue.push(row);
       if (item?.placement === 'steering') steeringQueueClientIds.push(row.clientId);
     }
-    if (pending !== null && !seen.has(pending.clientId)) pendingQueue.push(pending);
+    if (pending !== null && !seen.has(pending.clientId) && !isRetired(sessionId, pending.clientId)) pendingQueue.push(pending);
 
     const state = uiFor(sessionId);
     return {
@@ -375,6 +397,7 @@ export function createInputQueueTracker() {
     queues.clear();
     jobs.clear();
     ui.clear();
+    retired.clear();
   }
 
   return {
@@ -383,6 +406,8 @@ export function createInputQueueTracker() {
     jobsFor,
     projectionFor,
     clear,
+    /** Only a durable message event is proof of consumption; cancellation is not. */
+    retire,
     /** Whether DSH is holding this item; decides steer-promotion vs a new send. */
     hasItem: (sessionId, itemId) => itemOf(sessionId, itemId) !== undefined,
     /**

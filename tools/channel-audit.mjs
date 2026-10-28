@@ -21,6 +21,7 @@ import { readFileSync, readdirSync } from 'node:fs';
 import path from 'node:path';
 import { SUPPORTED_CHANNELS } from '../src/cindy-channels.js';
 import { HOST_PUSH_CHANNELS } from '../src/host-push-channels.js';
+import { UNSUPPORTED_INVOKES, UNSENT_PUSHES } from './compat-boundaries-20261028.mjs';
 
 const args = process.argv.slice(2);
 const cindyIndex = args.indexOf('--cindy');
@@ -40,6 +41,7 @@ const INVOKE_POLICY = path.join(CINDY, 'packages/device-link/src/invokePolicy.ts
  * rather than rediscover it.
  */
 const DECLINED = [
+  ...[...UNSUPPORTED_INVOKES].map(([name, why]) => ({ match: channel => channel === name, why })),
   { match: (channel) => ['maker:model-favorites:get', 'maker:model-favorites:apply'].includes(channel), why: 'explicitly unavailable: this Host has no remote model-favorites store or synchronization API; it must not report a successful empty catalog', candidate: 'would require a persisted favorites store plus matching changed pushes' },
   { match: (channel) => channel === 'maker:predict-prompt', why: 'explicitly unavailable: optional next-prompt prediction has no DSH implementation; normal user sends remain independent', candidate: 'optional model-backed prompt prediction' },
   { match: (channel) => channel.startsWith('maker:schedule:') || channel.startsWith('maker:project-automation:'), why: 'schedule family — plan rule' },
@@ -365,6 +367,7 @@ if (open.length > 0) {
  * no closed sessions, no mutable provider registry, and a roster of exactly one harness.
  */
 const DECLINED_PUSH = [
+  ...[...UNSENT_PUSHES].map(([name, why]) => ({ match: channel => channel === name, why })),
   { match: (channel) => channel === 'maker:model-favorites:changed', why: 'no remote favorites store or mutation API is served, so this Host has no favorites change to announce' },
   { match: (channel) => channel.startsWith('usage:'), why: 'usage/account reads — plan rule' },
   { match: (channel) => /bot/.test(channel), why: 'bots family — plan rule' },
@@ -394,6 +397,7 @@ const DECLINED_PUSH = [
  * channel this Host *does* send.
  */
 const PUSH_CHANNEL_CONSTANTS = new Map([
+  ['PROJECT_ALIASES_CHANGED_CHANNEL', 'local-db:project-aliases:changed'],
   ['SESSION_ACTIVITY_CHANNEL', 'local-db:sessions:activity'],
   ['SESSION_SYNC_CHANNEL', 'maker:session-sync'],
   ['MAKER_EVENT_BATCH_CHANNEL', 'maker:event:batch'],
@@ -407,7 +411,10 @@ const PUSH_CHANNEL_CONSTANTS = new Map([
 function pushChannelsHandledByPhone(...sources) {
   const found = new Set();
   for (const source of sources) {
-    for (const match of source.matchAll(/(?:push\.)?channel === '([^']+)'/g)) found.add(match[1]);
+    for (const match of source.matchAll(/(?:push\.)?channel === '([^']+)'/g)) {
+      // `typeof channel === 'string'` validates a type; it is not an event name.
+      if (match[1].includes(':')) found.add(match[1]);
+    }
     for (const match of source.matchAll(/(?:push\.)?channel === ([A-Z][A-Z0-9_]+)/g)) {
       found.add(PUSH_CHANNEL_CONSTANTS.get(match[1]) ?? `<${match[1]}>`);
     }
