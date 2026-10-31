@@ -20,9 +20,9 @@ import {
 
 // `device-link:media:fetch` is how a controller sees a picture that lives on this machine
 // (an image the agent drew). The reference controlled end resolves the path, uploads to the
-// shared staging area and answers with the key; this Host is deliberately stricter about
-// *which* paths, because it is a process on somebody's desktop rather than an app with its
-// own cache directory.
+// shared staging area and answers with the key. Directory constraints are optional, as
+// in Cindy: when supplied they are enforced after realpath; otherwise absolute paths
+// still pass through the never-serve list and file/size checks.
 
 /** A filesystem double: canonical paths in, contents out. */
 function fakeFs(files) {
@@ -55,9 +55,11 @@ test('parses the url a chat image carries, and refuses what it cannot honour', (
   const constrained = parseMediaFetchRequest(`xdt-file://open?path=${encodeURIComponent('/w/a.png')}&baseDir=${encodeURIComponent('/w')}&maxBytes=1024`);
   assert.deepEqual(constrained, { ok: true, path: '/w/a.png', roots: ['/w'], maxBytes: 1024 });
 
-  // A *missing* root is refused here, unlike the desktop's "old controller" allowance:
-  // without one, any absolute path on this machine would be servable.
-  assert.deepEqual(parseMediaFetchRequest('xdt-file://open?path=%2Fetc%2Fpasswd'), { ok: false, reason: 'no-root' });
+  // Cindy's project-folder image export sends only path + version, without a root.
+  for (const path of ['/home/user/project/图 (1).png', 'G:\\work\\cat.png']) {
+    const url = `xdt-file://open?path=${encodeURIComponent(path)}&v=123`;
+    assert.deepEqual(parseMediaFetchRequest(url), { ok: true, path, roots: [], maxBytes: null });
+  }
   // Malformed constraints are refused, never silently dropped: a constraint that a typo can
   // remove is not a constraint.
   assert.deepEqual(parseMediaFetchRequest('xdt-file://open?path=%2Fw%2Fa&baseDir=relative'), { ok: false, reason: 'invalid-baseDir' });
@@ -110,6 +112,27 @@ test('a fetch stages the file and answers the key the controller downloads', asy
   assert.deepEqual(staged, [{ size: 4, ext: 'png', contentType: 'image/png' }]);
 });
 
+test('project-folder PNG export accepts Cindy rootless URLs without changing the bytes', async () => {
+  const bytes = Buffer.from('iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAQAAAC1HAwCAAAAC0lEQVR42mP8/x8AAwMCAO+jP1EAAAAASUVORK5CYII=', 'base64');
+  for (const path of ['/home/user/project/图 (1).png', 'G:\\work\\cat.png']) {
+    const uploads = [];
+    const fetcher = createLocalMediaFetcher({
+      ...fakeFs({ [path]: { bytes } }),
+      uploader: async (uploaded, options) => {
+        uploads.push({ uploaded, options });
+        return { ok: true, key: 'image-key', size: uploaded.length };
+      },
+    });
+    const url = `xdt-file://open?path=${encodeURIComponent(path)}&v=123`;
+    assert.deepEqual(await fetcher({ url }), {
+      ok: true, result: { ossKey: 'image-key', mimeType: 'image/png', size: bytes.length },
+    });
+    assert.deepEqual(uploads, [{ uploaded: bytes, options: { ext: 'png', contentType: 'image/png' } }]);
+    // The image viewer/thumbnail uses the same rootless reference.
+    assert.equal((await fetcher({ url, thumbnail: true })).ok, true);
+  }
+});
+
 test('a fetch refuses what is outside the named root, over the cap, or unreadable', async () => {
   const files = {
     'G:\\work': { bytes: Buffer.alloc(0), directory: true },
@@ -131,7 +154,15 @@ test('a fetch refuses what is outside the named root, over the cap, or unreadabl
   assert.equal((await fetcher(ask('G:\\work\\.env'))).code, 'FORBIDDEN', 'the never-serve list wins even inside the root');
   assert.equal((await fetcher(ask('G:\\work\\link.png'))).code, 'FORBIDDEN', 'a symlink out of the workspace is caught by realpath');
   assert.equal((await fetcher(ask('G:\\work\\big.png', 'G:\\somewhere-else'))).code, 'FORBIDDEN', 'a root that cannot resolve authorises nothing');
-  assert.equal((await fetcher({ url: 'xdt-file://open?path=%2Fetc%2Fpasswd' })).code, 'BAD_REQUEST', 'no root at all');
+  assert.equal((await fetcher({ url: 'xdt-file://open?path=%2Fetc%2Fpasswd' })).code, 'NOT_FOUND', 'a rootless request still resolves the file');
+  for (const [path, code] of [
+    ['G:\\work\\missing.png', 'NOT_FOUND'],
+    ['G:\\work\\dir', 'BAD_REQUEST'],
+    ['G:\\work\\big.png', 'BAD_REQUEST'],
+    ['G:\\work\\.env', 'FORBIDDEN'],
+  ]) {
+    assert.equal((await fetcher({ url: `xdt-file://open?path=${encodeURIComponent(path)}` })).code, code);
+  }
 
   // The requested cap is honoured when it is the smaller of the two.
   const capped = createLocalMediaFetcher({ ...fakeFs({ 'G:\\work': files['G:\\work'], 'G:\\work\\a.png': { bytes: Buffer.alloc(10) } }), uploader });
@@ -331,7 +362,8 @@ test('shared resolver realpaths both roots and targets and rejects sensitive/non
   assert.equal((await resolver(fileUrl())).ok, true, 'canonical root authorizes canonical target');
   assert.equal((await resolver(fileUrl('G:\\work\\escape'))).code, 'FORBIDDEN');
   assert.equal((await resolver(fileUrl('G:\\work\\secret'))).code, 'FORBIDDEN');
-  assert.equal((await resolver('xdt-file://open?path=G%3A%5Cwork%5Cfile.txt')).code, 'BAD_REQUEST');
+  assert.equal((await resolver('xdt-file://open?path=G%3A%5Cwork%5Cfile.txt')).ok, true, 'Cindy does not require a directory constraint');
+  assert.equal((await resolver(fileUrl().replace('workdir=', 'baseDir='))).ok, true, 'an optional baseDir is enforced too');
   assert.equal((await resolver(fileUrl('G:\\work\\file.txt', 'G:\\missing'))).code, 'FORBIDDEN');
   const nonregular = createLocalFileResolver({ ...metadataFs(0), stat: async () => ({ size: 0, isDirectory: () => false, isFile: () => false }) });
   assert.equal((await nonregular(fileUrl())).code, 'BAD_REQUEST', 'devices/FIFOs/sockets are not files');
@@ -363,9 +395,12 @@ test('prepareOnly inlines regular files including empty and exactly 64 KiB witho
     const path = join(root, `file-${size}.txt`);
     const bytes = Buffer.alloc(size, 42);
     await writeFile(path, bytes);
-    assert.deepEqual(await fetcher({ url: fileUrl(path, root), prepareOnly: true }), {
-      ok: true, result: { ossKey: '', size, mimeType: 'text/plain', inlineBase64: bytes.toString('base64') },
-    });
+    const rootless = `xdt-file://open?path=${encodeURIComponent(path)}`;
+    for (const url of [fileUrl(path, root), rootless]) {
+      assert.deepEqual(await fetcher({ url, prepareOnly: true }), {
+        ok: true, result: { ossKey: '', size, mimeType: 'text/plain', inlineBase64: bytes.toString('base64') },
+      });
+    }
   }
   assert.equal((await fetcher({ url: fileUrl(root, root), prepareOnly: true })).code, 'BAD_REQUEST');
 });

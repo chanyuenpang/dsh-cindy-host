@@ -88,7 +88,11 @@ export function publishLifecycle(ws, subscribers, item, record) {
  * @param item - one lifecycle item from the projection sink.
  * @returns the channel and payload, or null when the item says nothing about a turn.
  */
-/** Cindy status events require both the running flag and a displayable string. */
+/**
+ * Cindy's status bar requires both the running flag and a displayable status string.
+ * Omitting `status` leaves the renderer calling `.trim()` on `undefined`. Keep the
+ * event shape in one place so projection, turn-boundary, and re-link paths agree.
+ */
 export function runningStatusEvent(status = 'running') {
   return { type: 'status', data: { isRunning: true, status } };
 }

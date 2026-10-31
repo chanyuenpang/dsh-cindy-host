@@ -8,19 +8,14 @@
  * (`apps/desktop/src/main/device-link/mediaFetch.ts`: 解析本机媒体 → 上传 OSS → 返回引用):
  *
  * ```
- * request   { url: 'xdt-file://open?path=<abs>&workdir=<abs>&maxBytes=<n>', thumbnail?, skipCache?, prepareOnly? }
+ * request   { url: 'xdt-file://open?path=<abs>', thumbnail?, skipCache?, prepareOnly? }
  * response  { ossKey, mimeType, size }            // the controller presign-gets the key
  * ```
  *
- * Two things are deliberately **stricter** than the reference, because this Host is a
- * process on somebody's desktop rather than an app with its own cache directory:
- *
- * 1. **A containment root is mandatory.** The desktop treats a missing `baseDir` as "no
- *    constraint" for old controllers; here a request that names no root (neither `baseDir`
- *    nor the `workdir` a chat image carries) is refused. Without that, any absolute path
- *    on this machine would be servable by anyone who can reach the Host.
- * 2. **Realpath on both sides.** A symlink inside the workspace must not become a way out
- *    of it, and `/tmp` vs `/private/tmp` must not make a legitimate file look outside.
+ * Directory constraints are optional, matching Cindy's native media-fetch contract.
+ * A plain absolute `path` is accepted; when `baseDir` or `workdir` is supplied, both
+ * the file and the root are realpath'd before containment checks. This prevents a
+ * symlink from escaping a supplied root and handles `/tmp` vs `/private/tmp` aliases.
  *
  * Malformed constraint parameters are refused rather than ignored: silently degrading to
  * "unconstrained" is how a constraint gets removed by a typo.
@@ -266,7 +261,6 @@ export function parseMediaFetchRequest(url) {
     if (value.trim() === '' || !isAbsoluteMediaPath(value)) return { ok: false, reason: `invalid-${key}` };
     roots.push(value);
   }
-  if (roots.length === 0) return { ok: false, reason: 'no-root' };
 
   let maxBytes = null;
   const rawMaxBytes = parsed.searchParams.get('maxBytes');
@@ -316,7 +310,7 @@ export function createLocalFileResolver({
         // A root that does not resolve cannot authorise anything; the others still can.
       }
     }
-    if (allowedRoots.length === 0 || !allowedRoots.some((root) => isInsideDirectory(real, root))) {
+    if (request.roots.length > 0 && !allowedRoots.some((root) => isInsideDirectory(real, root))) {
       return { ok: false, code: 'FORBIDDEN', message: 'the requested file is outside the directory the controller named' };
     }
     if (isBlockedMediaPath(real, blocked)) {

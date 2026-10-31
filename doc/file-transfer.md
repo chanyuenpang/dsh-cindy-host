@@ -14,7 +14,7 @@ DSH Host 对接 Cindy 已有 `device-link:file-peer` / `files-v1` 协议。手�
 ## 数据流与安全
 
 1. 手机 `remote-op caps.fileRead` → `fileUrl`；Host 只接受本机绝对 workdir 和相对 relPath。
-2. `media:fetch prepareOnly` 与 peer `open` 共用本地文件 resolver：必需目录根、realpath containment、敏感路径 denylist、常规文件校验；URL 的 maxBytes 只能收紧上限。
+2. `media:fetch prepareOnly` 与 peer `open` 共用本地文件 resolver：与 Cindy 原生取件一致，目录约束可选；提供 `baseDir` / `workdir` 时执行 realpath containment，未提供时接受绝对文件路径。敏感路径 denylist、常规文件校验仍生效；URL 的 maxBytes 只能收紧上限。
 3. Relay 认证的 `Envelope.src` 是唯一设备身份。`caps/offer/open/close` 仅传授权和信令；文件内容走 `files-v1` 的可靠有序二进制块。
 4. Host 用连接绑定的随机 ticket，严格连续 offset 与每次 16 块信用。每块最多 16 KiB，按文件句柄读取，零长度二进制块作为 EOF；不将大文件整份读进内存。
 5. 源文件 stat/句柄身份变化会终止；这是元数据变更检测，**不是密码学内容快照**。单连接同时一个文件，全 Host 最多四连接，60 秒无进展关闭。

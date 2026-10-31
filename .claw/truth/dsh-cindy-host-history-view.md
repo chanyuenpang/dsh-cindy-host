@@ -1,4 +1,4 @@
-# Work-grouped history view channels
+﻿# Work-grouped history view channels
 
 <!-- state: current -->
 ## Current behavior

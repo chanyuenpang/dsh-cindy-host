@@ -80,8 +80,19 @@ form, so an unavailable codec or a failed render is not an error. The whole fetc
 `MEDIA_FETCH_MAX_BYTES = 25 MiB` (a controller-supplied `maxBytes` is clamped by
 `Math.min(request.maxBytes, maxBytes)`), which means the 48 MiB downsample ceiling is normally
 unreachable — a request that large is refused before any render. `thumbnail: false` keeps the
-pre-existing behaviour (a staged key over the original bytes); the path is also refused when it
-is outside a directory root the controller named (`FORBIDDEN`) or is on the never-serve list.
+pre-existing behaviour (a staged key over the original bytes). Directory constraints are optional, matching Cindy's native media-fetch contract: an absolute path is accepted without `baseDir`/`workdir`; when either is supplied, realpath containment is enforced and malformed constraints are rejected. This optionality does not replace the separate authenticated-controller policy; never-serve paths, regular-file checks, and the 25 MiB media-fetch limit still apply. `test/host-media-fetch.test.js` covers rootless PNG bytes and constrained/unconstrained resolution.
+
+## Desktop/mobile session compatibility
+
+- `local-db:sessions:list(limit, status, { includePinned })` returns only the requested active/archived bucket, applies the limit, appends pinned rows outside the recent window, and excludes deleted rows. Sessions without a real non-empty title are absent from discovery, while exact `sessions:get` still addresses an untitled draft before its first prompt.
+- `local-db:sessions:patch-meta` treats deletion of a missing source session as successful only for a pure deletion metadata patch (`status: 'deleted'`, optionally with `pinnedAt`): after flags persist and the session-row read succeeds, an absent row is acknowledged with `{ id, ...writtenFields }`. This makes repeated deletion idempotent without fabricating a complete session. Persistence/read failures still fail; absent-session archive, restore, pin, rename, or mixed edits remain `NOT_FOUND`.
+- Project grouping evidence is exact transcript-derived `_count.messages` plus first durable `userSendAt`, warmed in bounded batches and invalidated by live events. Unknown evidence remains null; the Host never fabricates activity to force grouping.
+- Ordinary assistant/user/reasoning text crosses as a string; objects are reserved for attachments and tool structures. This keeps Cindy desktop from rendering `{"text":…}` literally while mobile continues to normalize both shapes.
+- **Queued UI rows separate display text from persisted SDK content.** In `src/host-input-queue.js`, both `toQueuedRemoteMessage` and `queuedRowFromController` put the already-flattened string in `chatMessage.content`, while `persistedContent` retains the serialized content blocks. Cindy desktop promotes the queue's `chatMessage` directly into the transcript; its quote/navigation text helper calls `.split` on the content string, so an array here causes a renderer `TypeError`. This is a confirmed contract failure and renderer error path, not proof by itself of an Electron main-process crash. `test/host-input-queue.test.js` covers the builders and queue projection contract.
+- **Retire consumed queue entries within the runtime fold.** DSH's formal user-message event can prove a queued prompt was consumed before the enqueue/steer request returns. A remove-only retirement loses that proof if the queue row has not arrived yet; a later ACK or stale baseline/inbox can then re-create the same client ID as pending/steering. The tracker now records consumed `(sessionId, clientId)` keys in a bounded 2,048-entry in-memory map, retaining the most recently retired keys; it filters them from mark, baseline/queue/adopt, authoritative inbox and pending-ACK projections. This is not a persistent queue or cross-restart deduplication ledger. Cancellation/UI deletion is not consumption; real unconsumed queue items remain visible. `src/host.js` wires formal-message retirement and clears the tracker on runtime teardown.
+- **Current durable input delivery and queue confirmation support the latest Cindy flow.** Host 0.1.27 added a transactional per-input delivery owner: complete replayable payload is persisted before ACK; `inputDeliveryVersion: 1`, per-`clientId` receipts, clear boundaries, cancellation and real persisted-history lookup are emitted from durable evidence, not inferred from DSH prompt admission. Same-session admission/cancel/clear serialize, recovery uses DSH inbox/history evidence, and the implementation does not claim exactly-once external side effects. Host 0.1.28 fixed the subsequent busy-queue confirmation defect: an actually pending DSH inbox occurrence remains in `pendingQueue` across enqueue ACK, pushes and polling until claim/consumption evidence changes it; a stale/empty mirror must not hide it. Real DSH busy-session and actual Android projection/ACK-epoch tests passed, with no duplicate user rows. After 0.1.28 activation the user confirmed phone and desktop queue behavior was normal. 0.1.29 is the current published source/test synchronization release with business logic unchanged from 0.1.28; it was not restarted into production, so the currently verified production runtime remains 0.1.28. Physical weak-network reconnect was not separately tested. See `.release/ack-0.1.28/package/src/host-input-delivery.js`, `.release/ack-0.1.28/package/src/host-input-queue.js`, `.release/ack-0.1.28/package/src/cindy-channels.js`, tests `latest-mobile-outbox`, `host-delivery-runtime`, `host-delivery-crash`, and `native-busy-queue-ack`, and [0.1.28 release evidence](<.release/ack-0.1.28/release-evidence.json>).
+- Every live `maker:event` status has both `isRunning:true` and a non-empty Cindy status string (`running` or `waiting on input`); a missing string is a protocol violation because the desktop status bar normalizes it with `.trim()`.
+- Approval and `ask_user_question` use one Host pending registry but fan out to Cindy and the local DSH UI. The first valid answer settles atomically, the losing surface is aborted/dismissed, and a late answer is rejected. A bare `Promise.race` without loser cancellation is forbidden.
 
 Pitfalls:
 
@@ -99,6 +110,14 @@ Code anchors:
 - `src/host-media-fetch.js` (`THUMBNAILABLE_MIMES`, `resolveThumbnailCodec`,
   `MEDIA_FETCH_MAX_BYTES`, `THUMBNAIL_*`, `INLINE_ORIGINAL_MAX_BYTES`, `STAGING_CACHE_*`)
 - `src/cindy-channels.js` (`device-link:media:fetch` branch, `skipCache` passthrough)
+- `src/host-input-queue.js` (`createInputQueueTracker`, retirement key/cap, queue filtering and projection)
+- `src/host.js` (`retireQueuedItem` on formal durable-message evidence; tracker teardown)
+- `.release/ack-0.1.28/package/src/host-input-delivery.js` (durable delivery coordinator)
+- `.release/ack-0.1.28/package/src/host-input-queue.js` (actual inbox projection)
+- `.release/ack-0.1.28/package/src/cindy-channels.js` (`around-client-id` and delivery protocol channels)
+- `test/host-input-queue.test.js` (string content, late ACK/snapshot filtering, session isolation, cleanup and capacity boundaries)
+- `test/host.test.js` (runtime enqueue/steer delivery ordering and stale-ACK integration regression)
+- `.release/ack-0.1.28/package/test/latest-mobile-outbox.test.js`, `host-delivery-runtime.test.js`, `host-delivery-crash.test.js`, and `native-busy-queue-ack.test.js` (latest outbox, persistence/recovery and busy queue caller-driven evidence)
 - `doc/cindy-phone-link.md` (the four questions with their Cindy source anchors)
 - Cindy checkout cited above: `packages/device-link-protocol/src/protocol.ts`,
   `packages/device-link/src/protocol.ts`, `.../src/client.ts`,
@@ -110,6 +129,20 @@ Verification rules:
 - `test/host.test.js` asserts `hello` declares `remoteControlEnabled` (including
   revoked/disabled variants) and that `presence-changed` alone leaves the state at
   `waiting`.
+- `test/host-input-queue.test.js` asserts both queue-row builders emit string
+  `chatMessage.content` and that baseline/re-entry projections remain renderable,
+  including empty text. It also covers consumed-key filtering across late ACKs and
+  stale snapshots, session isolation, cleanup, and the 2,048-entry bound.
+- `test/host.test.js` exercises real Host runtime ordering for enqueue and steering,
+  including durable consumption before ACK and verifies that the late ACK does not
+  restore the delivered row.
+- The immutable 0.1.28 release suite covers latest mobile outbox semantics, durable
+  owner/crash recovery, and the native busy-queue ACK race; a real DSH busy agent
+  retained the pending inbox item through ACK, pushes, and polling. The user then
+  confirmed phone and desktop behavior after 0.1.28 activation. This does not claim
+  physical weak-network reconnection was tested or that this proves every past
+  incident had a single cause; 0.1.29 source/repository publication did not restart
+  production, so runtime activation evidence is for 0.1.28.
 - Live check used for this Host: `hello-ack` returned a real `deviceId` and `userId`,
   and the account's device directory resolved real names/platforms
   (`<phone>`/android, `YOP`/win32).
@@ -127,3 +160,29 @@ dropped the QR requirement explicitly, and the bundle was built to render no QR 
 all rather than inventing a payload Cindy cannot consume. The reversal is retained
 because reader-facing docs and earlier plans still describe the QR as an open feature;
 the current bundle has no QR surface.
+
+<!-- dated: 2026-10-28 -->
+### Durable mobile delivery and busy-queue confirmation
+
+The 0.1.26 release rejected the latest Cindy durable-outbox history-confirmation call.
+0.1.27 added transactional durable delivery and real clientId history lookup. User
+acceptance then exposed a separate busy-queue projection race in which an empty mirror
+could erase a still-pending DSH inbox item. 0.1.28 corrected that projection using the
+real inbox occurrence and native Android ACK epoch behavior; a real busy DSH session and
+automated mobile/desktop paths passed, and the user confirmed both phone and desktop
+queue behavior after 0.1.28 activation. 0.1.29 published the synchronized source/tests
+without changing the 0.1.28 business logic; production remained loaded on 0.1.28. Physical
+weak-network reconnect remains unverified.
+
+<!-- dated: 2026-10-29 -->
+### Make media-fetch directory constraints optional
+
+The Host previously rejected an absolute media path unless the request also named
+`baseDir` or `workdir`, returning `no-root`. That Host-added requirement was removed
+to match Cindy's native contract: a rootless absolute path is accepted; a supplied
+root still receives realpath containment checks, and malformed constraint values are
+refused. The change addresses the project-folder PNG export compatibility failure
+without changing the separate authenticated-controller policy or other file checks.
+Regression coverage in `test/host-media-fetch.test.js` includes rootless PNG byte
+preservation and both rootless and constrained resolver paths. Deployment and Linux
+phone end-to-end acceptance remain unverified.

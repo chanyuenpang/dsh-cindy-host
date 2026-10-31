@@ -656,6 +656,15 @@ test('a device the relay calls offline keeps its subscriptions, and is told the 
       [],
       'a live turn is never announced as done',
     );
+    const runningStatus = socket.sent.findLast((frame) => frame.kind === 'push'
+      && frame.payload.channel === 'maker:event'
+      && frame.payload.payload.sessionId === 'dsh-host-demo'
+      && frame.payload.payload.event?.type === 'status');
+    assert.deepEqual(
+      runningStatus.payload.payload.event.data,
+      { isRunning: true, status: 'running' },
+      'a re-linked Cindy renderer always receives the display status it normalizes',
+    );
   } finally {
     await runtime.stop();
   }
