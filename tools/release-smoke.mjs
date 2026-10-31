@@ -22,7 +22,10 @@ check('provider:list remains supported, unlike the obsolete legacy refusal asser
 const projection = await call('maker:input:get-projection', ['release-smoke-empty']);
 check('unknown session or unverified identity cannot fabricate durable input ownership', () => {
   assert.equal(projection.ok, false);
-  assert.ok(['NOT_FOUND', 'NOT_AVAILABLE'].includes(projection.error.code));
+  // NOT_FOUND: the host is authenticated and the session id is unknown.
+  // DELIVERY_NOT_AVAILABLE / NOT_AVAILABLE: the host has no verified account yet, so it
+  //   cannot own durable input either. Both are refusals; neither invents ownership.
+  assert.ok(['NOT_FOUND', 'NOT_AVAILABLE', 'DELIVERY_NOT_AVAILABLE'].includes(projection.error.code));
 });
 for (const channel of ['maker:input:enqueue', 'maker:input:steer']) {
   const answer = await call(channel, []);
