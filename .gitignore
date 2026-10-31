@@ -9,9 +9,9 @@ node_modules/
 # the sandbox DSH home: it carries its own credentials and session storage
 .sandbox/
 
-# claw runtime state. The durable project memory under .claw/{tasks,adr,truth}
-# and .claw/project.json IS committed; the daemon's logs, runtime dir and its
-# sqlite memory are not (binary, churning, machine-local).
+# claw runtime state: the daemon's logs, runtime dir and sqlite memory are binary,
+# churning and machine-local. The project memory itself (.claw/project.json,
+# .claw/adr, .claw/truth) is committed — see the claw-kit block below.
 .claw/runtime/
 .claw/logs/
 .claw/memory.sqlite
@@ -39,10 +39,6 @@ acceptance-*.log
 Thumbs.db
 *.tmp
 
-# claw per-task runtime bookkeeping (the plan.json beside it is the durable record)
-.claw/tasks/**/.runtime/
-
-
 # npm pack 产物（构建物，不入库）
 *.tgz
 .gitnexus
@@ -51,11 +47,11 @@ Thumbs.db
 artifacts/
 
 # claw-kit
-.claw/*
+# .claw 整体入库（project.json / adr / truth 是项目记忆，见 doc/releasing.md）。
+# 例外只有三类：任务账本（tasks 及 retention 转出的 archive/tasks）、
+# 守护进程状态（上方 runtime/logs/sqlite）、个人配置层 project-override.json。
 .claw/tasks/
-!.claw/project.json
-!.claw/truth/
-!.claw/truth/**
+.claw/archive/tasks/
 .claw/project-override.json
 
 # Local release validation may contain private profiles and credentials.

@@ -52,7 +52,8 @@ claw_run plan.done     { retrospective, key_decisions, what_worked, issues, foll
    本身不接受结论字段——结论写在消息里。
 2. **plan.start 的 `acceptance` 就是发布的验收标准**，发布时逐条对照，不凭感觉。
 3. **计划文件不在仓库里**（写在 `~/.claw/runtime/sessions/<session>/tasks/...`）；仓库里的
-   `.claw/{truth,adr,tasks}` 才是要随代码发布的**项目记忆**。发布前确认：本轮新增的事实进了
+   `.claw/{truth,adr}` 与 `.claw/project.json` 才是要随代码发布的**项目记忆**（`.claw/tasks/`
+   是"这次怎么做"的过程账本，已 ignore）。发布前确认：本轮新增的事实进了
    `.claw/truth/*.md` 的 `<!-- state: current -->` 段，新增的**决策**进了 `.claw/adr/*.md`（含
    `Decision evolution` 段，写清"当初为什么这么定、后来为什么改"）。
 
