@@ -1,9 +1,9 @@
-﻿# DSH Cindy Host: runtime and settings card contract
+# DSH Cindy Host: runtime and settings card contract
 
 <!-- state: current -->
 ## Current behavior
 
-`dsh-cindy-host` (npm package and DSH bundle name `dsh-cindy-host`, current published release `0.1.29`) is the production DSH
+`dsh-cindy-host` (npm package and DSH bundle name `dsh-cindy-host`, current published release `0.1.31`) is the production DSH
 plugin bundle that mounts the 「Cindy 手机连接」 page in Settings and lets Cindy desktop and mobile clients reach this Host. The Host is the only truth
 for connection state: the card writes settings and renders whatever the Host's
 `status` answer contains.
@@ -137,8 +137,41 @@ Failure containment and observability:
 
 ## Distribution
 
-- **0.1.29 is the current published registry version** of production package `dsh-cindy-host`, from Git commit `4ad3bc320bb02020cfab7875adb8b98579ed633e`; npm latest SHA-1 is `e831361a8d7158e844ffff42c0fd56e29e5589d2`. The GitHub release asset SHA-256 is `f317806c192ce60e8961731d6b4f7b297659199e3938973e00dbc0182e0cab3b`. This release synchronizes the already-verified 0.1.28 runtime business logic with reproducible source/tests and lock data; it did not change that logic. The release run recorded 886 tests passing, 3 skipped, 0 failed. See `.release/repository-0.1.29/release-result.json`.
-- **The running desktop profile remains on 0.1.28**, which had been installed and verified loaded; 0.1.29 was not installed into/restarted on the production profile (`productionRestarted: false`). The 0.1.28 runtime reported `inputDeliveryReady: true`, delivery version 1, connected, zero handler errors, and no last delivery error. After activation the user confirmed the phone and desktop queue behavior normal. Automation covers reconnect/replay, but physical weak-network reconnection was not separately tested. See `.release/ack-0.1.28/release-evidence.json` and [DeviceLink protocol Truth](<.claw/truth/dsh-cindy-host-device-link-protocol.md>). The inherited DSH SDK Zod advisory remains unresolved; no forced SDK upgrade was made.
+- **0.1.31 is the current published registry version** of production package `dsh-cindy-host`
+  (tag `v0.1.31` → commit `828d287`, release commit on top of the origin/main merge `4e8c867`;
+  the docs follow-up `2d335c8` and everything after it stay outside the published `files`
+  whitelist, so the tag was not moved). npm `latest` SHA-1 is
+  `2177efc6cad76544cc70abc4c473980a2741e59f`, integrity
+  `sha512-KjB0/ZB+mtympckPoBbDlTqjWmieyulx7DNBK9Xl8eontfdUbuvtFlK3OSzX8ICTYCveBkUGfQgL9MYzv/FRWA==`,
+  67 files / 254.9 kB packed. It absorbs origin/main's rootless media-fetch containment and
+  targets the verified DSH `0.2.1-rc.5` service contracts (peers also accept `0.2.1-rc.3` /
+  `0.2.1-rc.4`). Release gates: 924 tests / 921 pass / 3 skipped / 0 fail, `audit:channels`
+  `unclassified: 0`. Post-merge acceptance was 72/80, with the **same 8 failures before and
+  after** the merge (both runs on the expired sandbox Cindy login plus stale expectations) —
+  zero regression, and not a clean pass.
+- **0.1.31 is installed in the production `desktop` profile but not yet activated.** The
+  profile dependency moved from `file:G:/Projects/DSH-cindy-host/dsh-cindy-host-0.1.30.tgz` to
+  registry `0.1.31` (lock integrity equals npm `latest` above). Installing does **not** reload
+  a running process: the instance on port 21398 kept reporting `pluginVersion: 0.1.30`,
+  `state: connected`, zero handler errors until the user restarts DeepSeek Harness by hand —
+  they chose to defer that restart rather than drop the conversation it was hosting. Verify
+  after restart with `GET http://127.0.0.1:21398/api/dsh-cindy-host/status` →
+  `pluginVersion: 0.1.31`. Rollback is one command: `dsh plugin --profile desktop add
+  dsh-cindy-host@0.1.30` (the tarball is still in the repo root), and the pre-install
+  `package.json` / `pnpm-lock.yaml` are kept in
+  `~/.dsh/profiles/desktop/_backup-before-0131-20261031-231829/`.
+  A clean-registry install into a throwaway `DSH_HOME` had already proven the package itself
+  (`/status` → `200 installed=true pluginVersion=0.1.31`, boot payload serving
+  `dsh-cindy-host/client.js`); the sandbox on 3081 runs 0.1.31 too.
+- **Installing a newer release is not activating it, and "installed" is the wrong word for the
+  running instance.** Earlier releases recorded exactly this gap in the opposite direction: the
+  running desktop profile stayed on 0.1.28 while 0.1.29 was published (`productionRestarted:
+  false`), and the 0.1.26 state before that was only confirmed loaded after a manual restart.
+  The 0.1.28 runtime reported `inputDeliveryReady: true`, delivery version 1, connected, zero
+  handler errors, and no last delivery error; the user confirmed the phone and desktop queue
+  behavior normal after that restart. See `.release/ack-0.1.28/release-evidence.json` and
+  [DeviceLink protocol Truth](<.claw/truth/dsh-cindy-host-device-link-protocol.md>). The
+  inherited DSH SDK Zod advisory remains unresolved; no forced SDK upgrade was made.
 - Historical 0.1.26 state: after manual restart, the desktop profile loaded 0.1.26 and was connected with zero handler errors. A later compatibility review found the default mobile durable-outbox confirmation route was rejected; 0.1.27/0.1.28 subsequently addressed the history and busy-queue gaps. See the dated evolution in [DeviceLink protocol Truth](<.claw/truth/dsh-cindy-host-device-link-protocol.md>).
 - The 2026-10-14 installation used `plugin_manager` to install the exact published 0.1.23 tarball while registry propagation was delayed. Follow-up inspection confirmed the plugin enabled and version 0.1.23 installed; installed router SHA-256 matched production source. The installer reported a timeout after pnpm completed, so this does **not** prove live activation. The user chose a later manual restart; desktop activation and Cindy mobile end-to-end verification remain pending until after that restart.
 - Release validation was deliberately scoped and user-approved: production worktree commit `5effc18` / tag `v0.1.23`; 770 unit tests passed with 3 skipped, with two skipped real-client contract tests rerun successfully; channel audit 54 served / 142 declined / 0 unclassified; clean isolated DSH mount and repeated missing-delete success over authenticated HTTP. Legacy broad acceptance was 67/77 and is **not** a release-green result; mobile end-to-end remains pending. Registry readback matched the final tarball integrity `sha512-rFu1LnLEQPQWOcz3ToZ+zHLlpv0ncirtxc1tlSu84YU4KStdgoF70csJtwBuj+PHvyTJ5cvxIpSeojv98np2lA==`.
