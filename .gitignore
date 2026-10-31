@@ -46,13 +46,29 @@ Thumbs.db
 # 本地打出来的安装包与探针产物（77MB 级二进制，绝不入库）
 artifacts/
 
+# Local release validation may contain private profiles and credentials.
+.release/
+
+# claw-kit 会逐字检查下面这 6 行（首行就是 "# claw-kit"），缺了它就再追加一份，
+# 而追加的那份会把 .claw 重新变成"全部忽略"（2026-10-31 发生过一次）。
+# 所以：块本身一个字符都不许改，本项目的策略写在块之后。
 # claw-kit
-# .claw 整体入库（project.json / adr / truth 是项目记忆，见 doc/releasing.md）。
-# 例外只有三类：任务账本（tasks 及 retention 转出的 archive/tasks）、
-# 守护进程状态（上方 runtime/logs/sqlite）、个人配置层 project-override.json。
+.claw/*
+!.claw/project.json
+!.claw/truth/
+!.claw/truth/**
+.claw/project-override.json
+
+# 本项目的策略，必须写在上面的块之后（gitignore 末条匹配生效）：
+# .claw 是随代码入库的项目记忆（见 doc/releasing.md），只有任务账本和
+# 机器本地状态不入库。
+!.claw/
+!.claw/**
 .claw/tasks/
 .claw/archive/tasks/
 .claw/project-override.json
-
-# Local release validation may contain private profiles and credentials.
-.release/
+.claw/runtime/
+.claw/logs/
+.claw/memory.sqlite
+.claw/memory.sqlite-shm
+.claw/memory.sqlite-wal
