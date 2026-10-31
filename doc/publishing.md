@@ -157,7 +157,9 @@ dsh plugin --profile <profile> add dsh-cindy-host@<version>
 
 **0.1.2 的修法**：把 `settingsNamespace` 内联进 `src/dsh-plugin.js`（它的实现只是个 brand：
 校验 `/^[a-z][a-z0-9-]*$/` 后原样返回字符串），DSH 的包全部改 `peerDependencies`，
-`dsh-host-apiproxy` 另标 `optional`。修完的实测（全新 `DSH_HOME` + `--from-default-profile web`）：
+`dsh-host-apiproxy` 另标 `optional`（这一条后来被 DSH 0.2 推翻，见本节末的教训条目与 ADR 0010：
+该包现在既不在 `dependencies`/`optionalDependencies`，**也不在 `peerDependencies`**，只留惰性
+`require` 的降级分支）。修完的实测（全新 `DSH_HOME` + `--from-default-profile web`）：
 
 ```
 add exit=0；profile-local @deepseek-ai = 0
@@ -171,7 +173,11 @@ dsh web: http://127.0.0.1:3095/?token=…
 - 失败栈里出现别人的包，**先问"这个包是从哪解析来的、是哪一代"**，再问"谁的锅"。我们当时只看了
   包名，就把它判给了 DSH。
 - `optionalDependencies` **不是**"可以不装"：pnpm 默认会装。想表达"宿主有就用、没有就算了"，
-  正确写法是 `peerDependencies` + `peerDependenciesMeta.optional`。
+  一般写法是 `peerDependencies` + `peerDependenciesMeta.optional`——**但对 `@deepseek-ai/*` 不适用**：
+  0.2 的 `evaluatePluginCompatibility` 遍历 `peerDependencies` 的每个键、**不看**
+  `peerDependenciesMeta`，所以只要包名在 peers 里，安装就会被拒、启动时 bundle 被静默跳过。
+  DSH 自己的包要么真的需要（写进 peers），要么这个键根本别出现，靠惰性 `require` + 失败降级
+  来表达"可选"（见 `package.json` 的 `//peerDependenciesMeta` 说明与 ADR 0010 的 Decision evolution）。
 - 一个**只在一个方向成立的现象**（"`file:` 装法坏、`link:` 装法好"）要当心：这里的真变量不是
   安装形式，而是 pnpm 有没有**真的**把依赖图装进 profile。第一次改回 `link:` 时 pnpm 打了
   `resolved 71, reused 1, added 0`（什么也没干），所以那次"好"是假象。

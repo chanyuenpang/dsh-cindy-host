@@ -91,3 +91,35 @@ Two diagnostics made this hard to see, and both are worth keeping:
 - The plugin owns three lines of a DSH helper now. It is a brand with a pattern, and the pattern
   is the contract; if DSH's pattern changes, `test/host-settings.test.js` and the settings
   registration are where it will show.
+
+## Decision evolution
+
+<!-- dated: 2026-09-30 -->
+### `dsh-host-apiproxy` left `peerDependencies` entirely, so "declare it optional" stopped being the rule
+
+Decision 1 said the apiproxy package is "additionally `peerDependenciesMeta.optional: true`",
+and that was right for the host generation it was written against. DSH 0.2 deleted the package,
+and declaring it at all became actively harmful. `unmetRequirements` in
+`@deepseek-ai/dsh-app-boot` walks **every** `peerDependencies` key whose name is
+`@deepseek-ai/dsh` or starts with `@deepseek-ai/dsh-`, and compares each range against the runtime
+version — it **never consults `peerDependenciesMeta`**. So an optional-marked peer is still a hard
+requirement: its presence rejected the whole plugin at install time (`installation rejected`) and
+got the bundle silently skipped at boot, so the `dsh-cindy-host` row never appeared. Fixed in
+`132da4d` by removing the peer and keeping the adapter as a lazy `createRequire` with a
+failure-degrades-to-nothing path (`src/dsh-plugin.js`).
+
+`package.json` now carries a `//peerDependenciesMeta` note recording that the field is absent on
+purpose. Two details that make the rule exactly as wide as it needs to be:
+
+- The walk only covers `@deepseek-ai/dsh` / `@deepseek-ai/dsh-*` peers. `@deepseek-ai/schemastery`
+  is a peer this check never examines, which is why it can carry a plain `^3.18.1` range.
+- An own `engines.dsh` range would decide compatibility **alone**, ignoring peers entirely. This
+  plugin deliberately does not set one: the peers are the claim we verified per package, and a
+  single hand-written DSH range would silently assert more than the tests cover.
+
+The general instruction therefore survives, but narrower than it reads above: **for libraries the
+host does not provide**, `peerDependencies` + `peerDependenciesMeta.optional` is how you say "use
+it if the host has it"; **for `@deepseek-ai/dsh*`**, the peer key must not exist at all unless the
+plugin genuinely requires that package, and an optional seam is expressed by removing the peer
+(decision 1) plus a lazy, failure-tolerant load.
+
