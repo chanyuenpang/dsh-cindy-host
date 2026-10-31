@@ -13,7 +13,73 @@
 import { randomUUID } from 'node:crypto';
 import { loginWithPhone } from './cindy-login.js';
 import { refreshStoredSession } from './cindy-login-flow.js';
-import { loadSession, saveSession, clearSession } from './credential-store.js';
+import { loadSession, saveSession, clearSession as clearStoredSession } from './credential-store.js';
+
+// One in-process writer for login/logout and guarded refresh commits. This is
+// deliberately not a cross-process credential-store CAS.
+let credentialRevision = 0;
+let writes = Promise.resolve();
+function serializeWrite(action) {
+  const pending = writes.then(action);
+  writes = pending.catch(() => {});
+  return pending;
+}
+function sameCredential(a, b) {
+  return a != null && b != null && ['deviceId', 'authBaseUrl', 'accessToken', 'refreshToken']
+    .every((key) => a[key] === b[key]);
+}
+const superseded = () => ({ ok: false, reason: 'OWNER_UNVERIFIED', message: 'Cindy 登录归属已变化，未采用旧操作结果' });
+
+/** Refresh only a captured authenticated lease, never import another stored identity. */
+export async function refreshOwnedCredential(captured, ports = {}) {
+  const load = ports.loadSession ?? loadSession;
+  const save = ports.saveSession ?? saveSession;
+  const refresh = ports.refreshStoredSession ?? refreshStoredSession;
+  const current = ports.isCurrent ?? (() => false);
+  const revision = credentialRevision;
+  const snapshot = Object.freeze({ ...captured });
+  const stored = await load();
+  if (revision !== credentialRevision || !current() || !sameCredential(snapshot, stored)) return superseded();
+  const timeoutMs = Number.isSafeInteger(ports.timeoutMs) && ports.timeoutMs > 0 ? Math.min(ports.timeoutMs, 30_000) : 30_000;
+  const controller = new AbortController();
+  const abort = () => controller.abort();
+  ports.signal?.addEventListener('abort', abort, { once: true });
+  if (ports.signal?.aborted) abort();
+  const timer = setTimeout(abort, timeoutMs);
+  let aborted;
+  let refreshed;
+  try {
+    const cancelled = new Promise((resolve) => {
+      aborted = () => resolve({ ok: false });
+      controller.signal.addEventListener('abort', aborted, { once: true });
+      if (controller.signal.aborted) aborted();
+    });
+    refreshed = await Promise.race([
+      Promise.resolve().then(() => {
+        controller.signal.throwIfAborted();
+        return refresh(snapshot, { signal: controller.signal });
+      }), cancelled,
+    ]);
+  } catch { refreshed = { ok: false }; }
+  finally {
+    clearTimeout(timer);
+    ports.signal?.removeEventListener('abort', abort);
+    controller.signal.removeEventListener('abort', aborted);
+  }
+  if (!refreshed?.ok) return { ok: false, reason: 'AUTH_FAILED', message: 'Cindy 登录续期失败' };
+  const session = { ...snapshot, ...refreshed.session };
+  if (session.deviceId !== snapshot.deviceId || session.authBaseUrl !== snapshot.authBaseUrl
+      || typeof session.accessToken !== 'string' || !session.accessToken
+      || typeof session.refreshToken !== 'string' || !session.refreshToken) return superseded();
+  return serializeWrite(async () => {
+    const stored = await load();
+    if (revision !== credentialRevision || !current() || !sameCredential(snapshot, stored)) return superseded();
+    await save(session);
+    if (revision !== credentialRevision || !current()) return superseded();
+    credentialRevision += 1;
+    return { ok: true, session };
+  });
+}
 
 /**
  * Load the stored session and refresh it.
@@ -28,14 +94,23 @@ export async function restoreSession(ports = {}) {
   const load = ports.loadSession ?? loadSession;
   const save = ports.saveSession ?? saveSession;
   const refresh = ports.refreshStoredSession ?? refreshStoredSession;
+  const revision = credentialRevision;
   const saved = await load();
   if (!saved) return { ok: false, reason: 'missing', message: '本机还没有 Cindy 登录态' };
 
+  if (revision !== credentialRevision) return superseded();
   const refreshed = await refresh(saved);
+  if (revision !== credentialRevision) return superseded();
   if (refreshed.ok) {
     const session = { ...saved, ...refreshed.session };
-    await save(session);
-    return { ok: true, session };
+    return serializeWrite(async () => {
+      const stored = await load();
+      if (revision !== credentialRevision || !sameCredential(saved, stored)) return superseded();
+      await save(session);
+      if (revision !== credentialRevision) return superseded();
+      credentialRevision += 1;
+      return { ok: true, session };
+    });
   }
 
   // A service that could not be reached is not evidence about the credential at
@@ -71,7 +146,8 @@ export async function restoreSession(ports = {}) {
 export async function adoptSession(session, ports = {}) {
   const save = ports.saveSession ?? saveSession;
   const stored = { deviceId: session.deviceId ?? randomUUID(), ...session };
-  await save(stored);
+  credentialRevision += 1; // Fence refreshes immediately, before waiting for an older writer.
+  await serializeWrite(() => save(stored));
   return stored;
 }
 
@@ -83,8 +159,9 @@ export async function adoptSession(session, ports = {}) {
  * @param ports - optional credential-store override, for tests.
  */
 export async function forgetSession(ports = {}) {
-  const clear = ports.clearSession ?? clearSession;
-  await clear();
+  const clear = ports.clearSession ?? clearStoredSession;
+  credentialRevision += 1;
+  await serializeWrite(clear);
 }
 
 /**
@@ -95,8 +172,8 @@ export async function getAuthenticatedSession() {
   const restored = await restoreSession();
   if (restored.ok) return restored.session;
   const session = await loginWithPhone({ clientType: 'desktop' });
-  await saveSession(session);
+  await adoptSession(session);
   return session;
 }
 
-export { clearSession };
+export { forgetSession as clearSession };

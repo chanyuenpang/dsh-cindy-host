@@ -27,9 +27,11 @@ function activity(kind, sessionId, phase, extra = {}) {
 /**
  * Whether a session belongs in a controller's session list.
  *
- * **A subagent run is not a task.** DSH marks its delegated sessions in the summary
- * (`origin: 'subagent'`, and a `parentSessionId` when the delegation has a parent), and
- * its own Web list shows only user-facing sessions — which is why a deployment's
+ * **A subagent run and an unprompted draft are not tasks.** DSH marks delegated
+ * sessions in the summary (`origin: 'subagent'`, and a `parentSessionId` when the
+ * delegation has a parent). It also marks a newly opened, never-prompted conversation
+ * as `blank: true`. Neither appears in DSH's user-facing sidebar, so neither may be
+ * projected as a Cindy task — which is why a deployment's
  * `~/.dsh/sessions` can hold two hundred subagent logs the user has never seen. This Host
  * listed every one of them as "Untitled DSH task": measured on a real profile, 219 rows of
  * which the visible handful were the actual tasks, and the whole list had to be folded
@@ -40,7 +42,7 @@ function activity(kind, sessionId, phase, extra = {}) {
  */
 function isControllerVisible(item) {
   if (item === null || typeof item !== 'object') return false;
-  if (item.origin === 'subagent') return false;
+  if (item.origin === 'subagent' || item.blank === true) return false;
   return item.parentSessionId === undefined || item.parentSessionId === null;
 }
 
@@ -101,8 +103,10 @@ export function createSessionControllerSource({
     const stale = [];
     for (const id of sessionIds) {
       const cached = titleCache.get(id);
+      // Expiry schedules a refresh; it does not make a known title disappear.
+      // In particular, rows outside this read's budget still need their label.
+      if (cached?.title != null) out.set(id, cached.title);
       if (cached !== undefined && at - cached.readAt < titleTtlMs) {
-        if (cached.title !== null) out.set(id, cached.title);
         continue;
       }
       stale.push(id);
@@ -126,13 +130,14 @@ export function createSessionControllerSource({
     try {
       fetched = await readTitles(batch);
     } catch {
-      // A missing title costs a nicer row label, never the session list. Cached as
-      // "no title" so a permanently unreadable log is not re-folded forever.
-      for (const id of batch) titleCache.set(id, { title: null, readAt: now() });
-      return;
+      // A transient failure is not evidence that a known title was cleared.
+      // Fall through so failed attempts still receive the normal retry backoff.
     }
     for (const id of batch) {
-      const title = typeof fetched?.get === 'function' ? fetched.get(id) ?? null : null;
+      const value = typeof fetched?.get === 'function' ? fetched.get(id) : null;
+      // The batch adapter omits rejected and empty snapshots alike. Neither is
+      // an authoritative clear; only a usable title replaces the last good one.
+      const title = (typeof value === 'string' ? value.trim() : '') || titleCache.get(id)?.title || null;
       titleCache.set(id, { title, readAt: now() });
       if (title !== null && out !== undefined) out.set(id, title);
     }

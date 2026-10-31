@@ -1,6 +1,6 @@
 import test from 'node:test';
 import assert from 'node:assert/strict';
-import { createInputQueueTracker, toQueuedRemoteMessage, queuedRowFromController, queueItemsFromInbox, goalFromProjections } from '../src/host-input-queue.js';
+import { createInputQueueTracker, toQueuedRemoteMessage, queuedRowFromController, queueItemsFromInbox, goalFromProjections, RETIRED_INPUT_LIMIT } from '../src/host-input-queue.js';
 
 const SESSION = { id: 's1', workingDir: 'G:\\Projects\\DSH-cindy-host' };
 // The shape the queue tracker is actually handed: a *source* row, which names
@@ -11,6 +11,76 @@ const SOURCE_SESSION = { id: 's1', cwd: 'G:\\Projects\\DSH-cindy-host' };
 function item(id, placement, text) {
   return { id, placement, message: { id, content: [{ type: 'text', text }] } };
 }
+
+test('desktop queue echoes expose string chat content, never DSH block arrays', () => {
+  // Cindy promotes chatMessage straight into its transcript on queue departure.
+  // Its prompt-preview/quote parser then calls content.split, unlike the mobile
+  // queue validator which checks role only. Both builders previously crashed it.
+  const accepted = queuedRowFromController({ clientId: 'echo', text: 'hello\nworld', session: SOURCE_SESSION });
+  const source = item('queued', 'queued', 'hello\nworld');
+  const queued = toQueuedRemoteMessage(source, SOURCE_SESSION);
+  for (const row of [accepted, queued]) {
+    assert.equal(typeof row.chatMessage.content, 'string');
+    assert.equal(row.chatMessage.content, row.text);
+    assert.deepEqual(row.chatMessage.content.split('\n'), ['hello', 'world']);
+    assert.equal(row.chatMessage.clientId, row.clientId);
+  }
+  assert.deepEqual(source.message.content, [{ type: 'text', text: 'hello\nworld' }], 'wire shaping cannot mutate agent input');
+});
+
+test('queue baselines, steering and re-entry retain renderable text including empty bodies', () => {
+  const tracker = createInputQueueTracker();
+  const pending = [item('queued', 'queued', 'queued body'), item('steer', 'steering', 'steer body'), item('empty', 'queued', '')];
+  tracker.apply({ type: 'baseline', value: { queues: { s1: pending }, jobs: {} } });
+  const live = tracker.projectionFor('s1', SOURCE_SESSION);
+  const reopened = createInputQueueTracker().projectionFor('s1', SOURCE_SESSION, null, pending);
+  for (const projection of [live, reopened]) {
+    assert.deepEqual(projection.pendingQueue.map(row => row.chatMessage.content), ['queued body', 'steer body', '']);
+    for (const row of projection.pendingQueue) assert.doesNotThrow(() => row.chatMessage.content.split('\n'));
+  }
+});
+
+test('durable consumption beats stale ACKs, baselines and inbox snapshots without hiding other inputs', () => {
+  const tracker = createInputQueueTracker();
+  const consumed = { ...item('durable-id', 'steering', 'already received'), rpcId: 'phone-id' };
+  const waiting = { ...item('waiting-id', 'queued', 'still pending'), rpcId: 'other-id' };
+  tracker.retire('s1', 'phone-id');
+  tracker.markQueued('s1', consumed);
+  tracker.markSteering('s1', consumed);
+  assert.deepEqual(tracker.queueFor('s1'), []);
+  tracker.apply({ type: 'baseline', value: { queues: { s1: [consumed, waiting] }, jobs: {} } });
+  tracker.apply({ type: 'queue', sessionId: 's1', items: [consumed, waiting] });
+  tracker.adopt('s1', [consumed, waiting]);
+  const pending = queuedRowFromController({ clientId: 'phone-id', text: 'late ACK', session: SESSION });
+  for (const projection of [tracker.projectionFor('s1', SESSION, pending), tracker.projectionFor('s1', SESSION, pending, [consumed, waiting])]) {
+    assert.deepEqual(projection.pendingQueue.map(row => row.clientId), ['other-id']);
+    assert.deepEqual(projection.steeringQueueClientIds, []);
+  }
+  assert.equal(tracker.dshItemId('s1', 'phone-id'), null);
+  assert.equal(tracker.dshItemId('s1', 'other-id'), 'waiting-id');
+  tracker.markQueued('s2', consumed);
+  assert.equal(tracker.projectionFor('s2', SESSION).pendingQueue[0].clientId, 'phone-id', 'consumption is scoped to its own session');
+});
+
+test('a UI removal is not durable consumption evidence', () => {
+  const tracker = createInputQueueTracker();
+  const pending = item('retry', 'queued', 'not delivered');
+  tracker.markQueued('s1', pending);
+  tracker.mirror('s1', 'retry', { kind: 'remove' });
+  tracker.markQueued('s1', pending);
+  assert.equal(tracker.projectionFor('s1', SESSION).pendingQueue.length, 1);
+});
+
+test('consumption evidence is bounded and clears with runtime teardown', () => {
+  const tracker = createInputQueueTracker();
+  for (let index = 0; index <= RETIRED_INPUT_LIMIT; index++) tracker.retire('s1', String(index));
+  tracker.markQueued('s1', item('0', 'queued', 'old evidence evicted'));
+  tracker.markQueued('s1', item(String(RETIRED_INPUT_LIMIT), 'queued', 'recent evidence retained'));
+  assert.deepEqual(tracker.projectionFor('s1', SESSION).pendingQueue.map(row => row.clientId), ['0']);
+  tracker.clear();
+  tracker.markQueued('s1', item(String(RETIRED_INPUT_LIMIT), 'queued', 'new runtime'));
+  assert.equal(tracker.projectionFor('s1', SESSION).pendingQueue.length, 1);
+});
 
 test('emits every field the controller validates a queued row on', () => {
   const row = toQueuedRemoteMessage(item('m1', 'queued', 'hello'), SESSION);
@@ -57,10 +127,9 @@ test('folds a just-accepted item into the projection for a source-shaped session
   assert.deepEqual(projection.pendingQueue.map((row) => row.clientId), ['c1']);
 });
 
-test('a just-accepted steering prompt is projected as steering, and only that one', () => {
-  // The controller keeps its bubble alive from `steeringQueueClientIds`; a prompt DSH has
-  // spliced but not yet made durable has to appear there, without disturbing the queue the
-  // session already holds.
+test('a steering prompt keeps its pending content until consumed', () => {
+  // pendingQueue preserves the unconsumed body; steeringQueueClientIds marks it
+  // as sending. Both survive re-entry without pretending it is durable history.
   const tracker = createInputQueueTracker();
   tracker.apply({ type: 'queue', sessionId: 's1', items: [item('q1', 'queued', 'queued first')] });
 
@@ -72,7 +141,8 @@ test('a just-accepted steering prompt is projected as steering, and only that on
 
   const projection = tracker.projectionFor('s1', SOURCE_SESSION);
   assert.deepEqual(projection.steeringQueueClientIds, ['c2']);
-  assert.deepEqual(projection.pendingQueue.map((row) => row.clientId), ['q1'], 'the real queue is untouched');
+  assert.deepEqual(projection.pendingQueue.map((row) => row.clientId), ['q1', 'c2'], 'steering is still pending, with content available on reopen');
+  assert.equal(projection.pendingQueue[1].text, '插一句');
 
   // Marking the same id again replaces that entry rather than duplicating it.
   tracker.markSteering('s1', { id: 'c2', rpcId: 'c2', message: { id: 'c2', content: [] } });
@@ -84,32 +154,14 @@ test('a just-accepted steering prompt is projected as steering, and only that on
   assert.deepEqual(tracker.projectionFor('s1', SOURCE_SESSION).steeringQueueClientIds, []);
 });
 
-test('a prompt accepted but not yet durable is served as a transcript row', () => {
-  // Measured gap: a prompt sent while a turn runs waits in DSH's inbox until the turn
-  // reaches a step boundary — 0.4 s when idle, 42 s in the worst observed case. With no row
-  // in the transcript for it, a controller that reloads shows nothing and the user retypes a
-  // message that is still queued (「退出去再进来，它不见了」).
+test('authoritative inbox reads retain pending bodies even after reconnect', () => {
   const tracker = createInputQueueTracker();
-  assert.deepEqual(tracker.pendingTranscriptRows('s1'), [], 'nothing accepted, nothing to show');
-
-  tracker.markSteering('s1', {
-    id: 'c9',
-    rpcId: 'c9',
-    message: { id: 'c9', content: [{ type: 'text', text: '插一句' }] },
-  });
-  const rows = tracker.pendingTranscriptRows('s1');
-  assert.equal(rows.length, 1);
-  assert.equal(rows[0].role, 'user');
-  assert.equal(rows[0].clientId, 'c9', 'the controller recognises its own message by this id');
-  assert.equal(rows[0].content.text, '插一句');
-  assert.equal(rows[0].pendingDelivery, 'steering');
-  assert.equal(rows[0].id, 's1:pending:c9');
-  assert.ok(Number.isFinite(Date.parse(rows[0].createdAt)), 'the row carries when it was accepted');
-
-  // The durable row retires it: the two never coexist, and the controller's own echo
-  // reconciliation swaps one for the other.
-  tracker.mirror('s1', 'c9', { kind: 'remove' });
-  assert.deepEqual(tracker.pendingTranscriptRows('s1'), []);
+  const items = [item('q1', 'queued', 'later'), item('s1', 'steering', 'insert')];
+  // No local optimistic history survives a restart; the inbox alone must suffice.
+  const projection = tracker.projectionFor('session', SOURCE_SESSION, null, items);
+  assert.deepEqual(projection.pendingQueue.map((row) => row.text), ['later', 'insert']);
+  assert.deepEqual(projection.steeringQueueClientIds, ['s1']);
+  assert.deepEqual(tracker.queueFor('session'), [], 'authoritative reads need no previous fold');
 });
 
 test('folds the baseline, then replaces one session at a time', () => {
@@ -129,7 +181,7 @@ test('folds the baseline, then replaces one session at a time', () => {
   assert.deepEqual(tracker.queueFor('s1'), [], 'an empty queue frame clears it');
 });
 
-test('separates queued from steering, and projects the rest as empty', () => {
+test('projects queued and steering user entries but not context entries', () => {
   const tracker = createInputQueueTracker();
   tracker.apply({
     type: 'baseline',
@@ -141,7 +193,7 @@ test('separates queued from steering, and projects the rest as empty', () => {
 
   const projection = tracker.projectionFor('s1', SESSION);
   assert.equal(projection.sessionId, 's1');
-  assert.deepEqual(projection.pendingQueue.map((row) => row.clientId), ['a']);
+  assert.deepEqual(projection.pendingQueue.map((row) => row.clientId), ['a', 'b']);
   assert.deepEqual(projection.steeringQueueClientIds, ['b'], 'a context entry is neither queued nor steering');
 
   // The error/recovery fields describe a failure inside the controller's own

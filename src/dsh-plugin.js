@@ -41,7 +41,7 @@ const ControllerSchema = Schema.object({ state: Schema.union(['authorized', 'rev
 // actions DSH has no concept of. `pinnedAt: ''` is a remembered unpin (settings
 // reject `null`, and an absent field cannot be told apart from "never pinned").
 const SessionFlagSchema = Schema.object({ status: Schema.union(['active', 'archived', 'deleted']), pinnedAt: Schema.string() });
-const HostSchema = Schema.object({ transportEnabled: Schema.boolean(), remoteControlEnabled: Schema.boolean(), controllers: Schema.dict(ControllerSchema), deviceId: Schema.string(), sessionFlags: Schema.dict(SessionFlagSchema) });
+const HostSchema = Schema.object({ transportEnabled: Schema.boolean(), remoteControlEnabled: Schema.boolean(), controllers: Schema.dict(ControllerSchema), deviceId: Schema.string(), deviceName: Schema.string(), sessionFlags: Schema.dict(SessionFlagSchema) });
 
 /**
  * Services that can supply the DSH session read source, in preference order.
@@ -1167,6 +1167,7 @@ export function buildDiagnostics({ runtime, sourceKind, seam, listingDiagnostics
   };
   return {
     dataSource: sourceKind,
+    transfers: field(() => runtime?.getTransferDiagnostics?.() ?? null, null),
     projectionRunning: runtime?.projectionRunning === true,
     projectedSessions: field(() => (runtime ? runtime.model.list().length : 0), 0),
     // What a controller actually asked for and what it got back, with the

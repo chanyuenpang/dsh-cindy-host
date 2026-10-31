@@ -1,6 +1,7 @@
 import test from 'node:test';
 import assert from 'node:assert/strict';
 import { createSessionControllerSource } from '../src/dsh-session-source.js';
+import { toCindySessionListRow } from '../src/cindy-session-row.js';
 
 /** A `sessionController` double: only `list` is used by the source. */
 function makeController(items, onList) {
@@ -32,7 +33,7 @@ test('requires the session controller service', () => {
   assert.throws(() => createSessionControllerSource({ subscribe: () => () => {} }), /requires sessionController/);
 });
 
-test('maps the host session list into conversation rows', async () => {
+test('maps only non-blank host sessions into conversation rows', async () => {
   let request;
   const source = createSessionControllerSource({
     sessionController: makeController(
@@ -52,7 +53,6 @@ test('maps the host session list into conversation rows', async () => {
   assert.equal(request.hasSignal, true, 'the list read is cancellable');
   assert.deepEqual(rows, [
     { id: 's1', title: undefined, running: true, updatedAt: new Date(1_700_000_000_000).toISOString(), createdAt: new Date(1_700_000_000_000).toISOString(), cwd: null, blank: false },
-    { id: 's2', title: undefined, running: false, updatedAt: new Date(1_700_000_001_000).toISOString(), createdAt: new Date(1_700_000_001_000).toISOString(), cwd: null, blank: true },
   ]);
 });
 
@@ -121,6 +121,7 @@ test('subagent runs are not controller sessions', async () => {
       { sessionId: 'task-1', updatedAt: 3, running: false },
       { sessionId: 'sub-1', updatedAt: 2, running: false, origin: 'subagent' },
       { sessionId: 'sub-2', updatedAt: 1, running: true, parentSessionId: 'task-1' },
+      { sessionId: 'draft-1', updatedAt: 0, running: false, blank: true },
     ]),
     subscribe: makeSubscribe(),
     readTitles: async (ids) => new Map(ids.map((id) => [id, 'a title'])),
@@ -138,6 +139,7 @@ test('subagent runs are not controller sessions', async () => {
   const dispose = pushed.onEvent((item) => events.push(item));
   subscribe.emit('api-session/added', { sessionId: 'sub-9', origin: 'subagent', running: true });
   subscribe.emit('api-session/added', { sessionId: 'sub-10', parentSessionId: 'task-1' });
+  subscribe.emit('api-session/added', { sessionId: 'draft-9', blank: true });
   subscribe.emit('api-session/added', { sessionId: 'task-9', running: false });
   assert.deepEqual(events.map((item) => item.sessionId), ['task-9']);
   dispose();
@@ -190,6 +192,67 @@ test('a listing folds one bounded batch of titles and warms the rest behind it',
   await source.listSessions();
   assert.equal(batches.length, 13, 'a warm cache folds nothing');
 });
+
+test('expired titles beyond the refresh budget stay on the wire while warming', async (t) => {
+  let clock = 0;
+  let release;
+  const gate = new Promise((resolve) => { release = resolve; });
+  t.after(() => release());
+  const batches = [];
+  const source = createSessionControllerSource({
+    sessionController: makeController(['s0', 's1', 's2'].map((sessionId) => ({ sessionId }))),
+    titleRefreshBudget: 1,
+    titleTtlMs: 100,
+    now: () => clock,
+    readTitles: async (ids) => {
+      batches.push(ids);
+      if (clock > 0 && ids[0] !== 's0') await gate;
+      return new Map(ids.map((id) => [id, (clock === 0 ? 'old ' : 'new ') + id]));
+    },
+  });
+  await source.listSessions();
+  await source.titlesSettled();
+  clock = 100;
+  const rows = await source.listSessions();
+  assert.deepEqual(rows.map((row) => toCindySessionListRow(row).title), [
+    'new s0', 'old s1', 'old s2',
+  ], 'TTL schedules refresh; it must not erase the titles outside this batch');
+  assert.ok(batches.every((ids) => ids.length <= 1), 'refresh remains bounded');
+  release();
+  await source.titlesSettled();
+  assert.deepEqual((await source.listSessions()).map((row) => row.title), ['new s0', 'new s1', 'new s2']);
+});
+
+for (const failure of ['throw', 'missing', 'blank']) {
+  test(`a ${failure} title refresh preserves known titles and later recovers`, async () => {
+    let clock = 0;
+    let reads = 0;
+    const source = createSessionControllerSource({
+      sessionController: makeController([{ sessionId: 's1' }, { sessionId: 's2' }]),
+      titleTtlMs: 100,
+      now: () => clock,
+      readTitles: async () => {
+        reads += 1;
+        if (clock === 100) {
+          if (failure === 'throw') throw new Error('temporary title failure');
+          return new Map([['s2', 'updated s2'], ...(failure === 'blank' ? [['s1', '  ']] : [])]);
+        }
+        return new Map([['s1', clock === 0 ? 'known s1' : 'recovered s1'], ['s2', 'known s2']]);
+      },
+    });
+    await source.listSessions();
+    clock = 100;
+    const expected = ['known s1', failure === 'throw' ? 'known s2' : 'updated s2'];
+    for (let poll = 0; poll < 2; poll += 1) {
+      const rows = await source.listSessions();
+      assert.deepEqual(rows.map((row) => toCindySessionListRow(row).title), expected);
+    }
+    assert.equal(reads, 2, 'a failed read is still throttled, not retried on every poll');
+    clock = 200;
+    assert.equal((await source.listSessions())[0].title, 'recovered s1');
+    assert.equal(reads, 3, 'the next TTL retries and accepts a successful update');
+  });
+}
 
 test('one warm-up at a time, and a rename drops its cached title', async () => {
   const items = Array.from({ length: 40 }, (_, index) => ({ sessionId: `s${index}`, updatedAt: 40 - index, running: false }));

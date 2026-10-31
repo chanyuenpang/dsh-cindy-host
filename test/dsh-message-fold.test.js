@@ -3,6 +3,8 @@ import assert from 'node:assert/strict';
 import { isHarnessNotice, promptRpcIdOf, foldSessionEvent, pageRows, createMessageCounter, createMessageReader, entryForTodoWrite, NEWEST_WINDOW_ROWS, NEWEST_WINDOW_TEXT_BYTES } from '../src/dsh-message-fold.js';
 import { toCindyMessages } from '../src/cindy-message-row.js';
 
+const textOf = (row) => typeof row.content === 'string' ? row.content : row.content?.text;
+
 test('names the controller id of a prompt that just became durable', () => {
   // This is the moment DSH's inbox drops the entry, so it is the moment the
   // controller's optimistic 队列中 row has to be retired.
@@ -78,14 +80,14 @@ test('pages back from a row id, which is the cursor the controller really sends'
     { message: { id: 'm4', role: 'assistant', content: [{ type: 'text', text: 'four' }] }, createdAt: '2026-01-01T00:00:03.000Z' },
   ], { sessionId: 's1' });
   // Newest first, which is the controller's paging order.
-  assert.deepEqual(rows.map((row) => row.content.text), ['four', 'three', 'two', 'one']);
+  assert.deepEqual(rows.map(textOf), ['four', 'three', 'two', 'one']);
 
   const first = pageRows(rows, { limit: 2 });
-  assert.deepEqual(first.map((row) => row.content.text), ['four', 'three']);
+  assert.deepEqual(first.map(textOf), ['four', 'three']);
 
   const anchor = first[first.length - 1].id;
   const second = pageRows(rows, { limit: 2, before: anchor });
-  assert.deepEqual(second.map((row) => row.content.text), ['two', 'one'], 'strictly older than the named row');
+  assert.deepEqual(second.map(textOf), ['two', 'one'], 'strictly older than the named row');
   assert.equal(second.some((row) => first.some((seen) => seen.id === row.id)), false, 'a page is never re-served');
 
   const third = pageRows(rows, { limit: 2, before: second[second.length - 1].id });
@@ -94,7 +96,7 @@ test('pages back from a row id, which is the cursor the controller really sends'
   // An id this Host cannot place must not degrade into "the newest page again":
   // that is exactly the failure the user saw, and it silently re-serves rows.
   const unknown = pageRows(rows, { limit: 2, before: 's1:never-seen:0' });
-  assert.deepEqual(unknown.map((row) => row.content.text), ['two', 'one'], 'the oldest page we have');
+  assert.deepEqual(unknown.map(textOf), ['two', 'one'], 'the oldest page we have');
 });
 
 test('counts rows the same way the transcript read does', async () => {
@@ -117,7 +119,7 @@ test('counts rows the same way the transcript read does', async () => {
     },
   ], { sessionId: 's1' });
   assert.equal(rows.length, 3);
-  assert.deepEqual(rows.map((row) => row.content.text), ['t', 'a', 'q']);
+  assert.deepEqual(rows.map(textOf), ['t', 'a', 'q']);
 });
 
 test('the transcript is folded once, then served from the live stream', async () => {
@@ -145,7 +147,7 @@ test('the transcript is folded once, then served from the live stream', async ()
   assert.equal(await reader.count('s1'), 1);
   const first = await reader('s1', { limit: 20 });
   assert.equal(reads, 1, 'the count seeded the cache instead of folding a second time');
-  assert.deepEqual(first.map((row) => row.content.text), ['one']);
+  assert.deepEqual(first.map(textOf), ['one']);
 
   // A second page for the same session must not touch the log again.
   await reader('s1', { limit: 20, before: first[0].id });
@@ -162,7 +164,7 @@ test('the transcript is folded once, then served from the live stream', async ()
   assert.equal(appended, true);
   assert.equal(reads, 1);
   const page = await reader('s1', { limit: 20 });
-  assert.deepEqual(page.map((row) => row.content.text), ['two', 'one'], 'newest first');
+  assert.deepEqual(page.map(textOf), ['two', 'one'], 'newest first');
   assert.equal(await reader.count('s1'), 2, 'the count sees the appended row');
 
   // A gap in the stream, a repeated seq (rewind), or an unknown seq drops the cache:
@@ -265,7 +267,7 @@ test('the newest page is filled to the controller window, and older pages are no
   const reader = createMessageReader({ readSessionLog: async () => ({ events }) });
   const newest = await reader('s1', { limit: 20 });
   assert.equal(newest.length, NEWEST_WINDOW_ROWS, 'the newest page is filled to the row cap');
-  assert.equal(newest[0].content.text, 'row-249', 'and it is still the newest rows');
+  assert.equal(textOf(newest[0]), 'row-249', 'and it is still the newest rows');
 
   const older = await reader('s1', { limit: 20, before: newest[newest.length - 1].id });
   assert.equal(older.length, 20, 'a cursor page is answered with exactly the asked limit');
@@ -295,13 +297,13 @@ test('a text-heavy newest page is cut to the byte budget, at a message boundary'
   const bytes = Buffer.byteLength(JSON.stringify(page), 'utf8');
   assert.ok(bytes <= NEWEST_WINDOW_TEXT_BYTES, `page carried ${bytes} bytes`);
   assert.ok(page.length < 20, 'the byte budget bound the page before the row cap did');
-  assert.equal(page[0].content.text.startsWith('row-19-'), true, 'the newest row is still first');
+  assert.equal(textOf(page[0]).startsWith('row-19-'), true, 'the newest row is still first');
 
   // The rows the budget left behind are exactly what the next cursor page serves, so
   // none of them became unreachable.
   const rest = await reader('s1', { limit: 20, before: page[page.length - 1].id });
   assert.equal(rest.length, 20 - page.length);
-  assert.equal(rest[0].content.text.startsWith(`row-${19 - page.length}-`), true);
+  assert.equal(textOf(rest[0]).startsWith(`row-${19 - page.length}-`), true);
 });
 
 

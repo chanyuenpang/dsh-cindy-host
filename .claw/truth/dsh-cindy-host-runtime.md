@@ -1,11 +1,10 @@
-# DSH Cindy Host: runtime and settings card contract
+﻿# DSH Cindy Host: runtime and settings card contract
 
 <!-- state: current -->
 ## Current behavior
 
-`dsh-cindy-host-demo` (package name `dsh-cindy-host-demo`, version `0.1.4`) is a DSH
-plugin bundle that mounts the 「Cindy 手机连接」 card in **Settings → Plugins** and
-lets this Host be reached from the Cindy mobile client. The Host is the only truth
+`dsh-cindy-host` (npm package and DSH bundle name `dsh-cindy-host`, current published release `0.1.29`) is the production DSH
+plugin bundle that mounts the 「Cindy 手机连接」 page in Settings and lets Cindy desktop and mobile clients reach this Host. The Host is the only truth
 for connection state: the card writes settings and renders whatever the Host's
 `status` answer contains.
 
@@ -19,7 +18,8 @@ Composition and mounting:
   carries the bundle patch and the web client platform.
 - `src/dsh-plugin.js` exports `name = 'dsh-cindy-host'`, `inject = ['settings']`, and
   `apply(ctx)`. It registers the settings namespace `dsh-cindy-host` with schema
-  `{ transportEnabled, remoteControlEnabled, controllers }` and
+  `{ transportEnabled, remoteControlEnabled, controllers, deviceId, deviceName, sessionFlags }`;
+  `deviceName` remains optional for older stored settings and defaults to the empty sentinel.
   `applies: 'live'`, then starts `startHost(source, scope.get())` inside
   `ctx.effect` so plugin teardown stops the runtime.
 - `webServer` is injected optionally (`ctx.inject(['webServer'], …)`), so headless
@@ -27,22 +27,26 @@ Composition and mounting:
 
 Card surface:
 
-- `lib/client.js` registers through `window.__ModuleLoader__.load({ id: "dsh-cindy-host-demo", factory })`,
+- `lib/client.js` registers through `window.__ModuleLoader__.load({ id: "dsh-cindy-host", factory })`,
   the same handwritten CommonJS-factory pattern the platform itself uses; there is
   no build step and the only platform dependency is the seeded `react`.
-- The card injects `['slots', 'settingsScope']`, binds
-  `ctx.settingsScope.bind({ namespace: 'dsh-cindy-host' })`, and injects the slot
-  `settings.plugin.item` with key `dsh-cindy-host`. Injecting the slot (rather than
-  calling `slots.register` directly) is required: the Plugins tab declares that
-  slot, and a bare register fails with `slot "settings.plugin.item" is not declared`.
+- The client module has only `slots` as a blocking dependency. It resolves settings non-blockingly through `configForms` on DSH 0.2 or `settingsScope` on 0.1.x, then contributes the `settings.section` page keyed by `dsh-cindy-host`. Missing settings services must not block client-module activation.
 - The switch writes `transportEnabled` through the bound settings scope and polls
   `GET /api/dsh-cindy-host/status` every 1500 ms. `switchOn` is true when
   `transportEnabled === true` or `remoteControlEnabled === true`.
-- The card shows exactly the five Host states with their labels: `disconnected`
-  未连接 / Not connected, `authenticating` 登录中 / Signing in, `waiting`
-  等待手机连接 / Waiting for phone, `connected` 已连接 / Connected, `failed`
-  连接失败 / Connection failed. Device rows render `name || deviceId`, platform,
-  and `deviceId`.
+- The card renders Host states from the status snapshot; `src/host-status.js` defines
+  `disconnected`, `authenticating`, `connecting`, `waiting`, `connected`, and `failed`
+  with Chinese and English labels. Device rows render `name || deviceId`, platform, and
+  `deviceId`.
+- Settings also edits the Host's display name. `deviceName` is an optional compatible
+  setting; absent or blank uses `DSH Host`. A saved name is trimmed for use, limited
+  to 1–64 UTF-16 code units, and rejects control characters; the editor is disabled
+  when settings are read-only. Saving is local and works offline. Runtime hello, status,
+  and session device identity use the configured name. When authenticated, the runtime
+  serializes `PATCH /api/device-link/devices/:id` name updates; a failed remote sync is
+  reported separately from local save, and reconnect is not forced. See
+  `src/host-settings.js`, `src/host-device-name.js`, `src/host.js` (settings watcher,
+  hello and status), and `lib/client.js` (`HostNameForm`, `writeHostName`).
 
 Constraints and pitfalls:
 
@@ -60,6 +64,8 @@ Code anchors:
 - `src/dsh-plugin.js` (`apply`, settings namespace, optional `webServer` row)
 - `lib/client.js` (`__ModuleLoader__.load`, `settings.plugin.item`, poll loop)
 - `src/host-status.js` (`CONNECTION_STATES`, `STATE_LABELS`, `STATE_LABELS_EN`)
+- `src/host-settings.js` (`deviceName` default and validation), `src/host-device-name.js` (serialized remote sync), `src/host.js` (runtime propagation)
+- `test/host-settings.test.js`, `test/host.test.js`, and `test/client-card.test.js` (settings, runtime and editor coverage)
 - `cordis.patch.yml`
 
 Verification rules:
@@ -69,7 +75,7 @@ Verification rules:
   `dsh --profile cindy-smoke --dump-config` must compose the bundle.
 - Gate 2: `dsh --profile cindy-smoke --no-open --port 3081` must show a running
   host with no Cindy authentication prompt; the card bundle is served as the
-  `dsh-cindy-host-demo` entry of `window.__DSH_BOOT__`.
+  `dsh-cindy-host` entry of `window.__DSH_BOOT__`.
 - `npm test` renders the card with React, so card markup and state rules are
   covered without a browser.
 - The sandbox is a second, independently restartable instance (`tools/sandbox.mjs`,
@@ -131,8 +137,13 @@ Failure containment and observability:
 
 ## Distribution
 
-- **0.1.4 is the current registry version** (`dsh plugin --profile <p> add
-  dsh-cindy-host-demo@0.1.4`), verified from the registry itself: install into a brand-new
+- **0.1.29 is the current published registry version** of production package `dsh-cindy-host`, from Git commit `4ad3bc320bb02020cfab7875adb8b98579ed633e`; npm latest SHA-1 is `e831361a8d7158e844ffff42c0fd56e29e5589d2`. The GitHub release asset SHA-256 is `f317806c192ce60e8961731d6b4f7b297659199e3938973e00dbc0182e0cab3b`. This release synchronizes the already-verified 0.1.28 runtime business logic with reproducible source/tests and lock data; it did not change that logic. The release run recorded 886 tests passing, 3 skipped, 0 failed. See `.release/repository-0.1.29/release-result.json`.
+- **The running desktop profile remains on 0.1.28**, which had been installed and verified loaded; 0.1.29 was not installed into/restarted on the production profile (`productionRestarted: false`). The 0.1.28 runtime reported `inputDeliveryReady: true`, delivery version 1, connected, zero handler errors, and no last delivery error. After activation the user confirmed the phone and desktop queue behavior normal. Automation covers reconnect/replay, but physical weak-network reconnection was not separately tested. See `.release/ack-0.1.28/release-evidence.json` and [DeviceLink protocol Truth](<.claw/truth/dsh-cindy-host-device-link-protocol.md>). The inherited DSH SDK Zod advisory remains unresolved; no forced SDK upgrade was made.
+- Historical 0.1.26 state: after manual restart, the desktop profile loaded 0.1.26 and was connected with zero handler errors. A later compatibility review found the default mobile durable-outbox confirmation route was rejected; 0.1.27/0.1.28 subsequently addressed the history and busy-queue gaps. See the dated evolution in [DeviceLink protocol Truth](<.claw/truth/dsh-cindy-host-device-link-protocol.md>).
+- The 2026-10-14 installation used `plugin_manager` to install the exact published 0.1.23 tarball while registry propagation was delayed. Follow-up inspection confirmed the plugin enabled and version 0.1.23 installed; installed router SHA-256 matched production source. The installer reported a timeout after pnpm completed, so this does **not** prove live activation. The user chose a later manual restart; desktop activation and Cindy mobile end-to-end verification remain pending until after that restart.
+- Release validation was deliberately scoped and user-approved: production worktree commit `5effc18` / tag `v0.1.23`; 770 unit tests passed with 3 skipped, with two skipped real-client contract tests rerun successfully; channel audit 54 served / 142 declined / 0 unclassified; clean isolated DSH mount and repeated missing-delete success over authenticated HTTP. Legacy broad acceptance was 67/77 and is **not** a release-green result; mobile end-to-end remains pending. Registry readback matched the final tarball integrity `sha512-rFu1LnLEQPQWOcz3ToZ+zHLlpv0ncirtxc1tlSu84YU4KStdgoF70csJtwBuj+PHvyTJ5cvxIpSeojv98np2lA==`.
+- The active npm package, Cordis bundle name, client ModuleLoader id, Profile dependency/bundle/lock/node_modules identity must change together; the Cordis row id, plugin name, settings namespace and HTTP prefix remain `dsh-cindy-host`, so user settings and login state do not migrate.
+- Historical 0.1.x validation retained the same clean-install rule: install into a brand-new
   `DSH_HOME` → `profile-local @deepseek-ai == 0`, compose passes, `dsh web` starts,
   `/api/dsh-cindy-host/status` → `200`. Its change is the new-conversation runtime
   (`.claw/truth/dsh-cindy-host-new-session-runtime.md`, `.claw/adr/0011`).
@@ -169,6 +180,11 @@ Failure containment and observability:
 
 <!-- state: history -->
 ## Evolution history
+
+<!-- dated: 2026-10-14 -->
+### 0.1.23 published; profile activation remains unverified
+
+The scoped release shipped from the production worktree as `dsh-cindy-host@0.1.23`. Registry integrity matched the final tarball, and the authenticated isolated DSH mount acknowledged repeated missing-session deletion. The current profile received the same reviewed tarball through `plugin_manager` after registry propagation lag; installed version and router hash matched the release source. The installer timed out after pnpm completion, and the user deferred restart to later manual action, so installed bytes are not evidence of live activation. The legacy broad acceptance remained 67/77, explicitly not green; mobile end-to-end verification is pending after restart.
 
 <!-- dated: 2026-09-17 -->
 ### The dependency declarations poisoned the profile that installed them

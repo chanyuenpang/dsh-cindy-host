@@ -11,10 +11,10 @@
  * what the runtime says. The card is a renderer.
  */
 import { randomUUID } from 'node:crypto';
-import { loadSession, clearSession } from './credential-store.js';
+import { loadSession } from './credential-store.js';
 import { rememberedDeviceId } from './host-settings.js';
 import { requestLoginCode, verifyLoginCode, selectLoginAccount } from './cindy-login-flow.js';
-import { adoptSession } from './auth-session.js';
+import { adoptSession, forgetSession } from './auth-session.js';
 
 /** Route prefix; the card hardcodes the same value. */
 export const API_PREFIX = '/api/dsh-cindy-host';
@@ -63,7 +63,12 @@ export async function readJsonBody(req) {
  * @param options - the runtime accessor and an optional diagnostics producer.
  * @returns one handler per route, each owning its own response.
  */
-export function createHostRoutes({ getRuntime, getDiagnostics, getSettings, rememberDeviceId }) {
+export function createHostRoutes({ getRuntime, getDiagnostics, getSettings, rememberDeviceId, auth = {} }) {
+  const loadCredential = auth.loadSession ?? loadSession;
+  const saveCredential = auth.adoptSession ?? adoptSession;
+  const forgetCredential = auth.forgetSession ?? forgetSession;
+  const verifyCredential = auth.verifyLoginCode ?? verifyLoginCode;
+  const selectCredential = auth.selectLoginAccount ?? selectLoginAccount;
   /**
    * The stable Cindy device handle for this Host.
    *
@@ -74,23 +79,29 @@ export function createHostRoutes({ getRuntime, getDiagnostics, getSettings, reme
    * different device and makes the phone's existing link dangle.
    * @returns the device id to log in with.
    */
+  let pendingDeviceId = null;
+  let fallbackDeviceId = null;
   async function hostDeviceId() {
-    const stored = await loadSession().catch(() => null);
-    const fromCredential = typeof stored?.deviceId === 'string' ? stored.deviceId.trim() : '';
-    const remembered = typeof getSettings === 'function'
-      ? (() => { try { return rememberedDeviceId(getSettings()); } catch { return ''; } })()
-      : '';
-    const deviceId = fromCredential !== '' ? fromCredential : (remembered !== '' ? remembered : randomUUID());
-    if (deviceId !== remembered && typeof rememberDeviceId === 'function') {
-      // Remembering is best effort: a settings write that fails must not cost the
-      // login the user is in the middle of.
-      try {
-        await rememberDeviceId(deviceId);
-      } catch {
-        // Ignored on purpose.
+    if (pendingDeviceId) return pendingDeviceId;
+    pendingDeviceId = (async () => {
+      // A read failure is NOT a missing identity. Never create a replacement then.
+      const stored = await loadCredential();
+      const fromCredential = typeof stored?.deviceId === 'string' ? stored.deviceId.trim() : '';
+      const remembered = typeof getSettings === 'function' ? rememberedDeviceId(getSettings()) : '';
+      const existing = fromCredential || remembered || fallbackDeviceId;
+      const deviceId = existing || randomUUID();
+      if (deviceId !== remembered && typeof rememberDeviceId === 'function') {
+        try { await rememberDeviceId(deviceId); }
+        catch (error) {
+          // A new ID must be durable before it is registered remotely.
+          if (!existing) throw error;
+        }
       }
-    }
-    return deviceId;
+      fallbackDeviceId = deviceId;
+      return deviceId;
+    })();
+    try { return await pendingDeviceId; }
+    finally { pendingDeviceId = null; }
   }
 
   /** Why the Host has (or has not) any data to serve — cheap, and only for diagnosis. */
@@ -133,8 +144,7 @@ export function createHostRoutes({ getRuntime, getDiagnostics, getSettings, reme
   }
 
   async function handleVerifyCode(req, res, body) {
-    const runtime = getRuntime();
-    const result = await verifyLoginCode({
+    const result = await verifyCredential({
       kind: body.kind,
       identifier: body.identifier,
       code: body.code,
@@ -144,7 +154,9 @@ export function createHostRoutes({ getRuntime, getDiagnostics, getSettings, reme
       sendJson(res, 400, result);
       return;
     }
-    await adoptSession(result.session);
+    const runtime = getRuntime();
+    await runtime?.beginIdentityChange?.();
+    await saveCredential(result.session);
     // A login while the switch is already on must finish the connect the user
     // asked for; with the switch off it only stores the session.
     if (runtime) {
@@ -155,13 +167,14 @@ export function createHostRoutes({ getRuntime, getDiagnostics, getSettings, reme
   }
 
   async function handleSelectAccount(req, res, body) {
-    const runtime = getRuntime();
-    const result = await selectLoginAccount({ loginTicket: body.loginTicket, accountId: body.accountId, deviceId: await hostDeviceId() });
+    const result = await selectCredential({ loginTicket: body.loginTicket, accountId: body.accountId, deviceId: await hostDeviceId() });
     if (!result.ok) {
       sendJson(res, 400, result);
       return;
     }
-    await adoptSession(result.session);
+    const runtime = getRuntime();
+    await runtime?.beginIdentityChange?.();
+    await saveCredential(result.session);
     if (runtime) {
       runtime.status.setLogin({ authenticated: true, required: false });
       await runtime.connect();
@@ -171,7 +184,8 @@ export function createHostRoutes({ getRuntime, getDiagnostics, getSettings, reme
 
   async function handleLogout(req, res) {
     const runtime = getRuntime();
-    await clearSession();
+    await runtime?.beginIdentityChange?.();
+    await forgetCredential();
     if (runtime) await runtime.disconnect();
     sendJson(res, 200, { ok: true, status: runtime ? runtime.getStatus() : null });
   }
@@ -204,7 +218,23 @@ export function createHostRoutes({ getRuntime, getDiagnostics, getSettings, reme
    * The route table: one entry per accepted method+path.
    * @returns handlers keyed by method and pathname.
    */
+  async function handleDeleteDevice(req, res, body) {
+    // A cross-origin HTML form cannot issue this JSON-only destructive request.
+    if (!(req.headers?.['content-type'] ?? '').toLowerCase().startsWith('application/json') || req.headers?.['sec-fetch-site'] === 'cross-site') {
+      sendJson(res, 403, { ok: false, message: '删除设备需要同源 JSON 请求' });
+      return;
+    }
+    const runtime = getRuntime();
+    if (typeof runtime?.deleteDevice !== 'function') {
+      sendJson(res, 503, { ok: false, message: 'Cindy Host 运行时尚未就绪' });
+      return;
+    }
+    const result = await runtime.deleteDevice(body.deviceId);
+    sendJson(res, result.ok ? 200 : (result.statusCode ?? 502), { ...result, status: runtime.getStatus() });
+  }
+
   const table = new Map([
+    ['POST /devices/delete', handleDeleteDevice],
     ['GET /status', handleStatus],
     ['POST /reconnect', handleReconnect],
     ['POST /login/request-code', handleRequestCode],
@@ -215,7 +245,7 @@ export function createHostRoutes({ getRuntime, getDiagnostics, getSettings, reme
   ]);
 
   /** Paths that take a JSON body. */
-  const BODY_PATHS = new Set(['/reconnect', '/login/request-code', '/login/verify-code', '/login/select-account', '/logout', '/selftest']);
+  const BODY_PATHS = new Set(['/devices/delete', '/reconnect', '/login/request-code', '/login/verify-code', '/login/select-account', '/logout', '/selftest']);
 
   /**
    * The one handler registered on the web server.

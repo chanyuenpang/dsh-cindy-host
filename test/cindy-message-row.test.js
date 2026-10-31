@@ -26,10 +26,10 @@ test('splits one DSH message into one row per renderable block, in order', () =>
 
   assert.deepEqual(rows.map((row) => row.role), ['thinking', 'tool_use', 'assistant']);
   // Thought → tool → answer: the order the user reads.
-  assert.deepEqual(rows[0].content, { text: 'thinking about it' });
+  assert.equal(rows[0].content, 'thinking about it');
   assert.equal(rows[1].toolUseId, 'call-1');
   assert.deepEqual(rows[1].content, { toolName: 'read_file', input: { path: 'a.ts' }, toolUseId: 'call-1' });
-  assert.deepEqual(rows[2].content, { text: 'Done.' });
+  assert.equal(rows[2].content, 'Done.');
 });
 
 test('renames the plan tool to the one name the phone renders a todo card for', () => {
@@ -124,7 +124,7 @@ test('drops blocks the phone has no representation for', () => {
     { sessionId: SESSION, createdAt: AT },
   );
   assert.equal(rows.length, 1, 'media has no channel in this slice, so it is skipped rather than emitted empty');
-  assert.equal(rows[0].content.text, 'caption');
+  assert.equal(rows[0].content, 'caption');
 });
 
 test('drops empty text and reasoning blocks, which exist only to host usage', () => {
@@ -152,7 +152,7 @@ test('reverses message order but never block order within a message', () => {
     { sessionId: SESSION },
   );
   // Newest message first (the phone's DESC paging contract) …
-  assert.deepEqual(rows.map((row) => row.content.text), ['then', 'second', 'first']);
+  assert.deepEqual(rows.map((row) => typeof row.content === 'string' ? row.content : row.content.text), ['then', 'second', 'first']);
   // … but within the newest message, thought still precedes the answer.
   assert.deepEqual(rows.slice(0, 2).map((row) => row.role), ['thinking', 'assistant']);
 });

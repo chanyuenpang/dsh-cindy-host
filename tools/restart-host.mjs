@@ -15,9 +15,17 @@
  * next (`/status`, or the log this writes), and a restart a person performs by hand does not
  * verify either.
  *
+ * The stop half is a **sweep, not one kill**: after the instance on the port is stopped, the
+ * other processes this DSH owns are stopped too — its command subprocesses
+ * (`dsh-subprocess-local/lib/runner.js`, the thing actually holding a pwsh/cmd/node command), its
+ * own worker children, and the orphans a previous instance left behind. A `dsh` tree that is only
+ * half gone is what makes the next start look hung, so the sweep runs before the relaunch rather
+ * than after it. `--keep-sandboxes` narrows it back to the target's own tree.
+ *
  * Usage:
  *   node tools/restart-host.mjs                      # dry run: what would happen
  *   node tools/restart-host.mjs --apply --grace 60   # do it, 60s from now (the default)
+ *   node tools/restart-host.mjs --keep-sandboxes --apply
  */
 import { execFileSync, spawn } from 'node:child_process';
 import { appendFileSync, closeSync, existsSync, mkdirSync, openSync } from 'node:fs';
@@ -35,11 +43,12 @@ export function parseArgs(argv) {
   // 60s, not 20: an agent that restarts this instance must first say so in the conversation, and
   // the message and the disconnect arriving together is the same as no warning at all
   // (「如果有重启的话一定要提前告诉我，不然我不知道你已经掉线了」).
-  const options = { apply: false, graceSeconds: 60, port: 3080, dshHome: null };
+  const options = { apply: false, graceSeconds: 60, port: 3080, dshHome: null, keepSandboxes: false };
   for (let index = 0; index < argv.length; index += 1) {
     const flag = argv[index];
     if (flag === '--apply') options.apply = true;
     else if (flag === '--supervise') options.supervise = true;
+    else if (flag === '--keep-sandboxes') options.keepSandboxes = true;
     else if (flag === '--grace') { options.graceSeconds = Number(argv[index + 1]); index += 1; }
     else if (flag === '--port') { options.port = Number(argv[index + 1]); index += 1; }
     else if (flag === '--dsh-home') { options.dshHome = argv[index + 1]; index += 1; }
@@ -100,8 +109,114 @@ function commandLineOf(pid) {
   }
 }
 
-/** The detached half: stop, then start. Two statements, and a line for each. */
-async function supervise({ port, graceSeconds, dshHome }) {
+/**
+ * Is this a process this DSH owns — its entry point, or one of the command subprocesses it
+ * spawns?
+ *
+ * The marker is the installed `@deepseek-ai/dsh` path, so every pinned command the harness runs
+ * matches: `lib/bin.js web` (the host itself), `dsh-subprocess-local/lib/runner.js` and
+ * `dsh-subprocess-windows/lib/runner.js` (the shell wrappers — "sandbox threads" in plain words:
+ * the pwsh/cmd/node process a command actually runs in), and `dsh-browser`'s headless child.
+ *
+ * The image name is not part of the test: the browser helper is node too, and the runner may be
+ * started by another runtime. What must *not* match is a line that merely mentions the word dsh —
+ * `claw`'s CLI (`--host dsh`), this script itself, and the `dsh-*` packages of unrelated products
+ * all fail on the path marker.
+ * @param commandLine - a process's command line, as `Win32_Process` reports it.
+ * @returns true when this process belongs to this DSH installation.
+ */
+export function isDshProcess(commandLine) {
+  return typeof commandLine === 'string' && /@deepseek-ai[\\/]dsh[\\/]/i.test(commandLine);
+}
+
+function commandLines() {
+  try {
+    const json = execFileSync('powershell', ['-NoProfile', '-Command', "Get-CimInstance Win32_Process | Where-Object { $_.Name -like 'node*' -or $_.Name -like 'dsh*' } | Select-Object ProcessId,ParentProcessId,Name,CommandLine | ConvertTo-Json -Compress"], { encoding: 'utf8' });
+    const parsed = JSON.parse(json.trim() === '' ? '[]' : json);
+    return Array.isArray(parsed) ? parsed : [parsed];
+  } catch {
+    // No CIM, no sweep: the caller still stops the target it found through netstat.
+    return [];
+  }
+}
+
+function isAlive(pid) {
+  try {
+    process.kill(pid, 0);
+    return true;
+  } catch {
+    return false;
+  }
+}
+
+/**
+ * Stop every process of this DSH tree, not just the listener.
+ *
+ * Killing only the pid on the port leaves the command subprocesses and the worker children it
+ * spawned: `runner.js` is not in its parent's job object on the way down, so it survives as an
+ * orphan holding a shell, a pipe and sometimes a lock on a log file. Those orphans are what turn
+ * "restart DSH" into "the new instance comes up wrong", so they are stopped here — before the
+ * relaunch, while nothing new is running yet.
+ *
+ * @param options.pid - the listener that was already killed, if any; its whole tree goes first.
+ * @param options.keepSandboxes - stop that tree only, and leave unrelated `dsh` processes alone.
+ * @param options.log - one line per decision, into the restart log.
+ * @returns the pids it stopped, in the order it stopped them.
+ */
+export async function sweepDshProcesses({ pid = null, keepSandboxes = false, log = () => {} } = {}) {
+  const self = process.pid;
+  const parent = process.ppid;
+  const all = commandLines();
+  const alive = (candidate) => candidate !== self && candidate !== parent && isAlive(candidate);
+
+  /** The target and everything below it: parent links are the tree, whatever the child's name. */
+  const tree = new Set();
+  if (pid !== null && isAlive(pid)) {
+    let frontier = [pid];
+    tree.add(pid);
+    for (let depth = 0; depth < 20 && frontier.length > 0; depth += 1) {
+      const next = all
+        .filter((row) => frontier.includes(row.ParentProcessId) && !tree.has(row.ProcessId))
+        .map((row) => row.ProcessId);
+      for (const candidate of next) tree.add(candidate);
+      frontier = next;
+    }
+  }
+
+  // Orphans of a previous instance, plus this instance's own workers. Both carry the marker, so
+  // the list is "every dsh process that is not inside something we must not touch".
+  const identified = all
+    .filter((row) => isDshProcess(row.CommandLine))
+    .map((row) => row.ProcessId);
+  const swept = keepSandboxes ? [...tree] : [...new Set([...tree, ...identified])];
+  const targets = swept.filter(alive);
+  if (targets.length === 0) {
+    log('cleanup: no dsh processes left to stop');
+    return [];
+  }
+
+  log(`cleanup: stopping ${targets.length} dsh process(es) ${keepSandboxes ? '(target tree only)' : '(whole tree, including command subprocesses)'} — pids ${targets.join(', ')}`);
+  for (const candidate of targets) {
+    try {
+      process.kill(candidate);
+    } catch (error) {
+      log(`cleanup: kill ${candidate} failed: ${error.message}`);
+    }
+  }
+
+  // A reaped command subprocess can take a moment to disappear; a second pass is cheap and is
+  // the difference between "gone" and "gone except the one that mattered".
+  for (let attempt = 0; attempt < 11; attempt += 1) {
+    const remaining = targets.filter(isAlive);
+    if (remaining.length === 0) break;
+    await settle(250);
+    if (attempt === 10) log(`cleanup: still alive after 2.5s — pids ${remaining.join(', ')}`);
+  }
+  return targets;
+}
+
+/** The detached half: stop (the tree), then start. Two statements, and a line for each. */
+async function supervise({ port, graceSeconds, dshHome, keepSandboxes }) {
   const oldPid = listenerPid(port);
   const args = oldPid === null ? [] : launchArgsFrom(commandLineOf(oldPid));
   log(`restart: port ${port}, target ${oldPid ?? 'none'}, grace ${graceSeconds}s, args ${JSON.stringify(args)}`);
@@ -118,6 +233,9 @@ async function supervise({ port, graceSeconds, dshHome }) {
     }
     for (let attempt = 0; attempt < 20 && listenerPid(port) !== null; attempt += 1) await settle(250);
   }
+  // Stop before starting: the sweep is here, not after the relaunch, so nothing of the old tree
+  // is still holding a shell, a pipe or a log file while the new instance opens its own.
+  await sweepDshProcesses({ pid: oldPid, keepSandboxes, log });
 
   const globalBin = join(process.env.APPDATA ?? '', 'npm', 'node_modules', '@deepseek-ai', 'dsh', 'lib', 'bin.js');
   if (!existsSync(globalBin)) {
@@ -150,20 +268,26 @@ if (!isMain) {
   await supervise(options);
 } else {
   const pid = listenerPid(options.port);
+  const cleanup = options.keepSandboxes
+    ? '(not swept: --keep-sandboxes)'
+    : commandLines().filter((row) => isDshProcess(row.CommandLine)).map((row) => row.ProcessId);
   console.log(JSON.stringify({
     port: options.port,
     targetPid: pid,
     relaunchArgs: pid === null ? [] : launchArgsFrom(commandLineOf(pid)),
     dshHome: options.dshHome ?? process.env.DSH_HOME ?? '(inherited default)',
     graceSeconds: options.graceSeconds,
+    cleanupPids: cleanup,
     mode: options.apply ? 'APPLY' : 'DRY RUN',
   }, null, 2));
   if (!options.apply) {
-    console.log('\ndry run: nothing was touched. --apply kills the target and starts it again.');
+    console.log('\ndry run: nothing was touched. --apply stops the target, sweeps the rest of the dsh tree, and starts it again.');
+    if (options.keepSandboxes) console.log('--keep-sandboxes: the sweep is limited to the target\'s own tree.');
+    else console.log(`--apply would also stop ${cleanup.length} dsh process(es): pids ${cleanup.join(', ') || '(none)'}.`);
   } else {
     // Through WMI: this process is a child of the very pid that is about to die, and a plain
     // `detached` child stays inside the harness's per-command job object (ADR-0009).
-    const superviseArgs = [fileURLToPath(import.meta.url), '--supervise', '--port', String(options.port), '--grace', String(options.graceSeconds), ...(options.dshHome === null ? [] : ['--dsh-home', options.dshHome])];
+    const superviseArgs = [fileURLToPath(import.meta.url), '--supervise', '--port', String(options.port), '--grace', String(options.graceSeconds), ...(options.keepSandboxes ? ['--keep-sandboxes'] : []), ...(options.dshHome === null ? [] : ['--dsh-home', options.dshHome])];
     const commandLine = [process.execPath, ...superviseArgs].map((part) => `"${part}"`).join(' ');
     let via = 'wmi';
     try {
@@ -181,6 +305,7 @@ if (!isMain) {
     }
     log(`requested: port ${options.port}, grace ${options.graceSeconds}s, via ${via}`);
     console.log(`\nAPPLY: restarting port ${options.port} in ${options.graceSeconds}s (via ${via}).`);
+    console.log(`stops the target, then the rest of the dsh tree${options.keepSandboxes ? ' (target tree only)' : ''}; then starts the new instance.`);
     console.log(`outcome goes to ${logFile}; this process may be killed in the meantime.`);
   }
 }

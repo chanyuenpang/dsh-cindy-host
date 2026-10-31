@@ -21,6 +21,9 @@ const DSH_MODEL = 'pi';
 const DSH_EFFORT = 'default';
 const DSH_PERMISSION_MODE = 'default';
 
+/** Bound recent durable-consumption evidence; this is not a second queue store. */
+export const RETIRED_INPUT_LIMIT = 2048;
+
 /**
  * The session's working directory, from whichever row shape was handed in.
  *
@@ -93,8 +96,10 @@ export function toQueuedRemoteMessage(item, session) {
     permissionMode: DSH_PERMISSION_MODE,
     workingDir,
     createOpts,
-    // The controller's validator requires a user-role chat message.
-    chatMessage: { role: 'user', clientId, content },
+    // This is a rendered ChatMessage, not the agent's raw SDK content blocks.
+    // Desktop promotes it directly into the transcript as the queue drains;
+    // its quote/navigation parsers require a string. Keep rich persistence above.
+    chatMessage: { role: 'user', clientId, content: text },
   };
 }
 
@@ -132,7 +137,7 @@ export function queuedRowFromController({ clientId, text, session }) {
     permissionMode: DSH_PERMISSION_MODE,
     workingDir,
     createOpts,
-    chatMessage: { role: 'user', clientId, content: [{ type: 'text', text: value }] },
+    chatMessage: { role: 'user', clientId, content: value },
   };
 }
 
@@ -145,6 +150,22 @@ export function createInputQueueTracker() {
   const queues = new Map();
   /** sessionId -> SessionJob[] */
   const jobs = new Map();
+  // Durable consumption can beat prompt acceptance/ACK and stale control reads.
+  // Keep proof long enough that those late observations cannot revive a spinner.
+  const retired = new Map();
+  const retirementKey = (sessionId, clientId) => JSON.stringify([sessionId, clientId]);
+  const isRetired = (sessionId, clientId) => retired.has(retirementKey(sessionId, clientId));
+  const itemRetired = (sessionId, item) => isRetired(sessionId,
+    typeof item?.rpcId === 'string' && item.rpcId !== '' ? item.rpcId : String(item?.id ?? ''));
+
+  function retire(sessionId, clientId) {
+    if (typeof sessionId !== 'string' || !sessionId || typeof clientId !== 'string' || !clientId) return;
+    const key = retirementKey(sessionId, clientId);
+    retired.delete(key);
+    retired.set(key, true);
+    while (retired.size > RETIRED_INPUT_LIMIT) retired.delete(retired.keys().next().value);
+    mirror(sessionId, clientId, { kind: 'remove' });
+  }
   /**
    * sessionId -> controller-owned queue UI state.
    *
@@ -230,49 +251,10 @@ export function createInputQueueTracker() {
   function markItem(sessionId, item, placement) {
     if (typeof sessionId !== 'string' || sessionId === '') return;
     const id = item?.id === undefined || item?.id === null ? null : String(item.id);
-    if (id === null) return;
+    if (id === null || itemRetired(sessionId, item)) return;
     const items = queues.get(sessionId) ?? [];
     const others = items.filter((entry) => String(entry?.id) !== id);
-    // `at` is what a pending transcript row is stamped with, so the message the user is
-    // looking at carries the moment it was accepted rather than the moment it was read.
-    queues.set(sessionId, [...others, { ...item, id, placement, at: Date.now() }]);
-  }
-
-  /**
-   * Transcript-shaped rows for prompts this Host has accepted but DSH has not made durable.
-   *
-   * The gap this closes, measured: a prompt sent while a turn is running waits in DSH's
-   * inbox until the turn reaches a step boundary — 0.4 s when idle, and **42 s** in the worst
-   * observed case. During that window the session's transcript (both the raw window and the
-   * work-grouped view) contains no row for it, so a controller that reloads the session — or
-   * simply drops its own optimistic bubble — shows nothing at all: 「退出去再进来，它不见了，
-   * 我就要重新输入这句话」, while the prompt is still queued and will be delivered. Serving
-   * the pending prompt as a row makes the Host the source of truth for "we have it", and the
-   * durable row replaces it by `clientId` the moment it lands.
-   *
-   * @param sessionId - the session.
-   * @returns newest-last rows in the controller's message shape.
-   */
-  function pendingTranscriptRows(sessionId) {
-    const rows = [];
-    for (const item of queueFor(sessionId)) {
-      const clientId = typeof item?.rpcId === 'string' && item.rpcId !== '' ? item.rpcId : String(item?.id ?? '');
-      if (clientId === '') continue;
-      const content = Array.isArray(item?.message?.content) ? item.message.content : [];
-      rows.push({
-        id: `${sessionId}:pending:${clientId}`,
-        clientId,
-        sessionId,
-        role: 'user',
-        toolUseId: null,
-        agentMeta: null,
-        createdAt: new Date(Number.isFinite(item?.at) ? item.at : Date.now()).toISOString(),
-        content: { text: textOf(content) ?? '' },
-        // Informational: which queue the prompt is waiting in, for anything that reads it.
-        pendingDelivery: item.placement === 'steering' ? 'steering' : 'queued',
-      });
-    }
-    return rows;
+    queues.set(sessionId, [...others, { ...item, id, placement }]);
   }
 
   /**
@@ -313,7 +295,8 @@ export function createInputQueueTracker() {
 
   /** Rebuild one session's queue state. */
   function setItems(sessionId, items) {
-    if (Array.isArray(items) && items.length > 0) queues.set(sessionId, items);
+    const pending = Array.isArray(items) ? items.filter((item) => !itemRetired(sessionId, item)) : [];
+    if (pending.length > 0) queues.set(sessionId, pending);
     else queues.delete(sessionId);
   }
 
@@ -330,7 +313,7 @@ export function createInputQueueTracker() {
       queues.clear();
       jobs.clear();
       for (const [sessionId, items] of Object.entries(frame.value?.queues ?? {})) {
-        if (Array.isArray(items)) queues.set(sessionId, items);
+        setItems(sessionId, items);
       }
       for (const [sessionId, entries] of Object.entries(frame.value?.jobs ?? {})) {
         if (Array.isArray(entries)) jobs.set(sessionId, entries);
@@ -379,12 +362,15 @@ export function createInputQueueTracker() {
     const seen = new Set();
     for (const item of source) {
       const row = toQueuedRemoteMessage(item, session);
-      if (row === null) continue;
+      if (row === null || isRetired(sessionId, row.clientId)) continue;
       seen.add(row.clientId);
+      // DSH next-step (steering) is still an inbox wait, not a consumed message.
+      // Cindy supports the same id in both fields: the body survives re-entry
+      // and its phase is 'sending', with queue actions disabled until delivery.
+      if (item?.placement === 'queued' || item?.placement === 'steering') pendingQueue.push(row);
       if (item?.placement === 'steering') steeringQueueClientIds.push(row.clientId);
-      else if (item?.placement === 'queued') pendingQueue.push(row);
     }
-    if (pending !== null && !seen.has(pending.clientId)) pendingQueue.push(pending);
+    if (pending !== null && !seen.has(pending.clientId) && !isRetired(sessionId, pending.clientId)) pendingQueue.push(pending);
 
     const state = uiFor(sessionId);
     return {
@@ -411,6 +397,7 @@ export function createInputQueueTracker() {
     queues.clear();
     jobs.clear();
     ui.clear();
+    retired.clear();
   }
 
   return {
@@ -419,6 +406,8 @@ export function createInputQueueTracker() {
     jobsFor,
     projectionFor,
     clear,
+    /** Only a durable message event is proof of consumption; cancellation is not. */
+    retire,
     /** Whether DSH is holding this item; decides steer-promotion vs a new send. */
     hasItem: (sessionId, itemId) => itemOf(sessionId, itemId) !== undefined,
     /**
@@ -461,15 +450,12 @@ export function createInputQueueTracker() {
     markSteering: (sessionId, item) => { markSteering(sessionId, item); },
     /** Record one just-accepted queued prompt, preserving the rest of the queue. */
     markQueued: (sessionId, item) => { markQueued(sessionId, item); },
-    /** Prompts accepted but not yet durable, in the controller's message shape. */
-    pendingTranscriptRows: (sessionId) => pendingTranscriptRows(sessionId),
     /**
      * The fold's own record for one item, by the controller's id or DSH's.
      *
-     * Needed because the record carries the message **content**, and the projection and the
-     * pending transcript row both render from it: an upsert that only carried an id produced a
-     * bubble with no text (「插入之后里面的文字被清空了」) and an empty transcript row for a
-     * prompt the user could plainly see. Callers that re-place an item preserve what the fold
+     * Needed because the pending projection renders the message **content**: an upsert
+     * carrying only an id produced an empty bubble (「插入之后里面的文字被清空了」).
+     * Callers that re-place an item preserve what the fold
      * already knew instead of restating it from memory.
      */
     itemFor: (sessionId, itemId) => queueFor(sessionId).find(

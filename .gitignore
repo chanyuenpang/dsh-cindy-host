@@ -44,3 +44,14 @@ Thumbs.db
 
 # 本地打出来的安装包与探针产物（77MB 级二进制，绝不入库）
 artifacts/
+
+# claw-kit
+.claw/*
+.claw/tasks/
+!.claw/project.json
+!.claw/truth/
+!.claw/truth/**
+.claw/project-override.json
+
+# Local release validation may contain private profiles and credentials.
+.release/

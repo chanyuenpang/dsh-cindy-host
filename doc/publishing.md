@@ -55,7 +55,7 @@ dsh plugin --profile <profile> add dsh-cindy-host-demo@<version>
 2. **DSH 自己的包一律 `peerDependencies`，绝不进 `dependencies`（也绝不进
    `optionalDependencies`）**。宿主提供它们；插件自己装一份，就等于把**另一代 DSH** 装进别人的
    profile，宿主再组合这个混合体便起不来。0.1.1 犯的正是这个错，实测与规则见 §5.4 / §5.6。
-   `dependencies` 里只放宿主不提供的库（本包是 `keytar` 与 `ws`）。
+   `dependencies` 里只放宿主不提供的库（本包是 `keytar`、`ws` 与固定版本的 `werift`）。
 3. **原生依赖要写清**：`keytar` 是原生模块（Windows 凭据管理器）。发布说明里必须写明平台/Node ABI
    要求（本包 `engines.node >= 22`），否则会出现"装上了但起不来"。
 4. **`private` 必须是 `false`**（发布到 registry 的必要条件；它是防止误发布的开关，不是发布配置。

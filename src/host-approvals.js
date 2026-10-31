@@ -113,7 +113,29 @@ export function createApprovalRegistry({
 } = {}) {
   /** requestId -> { sessionId, request, settle, timer } */
   const pending = new Map();
+  /** Web bridges observing structured questions; observing never owns or settles them. */
+  const questionObservers = new Set();
   let counter = 0;
+
+  function questionRequestEvent(request) {
+    return {
+      type: 'interaction-request',
+      sessionId: request.sessionId,
+      requestId: request.requestId,
+      kind: request.kind,
+      questions: request.questions.map((question) => ({ ...question })),
+    };
+  }
+
+  function notifyQuestionObservers(event) {
+    for (const observer of questionObservers) {
+      try {
+        observer(event);
+      } catch {
+        // An unavailable Web observer must not affect the single pending answer.
+      }
+    }
+  }
 
   function nextRequestId(prefix = 'dsh-approval') {
     counter += 1;
@@ -150,6 +172,14 @@ export function createApprovalRegistry({
           // A broken listener must not strand the answer the asker is waiting on.
         }
       }
+      if (request.kind === QUESTION_KIND) {
+        notifyQuestionObservers({
+          type: 'interaction-dismissed',
+          sessionId,
+          requestId: request.requestId,
+          kind: request.kind,
+        });
+      }
       settle(outcome);
     };
 
@@ -164,6 +194,7 @@ export function createApprovalRegistry({
     if (typeof timer?.unref === 'function') timer.unref();
 
     pending.set(request.requestId, { sessionId, request, settle: finish, timer, onAbort, answerOf });
+    if (request.kind === QUESTION_KIND) notifyQuestionObservers(questionRequestEvent(request));
     return { requestId: request.requestId, request, answered };
   }
 
@@ -239,6 +270,27 @@ export function createApprovalRegistry({
   }
 
   /**
+   * Observe structured questions without acquiring any right to settle them.
+   *
+   * Registration first replays all still-pending question entries, so a Web bridge
+   * that reconnects renders the same registry the phone lists. It returns a
+   * disposer; disconnecting only stops observation and never cancels a turn.
+   */
+  function observeUserQuestions(observer) {
+    if (typeof observer !== 'function') return () => {};
+    questionObservers.add(observer);
+    for (const entry of pending.values()) {
+      if (entry.request.kind !== QUESTION_KIND) continue;
+      try {
+        observer(questionRequestEvent(entry.request));
+      } catch {
+        // A failed initial replay is no different from a failed live push.
+      }
+    }
+    return () => questionObservers.delete(observer);
+  }
+
+  /**
    * Answer one pending interaction.
    *
    * The mapping comes from the **stored** entry, not from the decision's own
@@ -264,5 +316,5 @@ export function createApprovalRegistry({
     }
   }
 
-  return { ask, askUser, list, settle, clear, size: () => pending.size };
+  return { ask, askUser, list, observeUserQuestions, settle, clear, size: () => pending.size };
 }

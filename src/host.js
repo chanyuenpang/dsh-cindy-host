@@ -19,7 +19,7 @@
  *    missing `pong`s as a dead socket.
  */
 import WebSocket from 'ws';
-import { readFile as readFileImpl, realpath as realpathImpl, stat as statImpl } from 'node:fs/promises';
+import { realpath as realpathImpl, stat as statImpl } from 'node:fs/promises';
 import { extname as extnameImpl, resolve as resolvePathImpl } from 'node:path';
 import { restoreSession } from './auth-session.js';
 import { createChannelRouter, invokeError } from './cindy-channels.js';
@@ -29,15 +29,25 @@ import { createProjectionTracker, toGoalStatusPayload } from './host-goals.js';
 import { ReadOnlyProjection } from './projection.js';
 import { SessionReadModel } from './session-read-model.js';
 import { ProjectionReadModelSink } from './projection-read-model-sink.js';
-import { publishLifecycle, turnEventFor } from './session-publisher.js';
+import { publishLifecycle, runningStatusEvent, turnEventFor } from './session-publisher.js';
 import { acceptLink } from './host-authorization.js';
 import { AuthorizationPolicy } from './authorization-policy.js';
 import { HostStatus } from './host-status.js';
-import { DEFAULT_HOST_SETTINGS } from './host-settings.js';
+import { DEFAULT_HOST_SETTINGS, DEFAULT_HOST_DEVICE_NAME, hostDeviceName } from './host-settings.js';
+import { createDeviceNameSync } from './host-device-name.js';
 import { createSessionFlags } from './session-flags.js';
 import { MAX_ATTACHMENT_BYTES } from './host-attachments.js';
 import { createMediaRefResolver, createMediaReleaser, createMediaUploader, mediaApiBaseUrl, isAttachmentOssRef } from './host-media.js';
-import { createLocalMediaFetcher, isBlockedMediaPath, isInsideDirectory, mimeForMediaPath } from './host-media-fetch.js';
+import { createLocalMediaFetcher, createLocalFileResolver, isBlockedMediaPath, isInsideDirectory, mimeForMediaPath } from './host-media-fetch.js';
+import { createFilePeerManager } from './host-file-peer.js';
+import { createFileIceLoader } from './host-file-ice.js';
+import { createLocalFileUrl } from './host-file-reference.js';
+import { FILE_PEER_MAX_BYTES } from './file-peer-protocol.js';
+import { createFileMediaUploader } from './host-media.js';
+import { createExportJobs } from './host-export-jobs.js';
+import { createExportOwner } from './host-export-owner.js';
+import { createTransferDiagnostics } from './host-transfer-diagnostics.js';
+import { normalizeAuthBaseUrl } from './cindy-login-flow.js';
 import { RECONNECT_STABLE_RESET_MS, computeReconnectDelayMs } from './host-reconnect.js';
 import { MAX_FRAME_BYTES, fitInvokeResultToFrame, frameByteLength } from './host-frame-budget.js';
 
@@ -60,9 +70,12 @@ export const HEARTBEAT_INTERVAL_MS = 20_000;
  */
 export const HEARTBEAT_MISS_LIMIT = 3;
 
-export const HOST_DEVICE_NAME = 'DSH Host';
+import { deleteAccountDevice } from './host-device-delete.js';
+
+export const HOST_DEVICE_NAME = DEFAULT_HOST_DEVICE_NAME;
 export const HOST_PLATFORM = 'desktop';
-export const HOST_APP_VERSION = '0.1.0';
+import { HOST_APP_VERSION } from './host-version.js';
+export { HOST_APP_VERSION } from './host-version.js';
 
 /** Default socket factory; tests inject their own. */
 function openRelaySocket(session, url = RELAY_WS_URL) {
@@ -148,21 +161,37 @@ export async function startHost(initialSource, settings = DEFAULT_HOST_SETTINGS,
    *    failure within `SESSION_REFRESH_COOLDOWN_MS` is reported, not retried.
    * @returns whether the in-memory session is now a refreshed one.
    */
+  let credentialOperations = Promise.resolve();
+  function serializeCredentialOperation(action) {
+    const next = credentialOperations.then(action);
+    credentialOperations = next.catch(() => {});
+    return next;
+  }
   let sessionRefreshInFlight = null;
   let sessionRefreshedAt = 0;
   const SESSION_REFRESH_COOLDOWN_MS = 30_000;
   function refreshSessionForMedia() {
     if (sessionRefreshInFlight !== null) return sessionRefreshInFlight;
     if (Date.now() - sessionRefreshedAt < SESSION_REFRESH_COOLDOWN_MS) return Promise.resolve(false);
-    const attempt = (async () => {
+    const callerGeneration = generation;
+    const capturedOwner = exportOwner.capture();
+    const capturedCredential = exportOwner.getCredential(capturedOwner);
+    const attempt = serializeCredentialOperation(async () => {
+      if (stopped || callerGeneration !== generation) return false;
+      if (capturedOwner) {
+        const renewed = await exportOwner.refreshCredential(capturedCredential);
+        sessionRefreshedAt = Date.now();
+        return renewed !== null;
+      }
       const result = await restoreSession();
       sessionRefreshedAt = Date.now();
+      if (stopped || callerGeneration !== generation || exportOwner.capture()) return false;
       if (result?.ok === true && result.session !== undefined) {
         session = result.session;
         return true;
       }
       return false;
-    })().catch(() => { sessionRefreshedAt = Date.now(); return false; });
+    }).catch(() => { sessionRefreshedAt = Date.now(); return false; });
     sessionRefreshInFlight = attempt;
     void attempt.then(() => { if (sessionRefreshInFlight === attempt) sessionRefreshInFlight = null; });
     return attempt;
@@ -188,56 +217,19 @@ export async function startHost(initialSource, settings = DEFAULT_HOST_SETTINGS,
    * session for the same reason attachment fetching does.
    */
   const uploadMedia = createMediaUploader(mediaOptions);
-  /**
-   * The export path's own budget: same staging area, much wider limits.
-   *
-   * `device-link:media:fetch` shows one picture and is capped at 25 MB / 30 s, which is
-   * right for a picture. A file export is "hand me the file that is on that machine":
-   * an APK or an installer is a hundred times that, and at a home upload rate a 77 MB
-   * body needs minutes — the media budget refuses it before it starts (measured
-   * 2026-09-18: `OVERSIZE … over the 26214400 byte limit`) and would abort the PUT
-   * halfway even if it did (`AbortSignal.timeout(30s)`).
-   *
-   * The file is read into memory, so this ceiling is also a memory ceiling: raise it
-   * only with that in mind.
-   */
-  const FILE_EXPORT_MAX_BYTES = 512 * 1024 * 1024;
-  const FILE_EXPORT_UPLOAD_TIMEOUT_MS = 10 * 60_000;
-  const uploadMediaForExport = createMediaUploader({
-    ...mediaOptions,
-    timeoutMs: FILE_EXPORT_UPLOAD_TIMEOUT_MS,
-  });
+  // Streamed workdir Export follows Cindy's inclusive 2GiB ceiling.
+  const FILE_EXPORT_MAX_BYTES = 2 * 1024 * 1024 * 1024;
   /**
    * The controller asking this machine to hand over one of its files.
    *
    * The chat-image path: a picture the agent produced is referenced by path in the
    * transcript, and the controller resolves it through `device-link:media:fetch`. Same
-   * uploader as the file browser's export ops, stricter request handling
-   * (`host-media-fetch.js`): a containment root is mandatory and both sides are realpath'd.
+   * uploader as the file browser's export ops. Directory constraints are optional, as
+   * in Cindy; when supplied, both the file and the root are realpath'd before checking.
    */
   const fetchLocalMedia = createLocalMediaFetcher({ uploader: uploadMedia });
-
-  /**
-   * File exports the controller is polling: transferId → `{ state, size, uploaded, key?, message? }`.
-   *
-   * The reference answers `exportFileStart` **immediately** with a transfer id and does the
-   * upload behind the reply, because a photo can take longer than the invoke budget; the
-   * controller then polls `exportFileStatus`. Terminal states are kept for a while on
-   * purpose: a status reply that goes missing must still be re-readable, or the controller
-   * shows a failed export for a file it could have shown.
-   */
-  const fileExports = new Map();
-  const FILE_EXPORT_TTL_MS = 10 * 60_000;
-  const FILE_EXPORT_MAX_JOBS = 64;
-
-  /** Drop finished exports nobody can still be waiting for. */
-  function pruneFileExports() {
-    if (fileExports.size <= FILE_EXPORT_MAX_JOBS) return;
-    const cutoff = now().getTime() - FILE_EXPORT_TTL_MS;
-    for (const [transferId, job] of fileExports) {
-      if (job.state !== 'uploading' && job.at < cutoff) fileExports.delete(transferId);
-    }
-  }
+  const resolvePeerFile = createLocalFileResolver({ maxBytes: FILE_PEER_MAX_BYTES });
+  const fileUrl = createLocalFileUrl({ resolveFile: resolvePeerFile });
 
   /**
    * Resolve one controller-named path inside its workdir.
@@ -287,42 +279,8 @@ export async function startHost(initialSource, settings = DEFAULT_HOST_SETTINGS,
    * @param input - `{ workdir, relPath }` as the controller sent them.
    * @returns `{ ok: true, transferId, size, mtimeMs }` or a refusal.
    */
-  async function startFileExport(input) {
-    const resolved = await resolveInsideWorkdir(input?.workdir, input?.relPath);
-    if (resolved.ok !== true) return resolved;
-    const transferId = `exp_${now().getTime().toString(36)}_${Math.random().toString(36).slice(2, 8)}`;
-    const job = { state: 'uploading', size: resolved.info.size, uploaded: 0, at: now().getTime() };
-    fileExports.set(transferId, job);
-    pruneFileExports();
-    void (async () => {
-      try {
-        const bytes = await readFileImpl(resolved.real);
-        const staged = await uploadMediaForExport(bytes, { ext: extnameImpl(resolved.real).slice(1), contentType: mimeForMediaPath(resolved.real) });
-        if (staged?.ok === true) Object.assign(job, { state: 'done', key: staged.key, size: bytes.length, uploaded: bytes.length });
-        else Object.assign(job, { state: 'error', message: String(staged?.reason ?? 'staging failed'), uploaded: 0 });
-      } catch (error) {
-        // The message reaches the controller's failure placeholder, so it is the message —
-        // not `Error: …` — that travels.
-        Object.assign(job, { state: 'error', message: String(error?.message ?? error), uploaded: 0 });
-      }
-    })();
-    return { ok: true, transferId, size: resolved.info.size, mtimeMs: Number.isFinite(resolved.info.mtimeMs) ? resolved.info.mtimeMs : 0 };
-  }
-
-  /** Report one export's progress or terminal state; idempotent on purpose. */
-  function fileExportStatus(input) {
-    const transferId = typeof input?.transferId === 'string' ? input.transferId : '';
-    const job = transferId === '' ? undefined : fileExports.get(transferId);
-    if (job === undefined) return { ok: false, code: 'NOT_FOUND', message: `unknown transfer: ${transferId === '' ? '<none>' : transferId}` };
-    return {
-      ok: true,
-      state: job.state,
-      size: job.size,
-      uploaded: job.uploaded,
-      ...(job.key === undefined ? {} : { key: job.key }),
-      ...(job.message === undefined ? {} : { message: job.message }),
-    };
-  }
+  const startFileExport = (input, request) => fileExports.start(input, request);
+  const fileExportStatus = (input, request) => fileExports.status(input, request);
 
   const model = new SessionReadModel();
   /** Devices following the list-level `sessions` topic. */
@@ -378,10 +336,19 @@ export async function startHost(initialSource, settings = DEFAULT_HOST_SETTINGS,
   const status = new HostStatus({ now });
 
   let current = settings;
+  const deviceNameSync = createDeviceNameSync({ url: deviceListUrl(relayUrl), fetchImpl });
+  deviceNameSync.reset(current?.deviceName?.trim() || null);
+  function syncDeviceName() {
+    deviceNameSync.update({ name: current?.deviceName?.trim() || null,
+      session: active && ws !== null && boundSocketGeneration === generation &&
+        (current?.transportEnabled || current?.remoteControlEnabled) && status.ownDeviceId ? session : null, deviceId: status.ownDeviceId });
+  }
   let source = initialSource;
   let active = false;
-  let connecting = false;
+  let connecting = null; // Generation owning the in-flight connect, not a global latch.
   let session = null;
+  let socketSession = null;
+  let boundSocketGeneration = -1;
   let ws = null;
   let projection = null;
   let heartbeat = null;
@@ -401,6 +368,40 @@ export async function startHost(initialSource, settings = DEFAULT_HOST_SETTINGS,
   // and must not touch the runtime.
   let generation = 0;
   let stopped = false;
+  // Peer connections never outlive the relay/account authorization that created them.
+  const transferDiagnostics = createTransferDiagnostics({ now: () => Number(now()) });
+  let fileExports;
+  const exportOwner = createExportOwner({
+    ...options.exportCredentialOptions, now: () => Number(now()),
+    onSession: (next) => { session = next; },
+    onInvalidate: () => { void fileExports?.invalidateOwner(); transferDiagnostics.clear(); },
+  });
+  const uploadExport = createFileMediaUploader({
+    ...options.fileExportUploadOptions, apiBaseUrl: mediaBase, fetchImpl,
+    getCredential: (owner) => exportOwner.getCredential(owner),
+    refreshCredential: async (captured) => {
+      const owner = exportOwner.capture();
+      if (!owner || exportOwner.getCredential(owner) !== captured) return null;
+      const ok = await refreshSessionForMedia();
+      const next = exportOwner.getCredential(owner);
+      return ok && next !== captured ? next : null;
+    },
+  });
+  fileExports = createExportJobs({
+    ...options.fileExportJobOptions, resolveSource: resolveInsideWorkdir, upload: uploadExport,
+    captureOwner: () => exportOwner.capture(), isOwnerCurrent: (owner) => exportOwner.isCurrent(owner),
+    isControllerAllowed: (src) => policy.canAccept(src), now: () => Number(now()),
+    identify: (facts) => transferDiagnostics.identify(facts),
+    emit: (event) => transferDiagnostics.record(event),
+  });
+  const filePeer = createFilePeerManager({
+    ...options.filePeerOptions,
+    identify: (facts) => transferDiagnostics.identify({ ...facts, owner: exportOwner.capture() }),
+    onEvent: (event) => { if (exportOwner.capture()) transferDiagnostics.record(event); },
+    resolveFile: resolvePeerFile,
+    isAllowed: (peer) => !stopped && active && ws?.readyState === 1 && session !== null && policy.canAccept(peer),
+    loadIceServers: options.filePeerOptions?.loadIceServers ?? createFileIceLoader(mediaOptions),
+  });
   /** Devices we already asked the directory to name in this connection. */
   const directoryAsked = new Set();
   /**
@@ -655,7 +656,7 @@ export async function startHost(initialSource, settings = DEFAULT_HOST_SETTINGS,
    * @param reason - what was lost.
    */
   async function dropAndRetry(reason) {
-    await disconnect({ keepSwitch: true });
+    await disconnect({ keepSwitch: true, preserveExports: true });
     scheduleReconnect(reason);
   }
 
@@ -818,7 +819,32 @@ export async function startHost(initialSource, settings = DEFAULT_HOST_SETTINGS,
    * fixes every such row at once; failures are silent because a missing name
    * only costs a nicer label, never a connection.
    */
+  let directoryEpoch = 0;
+  const pendingDeletes = new Set();
+  async function deleteDevice(deviceId) {
+    if (pendingDeletes.has(deviceId)) return { ok: false, statusCode: 409, message: '设备正在删除' };
+    const owner = session;
+    const epoch = generation;
+    if (stopped || !active) return { ok: false, statusCode: 409, message: '请先连接 Cindy Host' };
+    pendingDeletes.add(deviceId);
+    try {
+      const result = await deleteAccountDevice({ deviceId, session: owner, snapshot: status.snapshot(), url: deviceListUrl(relayUrl), fetchImpl });
+      if (stopped || generation !== epoch || session !== owner) return { ok: false, statusCode: 409, message: '连接身份已改变，请刷新设备列表' };
+      if (result.ok) {
+        directoryEpoch++;
+        acceptedControllers.delete(deviceId);
+        subscribers.delete(deviceId);
+        status.removeDevice(deviceId);
+        status.refreshConnectionState();
+      }
+      return result;
+    } finally {
+      pendingDeletes.delete(deviceId);
+    }
+  }
+
   async function refreshDeviceDirectory() {
+    const readEpoch = directoryEpoch;
     if (session === null) return;
     const myGeneration = generation;
     let answer;
@@ -827,7 +853,7 @@ export async function startHost(initialSource, settings = DEFAULT_HOST_SETTINGS,
     } catch {
       return;
     }
-    if (stopped || !active || myGeneration !== generation) return;
+    if (stopped || !active || myGeneration !== generation || readEpoch !== directoryEpoch) return;
     const rows = Array.isArray(answer?.devices) ? answer.devices : [];
     for (const row of rows) {
       if (row === null || typeof row !== 'object') continue;
@@ -1167,6 +1193,8 @@ export async function startHost(initialSource, settings = DEFAULT_HOST_SETTINGS,
         // upload needs this runtime's account session.
         exportFileStart: startFileExport,
         exportFileStatus: fileExportStatus,
+        fileUrl,
+        filePeer: (peer, payload) => filePeer.handle(peer, payload),
         // The chat-image path: the controller names a file on this machine (an image the
         // agent drew, referenced by path) and gets a staged key back.
         fetchLocalMedia,
@@ -1209,8 +1237,6 @@ export async function startHost(initialSource, settings = DEFAULT_HOST_SETTINGS,
         // so the row the controller is showing has to exist in the fold for a later
         // promotion, edit or removal to resolve.
         markQueued: (sessionId, item) => inputQueue.markQueued(sessionId, item),
-        /** Prompts accepted but not yet durable, as transcript rows. */
-        pendingRows: (sessionId) => inputQueue.pendingTranscriptRows(sessionId),
         itemIds: (sessionId) => inputQueue.itemIds(sessionId),
       },
       /** Project a queue DSH actually reported, rather than the folded one. */
@@ -1280,7 +1306,7 @@ export async function startHost(initialSource, settings = DEFAULT_HOST_SETTINGS,
     now,
     // Every row must name the device it came from, or the phone's home filter
     // drops it as soon as the user selects this Host.
-    getDevice: () => ({ deviceId: status.ownDeviceId, deviceName: HOST_DEVICE_NAME }),
+    getDevice: () => ({ deviceId: status.ownDeviceId, deviceName: hostDeviceName(current) }),
   });
 
   /**
@@ -1514,7 +1540,7 @@ export async function startHost(initialSource, settings = DEFAULT_HOST_SETTINGS,
     const running = rows.filter((row) => row?.running === true && !sessionFlags.isHidden(row.id));
     if (running.length === 0) return;
     for (const row of running) {
-      const payload = { sessionId: String(row.id), event: { type: 'status', data: { isRunning: true } } };
+      const payload = { sessionId: String(row.id), event: runningStatusEvent() };
       recordPush(String(row.id), 'maker:event', 1, payload);
       send({ v: PROTOCOL_VERSION, kind: 'push', dst: deviceId, payload: { channel: 'maker:event', payload } });
     }
@@ -1535,7 +1561,7 @@ export async function startHost(initialSource, settings = DEFAULT_HOST_SETTINGS,
    */
   function announceTurnRunning(sessionId) {
     setCachedRunning(sessionId, true);
-    pushSessionUpdate(sessionId, 'maker:event', { sessionId, event: { type: 'status', data: { isRunning: true } } });
+    pushSessionUpdate(sessionId, 'maker:event', { sessionId, event: runningStatusEvent() });
     publishRowTurnState(sessionId, true);
   }
 
@@ -1856,13 +1882,20 @@ export async function startHost(initialSource, settings = DEFAULT_HOST_SETTINGS,
     pongMisses = 0;
     switch (frame.kind) {
       case 'hello-ack': {
+        if (boundSocketGeneration !== generation) {
+          boundSocketGeneration = generation;
+          exportOwner.bind({ realm: mediaBase + '|' + normalizeAuthBaseUrl(socketSession?.authBaseUrl),
+            userId: frame.payload?.userId, session: socketSession });
+        }
         const payload = frame.payload ?? {};
         status.setHost({
+          deviceName: hostDeviceName(current),
           deviceId: typeof payload.deviceId === 'string' ? payload.deviceId : null,
           userId: typeof payload.userId === 'string' ? payload.userId : null,
           protocolVersion: typeof payload.serverProtocolVersion === 'number' ? payload.serverProtocolVersion : null,
         });
         status.setState('waiting');
+        syncDeviceName();
         // The relay itself accepted us, which is the first moment "online" is true —
         // so this is where the reconnect ladder starts forgetting failed attempts.
         markConnectionStable();
@@ -1900,6 +1933,7 @@ export async function startHost(initialSource, settings = DEFAULT_HOST_SETTINGS,
           // turn that ends while the device is away must not be counted as delivered: it is a
           // frame into a void, and recording it would suppress the re-link announcement that
           // is supposed to repair exactly that.
+          filePeer.closePeer(snapshot.deviceId);
           markDeviceUnreachable(snapshot.deviceId);
         } else if (typeof snapshot.deviceId === 'string') {
           // Reachable again by the relay's own account: same restoration as an inbound frame,
@@ -1937,6 +1971,7 @@ export async function startHost(initialSource, settings = DEFAULT_HOST_SETTINGS,
       }
       case 'link-close': {
         if (typeof frame.src !== 'string') return;
+        filePeer.closePeer(frame.src);
         acceptedControllers.delete(frame.src);
         status.upsertDevice(frame.src, { isController: false });
         status.refreshConnectionState();
@@ -2027,7 +2062,7 @@ export async function startHost(initialSource, settings = DEFAULT_HOST_SETTINGS,
         v: PROTOCOL_VERSION,
         kind: 'hello',
         payload: {
-          deviceName: HOST_DEVICE_NAME,
+          deviceName: hostDeviceName(current),
           platform: HOST_PLATFORM,
           appVersion: HOST_APP_VERSION,
           // The relay refuses to route link-open/invoke to a target that did not
@@ -2069,16 +2104,16 @@ export async function startHost(initialSource, settings = DEFAULT_HOST_SETTINGS,
 
   /** Bring the relay up. Safe to call repeatedly; only the first call connects. */
   async function connect() {
-    if (stopped || connecting || ws !== null || !active) return;
-    connecting = true;
+    if (stopped || connecting === generation || ws !== null || !active) return;
     const myGeneration = ++generation;
+    connecting = myGeneration;
     try {
       status.setLogin({ authenticated: false, required: false });
       status.setState('authenticating', '正在读取本机 Cindy 登录态');
 
       let resolved;
       try {
-        resolved = await resolveSession();
+        resolved = await serializeCredentialOperation(() => resolveSession());
       } catch {
         resolved = { ok: false, message: '读取本机 Cindy 登录态失败' };
       }
@@ -2108,7 +2143,8 @@ export async function startHost(initialSource, settings = DEFAULT_HOST_SETTINGS,
 
       let socket;
       try {
-        socket = openSocket(session, relayUrl);
+        socketSession = Object.freeze({ ...session });
+        socket = openSocket(socketSession, relayUrl);
       } catch {
         // A socket that cannot even be created is the ordinary case when the network is
         // down at startup, so it retries like every other loss. Reporting `failed` here
@@ -2119,7 +2155,7 @@ export async function startHost(initialSource, settings = DEFAULT_HOST_SETTINGS,
       ws = socket;
       wireSocket(socket, myGeneration);
     } finally {
-      connecting = false;
+      if (connecting === myGeneration) connecting = null;
     }
   }
 
@@ -2128,8 +2164,11 @@ export async function startHost(initialSource, settings = DEFAULT_HOST_SETTINGS,
    * @param options - `keepSwitch` leaves the switch on (a heartbeat recovery
    *   attempt) instead of returning the status to `disconnected`.
    */
-  async function disconnect({ keepSwitch = false } = {}) {
+  async function disconnect({ keepSwitch = false, preserveExports = false } = {}) {
+    if (!preserveExports) exportOwner.invalidate();
     generation += 1;
+    deviceNameSync.reset(current?.deviceName?.trim() || null);
+    filePeer.closeAll();
     stopHeartbeat();
     // A pending view invalidation has no socket to reach once this returns; firing it later
     // would push to a link that is gone.
@@ -2170,6 +2209,8 @@ export async function startHost(initialSource, settings = DEFAULT_HOST_SETTINGS,
     }
 
     session = null;
+    socketSession = null;
+    if (!preserveExports) transferDiagnostics.clear();
     status.clearDevices();
     if (!keepSwitch) {
       status.setLogin({ authenticated: false, required: false });
@@ -2186,11 +2227,17 @@ export async function startHost(initialSource, settings = DEFAULT_HOST_SETTINGS,
     if (stopped) return;
     const previous = current;
     current = next;
+    const nameChanged = previous?.deviceName !== next?.deviceName;
+    const host = status.snapshot().host;
+    if (host && nameChanged) status.setHost({ ...host, deviceName: hostDeviceName(next) });
+    if (nameChanged) syncDeviceName();
     // The settings section is the durable home of the archive/delete/pin flags, so
     // every settings change is also a chance for another instance (or a hand edit)
     // to have moved them. `replace` never writes back — see `session-flags.js`.
     sessionFlags.replace(next?.sessionFlags);
     policy.update(next);
+    filePeer.pruneUnauthorized();
+    fileExports.pruneUnauthorized();
     const wanted = next?.transportEnabled === true || next?.remoteControlEnabled === true;
 
     if (!wanted) {
@@ -2218,6 +2265,7 @@ export async function startHost(initialSource, settings = DEFAULT_HOST_SETTINGS,
     stopped = true;
     active = false;
     await disconnect();
+    await fileExports.stop();
     status.setState('disconnected');
   }
 
@@ -2230,7 +2278,8 @@ export async function startHost(initialSource, settings = DEFAULT_HOST_SETTINGS,
     acceptedControllers,
     policy,
     status,
-    getStatus: () => status.snapshot(),
+    getStatus: () => ({ ...status.snapshot(), nameSync: deviceNameSync.snapshot() }),
+    deleteDevice,
     subscribeStatus: (listener) => status.subscribe(listener),
     /** The most recent invokes this Host served, for the status route's diagnostics. */
     getInvokeLog: () => invokeLog.slice(),
@@ -2361,7 +2410,7 @@ export async function startHost(initialSource, settings = DEFAULT_HOST_SETTINGS,
     retireQueuedItem: (sessionId, controllerId) => {
       if (typeof sessionId !== 'string' || sessionId === '') return;
       if (typeof controllerId !== 'string' || controllerId === '') return;
-      inputQueue.mirror(sessionId, controllerId, { kind: 'remove' });
+      inputQueue.retire(sessionId, controllerId);
       pushSessionUpdate(sessionId, 'maker:input:projection', inputQueue.projectionFor(sessionId, sessionRowFor(sessionId)));
     },
     /** Ask the watching controllers to decide a DSH approval; null when none is watching. */
@@ -2433,12 +2482,21 @@ export async function startHost(initialSource, settings = DEFAULT_HOST_SETTINGS,
     isSessionRunning: (sessionId) => isSessionRunningNow(sessionId),
     /** The questions still open, in the controller's shape. */
     listPendingInteractions: (sessionId) => approvals.list(sessionId),
+    /**
+     * Let the Web/API bridge observe the same ask_user registry as the phone.
+     * Registering replays open questions; disposing only ends observation.
+     */
+    observeUserQuestions: (observer) => approvals.observeUserQuestions(observer),
+    /** Both Web and Android answers go through this one registry settlement. */
     resolveInteraction,
     updateSettings,
     connect,
     /** The card's reconnect button: retry immediately and forget the backoff ladder. */
     reconnectNow,
     disconnect,
+    // Explicit successful login/select only; never called by Export or refresh.
+    beginIdentityChange: () => disconnect({ keepSwitch: true }),
+    getTransferDiagnostics: () => ({ ...transferDiagnostics.snapshot(), jobs: fileExports.getStats() }),
     setSource,
     stop,
     get sessionDeviceId() {

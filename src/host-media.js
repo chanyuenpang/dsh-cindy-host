@@ -32,6 +32,8 @@
  * @module dsh-cindy-host/host-media
  */
 import { createHash } from 'node:crypto';
+import { request as httpRequest } from 'node:http';
+import { request as httpsRequest } from 'node:https';
 
 /** Reference schemes a controlled end must accept. */
 export const ATTACH_OSS_SCHEMES = Object.freeze(['cindy-oss-attach', 'xdt-oss-attach']);
@@ -356,6 +358,304 @@ export function createMediaUploader({ apiBaseUrl, getSession, fetchImpl = fetch,
       }
     }
     return { ok: false, reason: 'presign-put answered 401' };
+  };
+}
+
+const FILE_UPLOAD_LIMIT = 2 * 1024 * 1024 * 1024;
+const FILE_UPLOAD_CHUNK = 64 * 1024;
+
+class FileUploadError extends Error {
+  constructor(code, stage) {
+    super(code.toLowerCase().replaceAll('_', '-'));
+    this.code = code;
+    this.stage = stage;
+  }
+}
+
+// Race even uncooperative test transports/credential providers, and consume late
+// rejections. A source fd remains exclusively owned by the Export job manager.
+function fileUploadAwait(operation, signal) {
+  if (signal.aborted) return Promise.reject(signal.reason);
+  return new Promise((resolve, reject) => {
+    const abort = () => {
+      signal.removeEventListener('abort', abort);
+      reject(signal.reason);
+    };
+    signal.addEventListener('abort', abort, { once: true });
+    Promise.resolve().then(() => {
+      signal.throwIfAborted();
+      return operation();
+    }).then(resolve, reject).finally(() => signal.removeEventListener('abort', abort));
+  });
+}
+
+function discardMediaResponse(response) {
+  try { Promise.resolve(response?.body?.cancel?.()).catch(() => {}); } catch { /* best effort */ }
+}
+
+/**
+ * Native PUT deliberately avoids fetch/undici's fixed response-header deadline:
+ * a continuously progressing upload may take more than ten minutes. No global
+ * dispatcher/agent mutation, redirects, retries, or total-upload timer. Each
+ * request owns its socket; the uploader supplies the resettable idle deadline.
+ * Awaiting each write callback bounds the writable queue to one <=64KiB chunk
+ * (and naturally honors backpressure). Response bodies are not retained.
+ */
+function nativeFileMediaPut(url, { headers, body, signal }, requestImpl) {
+  return new Promise((resolve, reject) => {
+    let settled = false;
+    let request;
+    const finish = (error, response) => {
+      if (settled) return;
+      settled = true;
+      signal.removeEventListener('abort', abort);
+      if (error) reject(error); else resolve(response);
+      request?.destroy();
+    };
+    const abort = () => finish(signal.reason);
+    if (signal.aborted) { reject(signal.reason); return; }
+    try {
+      const send = requestImpl ?? (new URL(url).protocol === 'https:' ? httpsRequest : httpRequest);
+      request = send(url, { method: 'PUT', headers, agent: false, timeout: 0 }, (response) => {
+        const status = response.statusCode;
+        response.destroy();
+        finish(null, { ok: status >= 200 && status < 300, status });
+      });
+      request.on('error', (error) => finish(error));
+      request.on('close', () => {
+        if (!settled) finish(new Error('PUT closed before response'));
+      });
+      signal.addEventListener('abort', abort, { once: true });
+      if (signal.aborted) { abort(); return; }
+      (async () => {
+        for await (const chunk of body) {
+          if (settled) break;
+          await fileUploadAwait(() => new Promise((written, failed) => {
+            request.write(chunk, (error) => error ? failed(error) : written());
+          }), signal);
+        }
+        if (!settled) request.end();
+      })().catch((error) => finish(error));
+    } catch (error) {
+      finish(error);
+    }
+  });
+}
+
+/**
+ * Authorized-file uploader; independent of the legacy Buffer uploader above.
+ * source = {size, read(buffer, position): Promise<number>, verify(): Promise<void>}
+ * is an already-authorized, already-open source; this module NEVER closes it.
+ * All sizes 0..2GiB stream. Caller maxBytes/path/owner admission belongs to jobs.
+ *
+ * getCredential(owner) MUST validate the captured owner and return {session,lease}
+ * or null. refreshCredential(capturedCredential) MUST enforce same-owner lineage
+ * and CAS itself; a new returned opaque lease is allowed. No live getSession.
+ * The manager must abort signal when that owner/controller becomes invalid.
+ * Only failure cleanup reacquires a credential, with that SAME captured owner.
+ *
+ * putImpl(url,{headers,body,signal}) is an optional controlled transport returning
+ * {ok,status}; it must incrementally consume the one-shot async iterable body and
+ * honor signal. Default native transport has no hidden fixed header deadline.
+ * requestImpl optionally injects Node's request signature for transport tests.
+ * setTimeoutImpl/clearTimeoutImpl inject timers (normal defaults otherwise).
+ *
+ * uploadFile(source,{owner,signal,ext,contentType,onProgress,onEvent}) returns
+ * {ok:true,key,size,sha256}, or sanitized {ok:false,code,reason,stage}. Progress
+ * counts bytes handed to the HTTP stack, NOT peer receipt/network confirmation.
+ * Events contain only {type,stage,code?}; callbacks are advisory and isolated.
+ */
+export function createFileMediaUploader({
+  apiBaseUrl, fetchImpl = fetch, getCredential, refreshCredential,
+  stageTimeoutMs = 30_000, idleTimeoutMs = 60_000, cleanupTimeoutMs = 5_000,
+  putImpl, requestImpl, setTimeoutImpl = setTimeout, clearTimeoutImpl = clearTimeout,
+} = {}) {
+  const validDuration = (value) => Number.isSafeInteger(value) && value > 0 && value <= 2_147_483_647;
+  const credentialUsable = (value) => value?.lease != null
+    && typeof value?.session?.accessToken === 'string' && value.session.accessToken !== '';
+  const put = putImpl ?? ((url, init) => nativeFileMediaPut(url, init, requestImpl));
+
+  return async function uploadFile(source, opts = {}) {
+    const invalid = (code = 'INVALID_ARGUMENT') => ({ ok: false, code, reason: code.toLowerCase().replaceAll('_', '-'), stage: 'validate' });
+    if (!opts || typeof opts !== 'object' || !source || typeof source.read !== 'function' || typeof source.verify !== 'function') return invalid();
+    const size = source.size;
+    if (!Number.isSafeInteger(size) || size < 0) return invalid();
+    if (size > FILE_UPLOAD_LIMIT) return invalid('OVERSIZE');
+    const { owner, signal, ext, contentType, onProgress, onEvent } = opts;
+    if (owner == null || typeof getCredential !== 'function' || typeof fetchImpl !== 'function'
+      || typeof put !== 'function' || typeof apiBaseUrl !== 'string' || !apiBaseUrl
+      || ![stageTimeoutMs, idleTimeoutMs, cleanupTimeoutMs].every(validDuration)
+      || (signal != null && !(signal instanceof AbortSignal))
+      || (ext !== undefined && (typeof ext !== 'string' || ext.length > 64 || !/^[.a-zA-Z0-9_-]*$/.test(ext)))
+      || (contentType !== undefined && (typeof contentType !== 'string' || contentType.length > 256 || /[^\x20-\x7e]/.test(contentType)))) return invalid();
+    const staging = stageableStaging(ext, contentType);
+    const controller = new AbortController();
+    const bound = controller.signal;
+    let stage = 'verify';
+    let timer;
+    let key;
+    let body;
+    let complete = false;
+    let sha256;
+    const fault = (code) => new FileUploadError(code, stage);
+    const emit = (type, code) => {
+      try { onEvent?.({ type, stage, ...(code ? { code } : {}) }); } catch { /* diagnostics cannot change transfer */ }
+    };
+    const arm = (ms, code) => {
+      clearTimeoutImpl(timer);
+      timer = setTimeoutImpl(() => controller.abort(fault(code)), ms);
+    };
+    const abort = () => controller.abort(fault('ABORTED'));
+    signal?.addEventListener('abort', abort, { once: true });
+    if (signal?.aborted) abort();
+    const wait = (operation) => fileUploadAwait(operation, bound);
+    const verify = async () => {
+      try { await wait(() => source.verify()); }
+      catch { throw bound.aborted ? bound.reason : fault('SOURCE_CHANGED'); }
+    };
+    let cleanupPromise;
+    const cleanup = () => cleanupPromise ??= (async () => {
+      if (!key) return;
+      const cleanupController = new AbortController();
+      const cleanupTimer = setTimeoutImpl(() => cleanupController.abort(), Math.min(cleanupTimeoutMs, 5_000));
+      const cleanupWait = (operation) => fileUploadAwait(operation, cleanupController.signal);
+      try {
+        // Never refresh here, nor use the new account's unbound live session.
+        const credential = await cleanupWait(() => getCredential(owner));
+        if (!credentialUsable(credential)) { emit('cleanup_skipped_owner'); return; }
+        const response = await cleanupWait(() => fetchImpl(`${apiBaseUrl}/media`, {
+          method: 'DELETE', headers: mediaHeaders(credential.session),
+          body: JSON.stringify({ key }), signal: cleanupController.signal,
+        }));
+        discardMediaResponse(response);
+        emit(response?.ok === true ? 'cleanup_done' : 'cleanup_failed');
+      } catch { emit('cleanup_failed'); }
+      finally { clearTimeoutImpl(cleanupTimer); cleanupController.abort(); }
+    })();
+    try {
+      arm(stageTimeoutMs, 'STAGE_TIMEOUT');
+      await verify();
+      stage = 'credential';
+      let credential;
+      try { credential = await wait(() => getCredential(owner)); }
+      catch { throw bound.aborted ? bound.reason : fault('OWNER_UNVERIFIED'); }
+      if (!credentialUsable(credential)) throw fault('OWNER_UNVERIFIED');
+      let signed;
+      for (let attempt = 0; attempt < 2; attempt += 1) {
+        stage = 'presign';
+        emit('presign');
+        const response = await wait(() => fetchImpl(`${apiBaseUrl}/media/presign-put`, {
+          method: 'POST', headers: mediaHeaders(credential.session),
+          body: JSON.stringify({ size, ext: staging.ext, contentType: staging.contentType }), signal: bound,
+        }));
+        if (response?.ok === true) {
+          if (typeof response.body?.getReader === 'function') {
+            const reader = response.body.getReader();
+            const decoder = new TextDecoder();
+            let bytes = 0;
+            let text = '';
+            try {
+              for (;;) {
+                const chunk = await wait(() => reader.read());
+                if (chunk.done) break;
+                bytes += chunk.value.byteLength;
+                if (bytes > 64 * 1024) throw fault('PRESIGN_FAILED');
+                text += decoder.decode(chunk.value, { stream: true });
+              }
+              signed = JSON.parse(text + decoder.decode());
+            } finally {
+              try { Promise.resolve(reader.cancel()).catch(() => {}); } catch {}
+              try { reader.releaseLock(); } catch {}
+            }
+          } else {
+            // Injected response doubles need no network reader.
+            signed = await wait(() => response.json());
+          }
+          break;
+        }
+        discardMediaResponse(response);
+        if (response?.status !== 401) throw fault('PRESIGN_FAILED');
+        if (attempt !== 0 || typeof refreshCredential !== 'function') throw fault('AUTH_FAILED');
+        stage = 'refresh';
+        emit('refresh');
+        try { credential = await wait(() => refreshCredential(credential)); }
+        catch { throw bound.aborted ? bound.reason : fault('OWNER_UNVERIFIED'); }
+        if (!credentialUsable(credential)) throw fault('OWNER_UNVERIFIED');
+      }
+      if (typeof signed?.key !== 'string' || !signed.key || signed.key.length > 4096 || /[\x00-\x1f\x7f]/.test(signed.key)) throw fault('PRESIGN_FAILED');
+      key = signed.key; // Retain a known unpublished key even if the URL is invalid.
+      const putUrl = typeof signed.putUrl === 'string' ? signed.putUrl : signed.url;
+      if (typeof putUrl !== 'string' || putUrl.length > 16 * 1024) throw fault('PRESIGN_FAILED');
+      let target;
+      try { target = new URL(putUrl); } catch { throw fault('PRESIGN_FAILED'); }
+      if (!['http:', 'https:'].includes(target.protocol) || target.username || target.password) throw fault('PRESIGN_FAILED');
+      bound.throwIfAborted();
+      stage = 'put';
+      arm(idleTimeoutMs, 'IDLE_TIMEOUT');
+      emit('put');
+      const hash = createHash('sha256');
+      const read = async (buffer, position) => {
+        let count;
+        try { count = await wait(() => source.read(buffer, position)); }
+        catch { throw bound.aborted ? bound.reason : fault('SOURCE_READ_FAILED'); }
+        bound.throwIfAborted();
+        if (!Number.isInteger(count) || count < 0 || count > buffer.length) throw fault('SOURCE_READ_FAILED');
+        return count;
+      };
+      body = (async function* () {
+        try {
+          let position = 0;
+          while (position < size) {
+            const buffer = Buffer.allocUnsafe(Math.min(FILE_UPLOAD_CHUNK, size - position));
+            const count = await read(buffer, position);
+            if (count === 0) throw fault('SIZE_MISMATCH');
+            const chunk = buffer.subarray(0, count);
+            hash.update(chunk);
+            yield chunk;
+            bound.throwIfAborted();
+            position += count;
+            arm(idleTimeoutMs, 'IDLE_TIMEOUT');
+            try { onProgress?.(position); } catch { /* advisory only */ }
+          }
+          if (await read(Buffer.allocUnsafe(1), size) !== 0) throw fault('SIZE_MISMATCH');
+          await verify();
+          bound.throwIfAborted();
+          sha256 = hash.digest('hex');
+          complete = true;
+        } catch (error) {
+          // Invalidate BEFORE transport can race a successful HTTP response.
+          controller.abort(error);
+          throw error;
+        }
+      })();
+      const response = await wait(() => put(putUrl, {
+        headers: { 'Content-Type': staging.contentType, 'Content-Length': String(size), 'x-oss-object-acl': 'private' },
+        body, signal: bound,
+      }));
+      discardMediaResponse(response);
+      bound.throwIfAborted();
+      if (response?.ok !== true) throw fault('PUT_FAILED');
+      if (!complete) throw fault('INCOMPLETE_UPLOAD');
+      await verify(); // Includes changes while awaiting the final HTTP response.
+      emit('complete');
+      bound.throwIfAborted();
+      // The job publisher may still lose a cancellation race before exposing key.
+      return { ok: true, key, size, sha256, discard: cleanup };
+    } catch (error) {
+      const failure = bound.aborted ? bound.reason : error;
+      const safe = failure instanceof FileUploadError ? failure : fault('NETWORK_ERROR');
+      controller.abort(safe);
+      clearTimeoutImpl(timer);
+      if (body) await body.return().catch(() => {});
+      emit('error', safe.code);
+      await cleanup();
+      return { ok: false, code: safe.code, reason: safe.message, stage: safe.stage };
+    } finally {
+      clearTimeoutImpl(timer);
+      signal?.removeEventListener('abort', abort);
+      controller.abort();
+      if (body) await body.return().catch(() => {});
+    }
   };
 }
 
