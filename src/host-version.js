@@ -4,4 +4,4 @@
  */
 export const HOST_APP_VERSION = '0.1.82';
 /** Actual npm release, separate from the Cindy compatibility identity. */
-export const HOST_PLUGIN_VERSION = '0.1.30';
+export const HOST_PLUGIN_VERSION = '0.1.31';

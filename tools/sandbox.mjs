@@ -17,7 +17,7 @@
  * tool's business.
  */
 import { spawn, execFileSync } from 'node:child_process';
-import { existsSync, mkdirSync, readFileSync, rmSync, writeFileSync } from 'node:fs';
+import { existsSync, mkdirSync, readdirSync, readFileSync, rmSync, statSync, writeFileSync } from 'node:fs';
 import { dirname, join, resolve } from 'node:path';
 import { fileURLToPath } from 'node:url';
 
@@ -37,6 +37,49 @@ function alive(pid) {
   } catch {
     return false;
   }
+}
+
+/**
+ * Whether the sandbox home is set up.
+ *
+ * DSH 0.2 moved a home's settings into the profile's patch layer and renamed the
+ * original file to `settings.yaml.imported` — so requiring `settings.yaml` itself
+ * now reports "not set up" for a home that is fully migrated and running. Either
+ * name proves the one-time setup happened; recreating `settings.yaml` would put a
+ * second, stale source of truth back in front of the patch layer.
+ */
+function homeIsSetUp() {
+  return existsSync(join(sandboxHome, 'settings.yaml')) || existsSync(join(sandboxHome, 'settings.yaml.imported'));
+}
+
+/**
+ * Every `@deepseek-ai/dsh` entry point this machine can start, best first.
+ *
+ * The npm-global layout used to be the only one. It is not: `npx @deepseek-ai/dsh`
+ * leaves its install in the npx cache and never touches `%APPDATA%\npm`, which is
+ * exactly how the instance on 3081 was started. Without this fallback `start` tried
+ * `spawn('dsh', …)` on a machine with no such shim and failed instead of restarting.
+ *
+ * @returns the candidate `lib/bin.js` paths that exist, newest install first.
+ */
+function dshEntryPoints() {
+  const found = [];
+  const override = process.env.DSH_BIN;
+  if (override) found.push(override);
+  found.push(join(process.env.APPDATA ?? '', 'npm', 'node_modules', '@deepseek-ai', 'dsh', 'lib', 'bin.js'));
+  for (const cache of [process.env.LOCALAPPDATA, process.env.APPDATA]) {
+    if (!cache) continue;
+    const npxRoot = join(cache, 'npm-cache', '_npx');
+    if (!existsSync(npxRoot)) continue;
+    for (const entry of readdirSync(npxRoot)) {
+      found.push(join(npxRoot, entry, 'node_modules', '@deepseek-ai', 'dsh', 'lib', 'bin.js'));
+    }
+  }
+  return found
+    .filter((candidate) => existsSync(candidate))
+    .map((candidate) => ({ candidate, mtime: statSync(candidate).mtimeMs }))
+    .sort((left, right) => right.mtime - left.mtime)
+    .map((entry) => entry.candidate);
 }
 
 function recordedPid() {
@@ -103,7 +146,7 @@ async function stop() {
 }
 
 async function start() {
-  if (!existsSync(join(sandboxHome, 'settings.yaml'))) {
+  if (!homeIsSetUp()) {
     console.error(`no sandbox home at ${sandboxHome} — see README.md → "Safe isolated DSH smoke test" for the one-time setup`);
     process.exitCode = 1;
     return;
@@ -120,11 +163,13 @@ async function start() {
   mkdirSync(dirname(logFile), { recursive: true });
   // Prefer the published entry point over the `dsh` shim: spawning a `.cmd` needs a shell, and
   // a shell re-parsing these arguments is both a warning and a needless failure mode. The
-  // shim is only a fallback for a machine where the package layout is not the npm default.
-  const globalBin = join(process.env.APPDATA ?? '', 'npm', 'node_modules', '@deepseek-ai', 'dsh', 'lib', 'bin.js');
-  const viaNode = existsSync(globalBin);
-  const out = viaNode
-    ? spawn(process.execPath, [globalBin, '--profile', profile, '--no-open', '--port', String(port)], {
+  // shim is only a fallback for a machine where the package layout is not an npm default or
+  // the npx cache — neither of which is this machine, so the fallback is genuinely last.
+  const entries = dshEntryPoints();
+  const entry = entries[0] ?? null;
+  if (entry !== null) console.log(`starting ${entry}`);
+  const out = entry !== null
+    ? spawn(process.execPath, [entry, '--profile', profile, '--no-open', '--port', String(port)], {
       cwd: repoRoot,
       env: { ...process.env, DSH_HOME: sandboxHome },
       stdio: ['ignore', 'inherit', 'inherit'],

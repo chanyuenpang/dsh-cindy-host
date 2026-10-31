@@ -4,13 +4,17 @@ A Host-side adapter connecting current Cindy clients to DeepSeek Harness.
 
 ## Requirements and installation
 
-Version 0.1.29 targets the verified **DSH 0.2.1-rc.3** service contracts, with **Node.js >=22.16**. Its DSH peer versions are pinned to this carrier to prevent an installer from mixing a newer prerelease SDK into the running host. The verified Desktop runtime includes Node.js 24.21. Install through the Desktop DSH plugin manager. CLI-managed profiles can use:
+Version 0.1.31 targets the verified **DSH 0.2.1-rc.5** service contracts (also accepting `0.2.1-rc.3` and `0.2.1-rc.4`), with **Node.js >=22.16**. Its DSH peer versions are pinned to those carrier versions to prevent an installer from mixing a newer prerelease SDK into the running host. The verified Desktop runtime includes Node.js 24.21. Install through the Desktop DSH plugin manager. CLI-managed profiles can use:
 
 ```sh
-dsh plugin --profile <profile> add dsh-cindy-host@0.1.29
+dsh plugin --profile <profile> add dsh-cindy-host@0.1.31
 ```
 
 Reload the Host plugin after installation. A full DSH restart is separate. Keep existing Cindy sign-in, device identity and settings; do not run two Host processes with the same identity.
+
+## 0.1.31: merged `main`, native rootless media fetch
+
+Absorbs the `main` branch on top of the 0.2.1 carrier. The one behavioral change that came from it: media and file-peer fetch now accept Cindy's **native URL shape**, where a project-folder export sends only `path` plus an optional `v` and no directory roots. Directory containment is therefore enforced only when the controller actually names roots; the never-serve denylist, the regular-file check, the 25 MiB cap and the separate authenticated-controller policy are unchanged. Also carried over: the native-contract fixture matrix (15 extensions × POSIX/Windows), the repository/docs snapshot, and a test that pins the rootless file-peer transfer end to end.
 
 ## 0.1.29: reproducible repository release
 

@@ -6,6 +6,7 @@ import path from 'node:path';
 import { randomUUID } from 'node:crypto';
 import { setImmediate as immediate } from 'node:timers/promises';
 import { createFilePeerManager } from '../src/host-file-peer.js';
+import { createLocalFileResolver } from '../src/host-media-fetch.js';
 
 const CHUNK = 16384;
 const BATCH = CHUNK * 16;
@@ -61,6 +62,23 @@ async function fixture(t, bytes = Buffer.from('hello'), overrides = {}) {
   state.open = (c, url = 'authorized-url') => state.manager.handle(c.peer, { action: 'open', connection: c.connection, url });
   return state;
 }
+
+// The Host wires `resolveFile` to the same real-file resolver the media channel
+// uses, so a peer download has to honour Cindy's native rootless URL shape too:
+// `path` plus an optional `v`, with no `roots` at all. This is the file-peer
+// half of that contract — the media half is covered in host-media-fetch.test.js.
+test('file-peer accepts native rootless URLs through the shared real-file resolver', async (t) => {
+  const bytes = Buffer.from('rootless peer download');
+  const f = await fixture(t, bytes);
+  f.resolve = createLocalFileResolver();
+  const c = await f.connect();
+  const url = `xdt-file://open?path=${encodeURIComponent(f.file)}`;
+  const opened = await f.open(c, url);
+  assert.equal(opened.size, bytes.length);
+  await c.dc.request(opened.ticket);
+  assert.deepEqual(Buffer.concat(c.dc.sent), bytes);
+  assert.equal(c.dc.sent.at(-1).length, 0, 'the transfer ends with EOF');
+});
 
 test('caps, signaling and close match Cindy wire and enforce owner binding', async (t) => {
   const f = await fixture(t);

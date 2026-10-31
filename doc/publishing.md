@@ -66,11 +66,12 @@ dsh plugin --profile <profile> add dsh-cindy-host@<version>
 建议的 `files` 白名单：
 
 ```json
-"files": ["src", "lib", "cordis.patch.yml", "README.md", "CHANGELOG.md", "doc/"]
+"files": ["src", "lib", "cordis.patch.yml", "README.md", "CHANGELOG.md", "LICENSE"]
 ```
 
-（`package.json` 里的实际白名单和这里一致；`test/`、`tools/`、`.claw/` 留在仓库里，需要随包分发
-测试时再加。）
+（`package.json` 里的实际白名单和这里一致。`doc/`、`test/`、`tools/`、`.claw/` 留在仓库里：
+`doc/` 里的验收清单和发布流程是维护者资产，装到用户 profile 里只是体积和暴露面。0.1.28 起
+`doc` 已从白名单移除，从 registry 下载的 tarball 里没有这个目录。）
 
 ## 4. 版本与兼容性声明
 

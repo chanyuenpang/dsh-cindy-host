@@ -1,5 +1,18 @@
 # Changelog
 
+## 0.1.31 — 2026-10-31
+
+- Merge `main` into the DSH 0.2.1 carrier. `main` was a single working-tree snapshot that had diverged since the 0.2.1 peers landed; every conflict was resolved by keeping the newer, functionally wider side and re-taking `main`'s unique fixes rather than picking a whole file.
+- **Behavioral change from `main`:** media and file-peer fetch accept Cindy's native URL shape — a project-folder export sends only `path` and an optional `v`, with no directory roots. Containment is now enforced only when the controller names roots; the never-serve denylist (`.ssh`, `.aws`, `.gnupg`, `.env`, `id_rsa`, …), the regular-file check, the 25 MiB cap and the authenticated-controller policy are unchanged.
+- Add the native-contract fixture matrix (15 extensions × POSIX/Windows roots, offline) and a file-peer test that pins the rootless transfer and its EOF end to end.
+- Keep DSH 0.2.1-rc.3/rc.4/rc.5 as the accepted peer set; the verified isolated runtime for this release is **DSH 0.2.1-rc.5** on Node.js 24.12.
+- Device deletion keeps the bearer-renewal retry added on this carrier (401 → renew once through the Host owner, then re-validate the target before retrying); `doc/device-management.md` now states that exception instead of claiming deletion never renews anything.
+- `doc/` stays out of the published package, as it has since 0.1.28; `doc/publishing.md` no longer documents the opposite.
+
+## 0.1.30 — 2026-10-31
+
+- Accept `@deepseek-ai/dsh-session` and `@deepseek-ai/dsh-settings` `0.2.1-rc.4` and `0.2.1-rc.5` in addition to `0.2.1-rc.3`. The pinned single-version peers made `dsh plugin add` reject the install on a host that had already moved to rc.5. No runtime behavior change.
+
 ## 0.1.29 — 2026-10-29
 
 - Publish from a clean, committed Git source tree; preserve the accepted 0.1.28 runtime behavior.
