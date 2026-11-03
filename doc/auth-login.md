@@ -1,0 +1,27 @@
+# Host browser authentication
+
+## Scope and usage
+
+The settings-page flow supports the official `cn` and `global` account regions, provider discovery, enabled Apple/Google/WeChat browser login, phone/email verification, organization/email discovery, explicit region confirmation, account choice, required contact binding and SSO verification. Availability is controlled by each auth deployment; disabled methods are not invented. Select the same region and account as the phone. Cross-region accounts are separate, even for the same Apple identity.
+
+Choose **Load sign-in options**, choose a provider or enterprise organization, then open the official authorization link. Return to the settings page for any required continuation. Authentication does not turn the phone connection switch on. Cancelling or navigating away cancels an uncommitted attempt. A second settings page cannot silently adopt the first page's attempt; explicit start-over is required. Saving a session is the short, non-cancellable commit boundary; logout fences and drains it before clearing the vault.
+
+CAPTCHA code delivery uses the auth-server's `/captcha/turnstile` page. Ordinary browsers cannot read its cross-origin result hash. Complete the official page, copy the full successful URL containing `#cindy-captcha=ok.…`, and paste it into the form. The URL is sensitive: do not send it to support or persist it. Only its proof is forwarded in the requested code-delivery body. Failure requires a fresh challenge if the proof expired or was consumed. No claim is made that a localhost Turnstile site key works; there is no injected script, CAPTCHA proxy or verification bypass.
+
+## Owners and security
+
+- `src/cindy-auth-endpoints.js`: fixed public bootstrap URLs from Cindy's `config/endpoint.json` and `config/endpoint.global.json`; HTTPS, official realm-domain, schema and callback-origin checks; redirects/error-body reflection are refused. New attempts fetch manifests; successful sessions store a validated snapshot alongside encrypted credentials. Only pre-v2 sessions at the two known official auth origins have a narrow migration mapping. Unknown/custom origins without an explicit network configuration fail closed instead of using a mainland relay.
+- `src/cindy-auth-controller.js`: installation-scoped attempt, capability ID, revision, region, deadline, secret tickets and four official outcomes. Pages receive a whitelisted view. Resource tokens (not account-management tokens) become the selected membership session. Partial/mismatched two-region discovery is an error, not absence. Unknown future methods are ignored only when they do not corrupt a known method.
+- `src/cindy-browser-auth.js`: random PKCE verifier and independent poll secret; only their SHA-256 challenge/hash enters the authorize URL. Hosted polling follows the same fixed manifest callback as Cindy desktop. Empty callback configuration alone selects an ephemeral IPv4 loopback listener with one-use state validation. A hosted failure never silently switches callback transports. The five-minute browser budget, abort and bounded transient failure budget release pending work.
+- `src/auth-session.js` and `src/host-routes.js`: serialized, lease-fenced vault commits; logout waits for an in-flight writer then clears it. No failed refresh/login erases an old session. The API is loopback-only and mutations require same-origin JSON and a local Host header; no credentials/tickets appear in the new flow's responses or log errors. Legacy direct code endpoints remain compatibility surfaces; the settings page no longer holds or returns their tickets.
+- `src/host.js` / `src/dsh-plugin.js`: one immutable endpoint/credential context per runtime. A new identity replaces all socket, directory, media, ICE, export and controller owners. Reconnect rejects a stored realm changed behind the old runtime instead of sending its token to the old network. Late secure-store availability also reconstructs the runtime.
+
+The OS vault backend, DSH installation isolation and explicit logout semantics are unchanged. No plaintext fallback or import of user private credentials is introduced.
+
+## Upstream contract evidence and verification
+
+Protocol references: Cindy `packages/auth-client/src/{client,types,orgRealmDiscovery,emailLoginDiscovery}.ts`, desktop `authManager.ts`, `authHostedCallback.ts`, `authLoopbackCallback.ts`, and the two regional endpoint source manifests. Anonymous public provider/manifest reads confirmed both regional entrypoints during development; they do not prove a real identity-provider login.
+
+Offline coverage: `test/cindy-auth-controller.test.js`, `test/cindy-browser-auth.test.js` (including actual local HTTP callbacks), `test/auth-session-lease.test.js`, `test/host-auth-routes.test.js`, `test/host-auth-region.test.js`, and the settings-panel regressions in `test/client-card.test.js`. The regional runtime tests assert successful media/peer RPC payloads and actual socket, device directory, staging and ICE URL use, not just an outer diagnostic success flag.
+
+Before production acceptance, use an isolated authorized test account/install to verify both regions' Apple login, at least one enterprise IdP, real binding/SSO verification, CAPTCHA delivery, cancellation/logout, iOS same-account discovery and a file/image round trip. No production profile, installed plugin or actual user identity was changed by this implementation. Package publication, installation/reload and that human acceptance remain separate actions.

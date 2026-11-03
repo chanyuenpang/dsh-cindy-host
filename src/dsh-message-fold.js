@@ -16,6 +16,7 @@
  * history, and model requests all share, so a second copy here would drift.
  */
 import { deriveEventMessage, isAppendSurfaceEvent } from '@deepseek-ai/dsh-session/surface';
+import { createReasoningStream } from './reasoning-stream.js';
 import { toCindyMessageRows, toCindyMessages, hydrateImageAttachments } from './cindy-message-row.js';
 
 /** Default page size when the controller does not ask for one. */
@@ -377,6 +378,7 @@ export function createMessageReader({
     const snapshot = await readSessionLog(sessionId);
     const events = Array.isArray(snapshot?.events) ? snapshot.events : [];
     const entries = [];
+    const reasoning = createReasoningStream(sessionId);
     let lastSeq = null;
     for (const event of events) {
       if (event === null || typeof event !== 'object') continue;
@@ -384,6 +386,7 @@ export function createMessageReader({
       // property of the log, and a caller comparing against renders would read a
       // gap as "nothing happened here".
       if (Number.isFinite(event.seq)) lastSeq = event.seq;
+      reasoning.consume(event);
       const todo = entryForTodoWrite(event);
       if (todo !== null) {
         entries.push(todo);
@@ -407,7 +410,7 @@ export function createMessageReader({
         promptClientId: promptRpcIdOf(event),
       });
     }
-    return { entries, lastSeq };
+    return { entries, lastSeq, reasoning };
   }
 
   /** Drop the least recently used transcripts, keeping the window bounded. */
@@ -427,8 +430,14 @@ export function createMessageReader({
     evict();
   }
 
+  // Overlay only the unfinished step; durable counts/activity never include these rows.
+  function visibleRows(entry) {
+    const live = entry.reasoning.rows();
+    return live.length > 0 ? [...live, ...entry.rows] : entry.rows;
+  }
+
   async function readMessages(sessionId, options = {}) {
-    const all = await ensureTranscript(sessionId);
+    const all = visibleRows(await ensureTranscript(sessionId));
     const page = isNewestRequest(options)
       ? fitNewestPageBytes(pageRows(all, widenNewestPage(options)))
       : pageRows(all, options);
@@ -449,15 +458,15 @@ export function createMessageReader({
   }
 
   /**
-   * The cached (or freshly seeded) transcript rows for one session.
+   * The cached (or freshly seeded) durable transcript and its display-only reasoning overlay.
    * @param sessionId - the session.
-   * @returns the whole transcript, newest first.
+   * @returns the cache entry; its durable rows are newest first.
    */
   async function ensureTranscript(sessionId) {
     const entry = transcripts.get(sessionId);
     if (entry !== undefined) {
       touch(sessionId, entry);
-      return entry.rows;
+      return entry;
     }
     const pending = seeding.get(sessionId);
     if (pending !== undefined) return pending.promise;
@@ -473,9 +482,9 @@ export function createMessageReader({
         // invalidation also detaches this flight so a post-invalidation read starts
         // fresh; an older completion must never overwrite that newer generation.
         if (seeding.get(sessionId) === flight && !flight.dirty) {
-          touch(sessionId, { rows, seq: read.lastSeq, at: clock });
+          touch(sessionId, { rows, reasoning: read.reasoning, seq: read.lastSeq, at: clock });
         }
-        return transcripts.get(sessionId)?.rows ?? rows;
+        return transcripts.get(sessionId) ?? { rows, reasoning: read.reasoning };
       } finally {
         // Failure is not an authoritative empty transcript. Release this flight
         // on success or rejection, without deleting a newer read's ownership.
@@ -495,8 +504,8 @@ export function createMessageReader({
    * @returns the row count.
    */
   async function countRows(sessionId) {
-    const rows = await ensureTranscript(sessionId);
-    return rows.length;
+    const entry = await ensureTranscript(sessionId);
+    return entry.rows.length;
   }
 
   /**
@@ -529,6 +538,7 @@ export function createMessageReader({
     }
     entry.seq = seq;
     entry.at = ++clock;
+    entry.reasoning.consume(event);
     // A live todo snapshot becomes the same `TodoWrite` row the durable read produces, so
     // the phone's plan card updates while the plan is being worked rather than only when
     // the transcript is re-read.
@@ -557,12 +567,14 @@ export function createMessageReader({
     return { sessions: transcripts.size, rows, seeding: seeding.size };
   }
 
+  // Synchronous cached preview snapshots let the live publisher retire rows read mid-block.
+  readMessages.reasoningRows = (sessionId) => transcripts.get(sessionId)?.reasoning.rows() ?? null;
   readMessages.noteEvent = noteEvent;
   readMessages.invalidate = invalidate;
   readMessages.count = countRows;
   /** Exact project-grouping evidence derived from the same folded transcript. */
   readMessages.activity = async (sessionId) => {
-    const rows = await ensureTranscript(sessionId);
+    const { rows } = await ensureTranscript(sessionId);
     let userSendAt = null;
     for (let index = rows.length - 1; index >= 0; index -= 1) {
       const row = rows[index];
@@ -580,7 +592,7 @@ export function createMessageReader({
    * (`local-db:messages:view`), and therefore cannot go through the newest-page budget.
    * The array is the cache's own, so callers treat it as read-only.
    */
-  readMessages.all = (sessionId) => ensureTranscript(sessionId);
+  readMessages.all = async (sessionId) => visibleRows(await ensureTranscript(sessionId));
   readMessages.stats = stats;
   return readMessages;
 }

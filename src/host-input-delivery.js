@@ -1,5 +1,6 @@
 import { createHash } from 'node:crypto';
 import { deliveryError } from './host-input-delivery-store.js';
+import { assertNoStructuredSessionReferences } from './session-reference-boundary.js';
 const terminal = phase => phase==='accepted' || phase==='removed';
 function canonical(value) {
   if(Array.isArray(value))return value.map(canonical);
@@ -103,6 +104,7 @@ export function createInputDeliveryCoordinator({store,backend,baseProjection=()=
     currentProjection:(sid,ids=[],base)=>view(sid,ids,base),
     owns:(sid,cid)=>store.get(sid,cid)!==null,
     async accept(sid,row,options={}){
+      assertNoStructuredSessionReferences(row,options);
       identity(sid,row?.clientId);if(stopped)throw deliveryError('DELIVERY_STOPPED','Input delivery is stopping');
       return lane(sid,async()=>{
         if(stopped)throw deliveryError('DELIVERY_STOPPED','Input delivery is stopping');
@@ -125,6 +127,7 @@ export function createInputDeliveryCoordinator({store,backend,baseProjection=()=
       });
     },
     async edit(sid,cid,value){
+      assertNoStructuredSessionReferences(value);
       identity(sid,cid);
       return lane(sid,async()=>{
         let entry=store.get(sid,cid);if(!entry?.payload||terminal(entry.phase)||entry.cancelRequested)throw deliveryError('NOT_FOUND','Input is no longer editable');
@@ -142,6 +145,7 @@ export function createInputDeliveryCoordinator({store,backend,baseProjection=()=
       });
     },
     async steer(sid,row,options={}){
+      assertNoStructuredSessionReferences(row,options);
       identity(sid,row?.clientId);
       const promoted=await lane(sid,async()=>{
         const proof=await evidence(sid);const held=proof.inbox.find(x=>x.clientId===row.clientId);const entry=store.get(sid,row.clientId);

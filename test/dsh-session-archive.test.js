@@ -1,15 +1,15 @@
 import test from 'node:test';
 import assert from 'node:assert/strict';
-import { createDshSessionArchive } from '../src/dsh-session-archive.js';
+import { createDshSessionArchive, NATIVE_PIN_MEMBERSHIP_AT } from '../src/dsh-session-archive.js';
 import { buildDshSource, capabilityProvider } from '../src/dsh-plugin.js';
 import { startHost } from '../src/host.js';
 
 const tick = () => new Promise(resolve => setImmediate(resolve));
 const OFF = { transportEnabled: false, remoteControlEnabled: false, controllers: {} };
 
-function fixture(initialArchive = [], initialFlags = {}) {
+function fixture(initialArchive = [], initialFlags = {}, initialPins = []) {
   const listeners = new Map();
-  const state = { archivedSessionIds: [...initialArchive] };
+  const state = { archivedSessionIds: [...initialArchive], pinnedSessionIds: [...initialPins] };
   const calls = [];
   const running = new Set();
   let writeError;
@@ -23,6 +23,19 @@ function fixture(initialArchive = [], initialFlags = {}) {
   const committed = () => emit({ domain: 'workspace', table: '', operation: 'put', value: structuredClone(state) });
   const registry = {
     get archivedSessionIds() { return state.archivedSessionIds; },
+    get pinnedSessionIds() { return state.pinnedSessionIds; },
+    async pinSession(id) {
+      calls.push(['pin', id]);
+      if (writeError) throw writeError;
+      if (!known.includes(id)) throw Object.assign(new Error('unknown session'), { name: 'WorkspaceUnknownSessionError' });
+      if (state.archivedSessionIds.includes(id)) throw Object.assign(new Error('archived session cannot be pinned'), { name: 'WorkspaceArchivedSessionPinError' });
+      state.pinnedSessionIds = [id, ...state.pinnedSessionIds.filter(item => item !== id)]; committed();
+    },
+    async unpinSession(id) {
+      calls.push(['unpin', id]);
+      if (writeError) throw writeError;
+      state.pinnedSessionIds = state.pinnedSessionIds.filter(item => item !== id); committed();
+    },
     async archiveSession(...args) {
       calls.push(['archive', ...args]);
       const [id] = args;
@@ -30,7 +43,8 @@ function fixture(initialArchive = [], initialFlags = {}) {
       if (state.archivedSessionIds.includes(id)) return;
       if (!known.includes(id)) throw Object.assign(new Error('unknown session'), { name: 'WorkspaceUnknownSessionError' });
       if (running.has(id)) throw Object.assign(new Error('session is active'), { name: 'WorkspaceActiveSessionError' });
-      state.archivedSessionIds.push(id); committed();
+      state.archivedSessionIds.push(id);
+      state.pinnedSessionIds = state.pinnedSessionIds.filter(item => item !== id); committed();
     },
     async unarchiveSession(...args) {
       calls.push(['unarchive', ...args]);
@@ -43,12 +57,13 @@ function fixture(initialArchive = [], initialFlags = {}) {
   const rows = () => known.map(id => ({ id, title: 'Task ' + id, running: running.has(id), createdAt: '2026-01-01T00:00:00Z', updatedAt: '2026-01-01T00:00:00Z' }));
   const source = { archive, listSessions: async () => rows(), getSession: async id => rows().find(row => row.id === id),
     listSessionStates: async () => rows(), onEvent: () => () => {} };
-  async function start() {
-    return startHost(source, { ...OFF, sessionFlags: flags }, { persistSessionFlags: async value => { flags = structuredClone(value); } });
+  async function start(options = {}) {
+    return startHost(source, { ...OFF, sessionFlags: flags }, { persistSessionFlags: async value => { flags = structuredClone(value); }, ...options });
   }
   return { archive, source, registry, calls, state, on, emit, committed, running, start,
     getFlags: () => flags, setError: value => { writeError = value; }, setRegistry: value => { supplied = value; },
     external(ids) { state.archivedSessionIds = [...ids]; committed(); },
+    externalPins(ids) { state.pinnedSessionIds = [...ids]; committed(); },
     listenerCount: () => listeners.get('domain/changed')?.size ?? 0 };
 }
 async function invoke(host, channel, args = []) {
@@ -224,5 +239,117 @@ test('committed desktop archive updates are multicast only to linked row watcher
       assert.equal(frame.payload.payload.patch.status, 'archived');
       assert.equal(frame.payload.payload.patch.pinnedAt, null);
     }
+  } finally { await host.stop(); }
+});
+
+test('native pin retries preserve original order and unpin is idempotent', async () => {
+  const f = fixture([], {}, ['two']);
+  await f.archive.setPinned('one', true);
+  await f.archive.setPinned('one', true);
+  assert.deepEqual(f.state.pinnedSessionIds, ['one', 'two']);
+  assert.deepEqual(f.calls, [['pin', 'one']]);
+  await f.archive.setPinned('one', false);
+  await f.archive.setPinned('one', false);
+  assert.deepEqual(f.calls, [['pin', 'one'], ['unpin', 'one']]);
+  assert.equal(f.archive.isPinned('one'), false);
+});
+
+test('Cindy pin writes native membership and retires only its own legacy overlay', async () => {
+  const f = fixture([], { one: { pinnedAt: '2026-01-01T00:00:00Z' }, two: { pinnedAt: '2026-02-01T00:00:00Z' } });
+  let host = await f.start();
+  try {
+    assert.deepEqual(f.calls, [], 'old overlays must never be auto-migrated into native pins');
+    const pinned = await patch(host, 'one', { pinnedAt: '2026-11-03T12:00:00Z' });
+    assert.equal(pinned.ok, true);
+    assert.equal(pinned.result.pinnedAt, NATIVE_PIN_MEMBERSHIP_AT);
+    assert.deepEqual(f.state.pinnedSessionIds, ['one']);
+    assert.deepEqual(f.getFlags(), { two: { pinnedAt: '2026-02-01T00:00:00Z' } });
+    await host.stop(); host = await f.start();
+    assert.equal((await result(host, 'local-db:sessions:get', ['one'])).pinnedAt, NATIVE_PIN_MEMBERSHIP_AT);
+    assert.equal((await patch(host, 'one', { pinnedAt: null })).result.pinnedAt, null);
+    assert.deepEqual(f.state.pinnedSessionIds, []);
+    assert.deepEqual(f.getFlags(), { two: { pinnedAt: '2026-02-01T00:00:00Z' } });
+  } finally { await host.stop(); }
+});
+
+test('desktop native pin and unpin refresh warm lists and clear stale local pins', async () => {
+  const f = fixture([], { one: { pinnedAt: '2026-01-01T00:00:00Z' } }); const host = await f.start();
+  try {
+    await result(host, 'local-db:sessions:list', [100, 'active']);
+    const before = host.getPushLog().length;
+    f.externalPins(['one']); await tick();
+    assert.equal((await result(host, 'local-db:sessions:get', ['one'])).pinnedAt, NATIVE_PIN_MEMBERSHIP_AT);
+    assert.deepEqual(f.getFlags(), {});
+    f.externalPins([]); await tick();
+    assert.equal((await result(host, 'local-db:sessions:get', ['one'])).pinnedAt, null);
+    assert.equal((await result(host, 'local-db:sessions:list', [100, 'active']))[0].pinnedAt, null);
+    assert.ok(host.getPushLog().slice(before).filter(entry => entry.channel === 'local-db:sessions:patched').length >= 2);
+  } finally { await host.stop(); }
+});
+
+test('native archive clears native pin and never leaves a local pin shadow', async () => {
+  const f = fixture([], {}, ['one']); const host = await f.start();
+  try {
+    const reply = await patch(host, 'one', { status: 'archived', pinnedAt: null });
+    assert.equal(reply.ok, true);
+    assert.equal(reply.result.status, 'archived'); assert.equal(reply.result.pinnedAt, null);
+    assert.deepEqual(f.state.pinnedSessionIds, []);
+    assert.deepEqual(f.getFlags(), {});
+    assert.equal((await patch(host, 'one', { status: 'active' })).result.pinnedAt, null);
+  } finally { await host.stop(); }
+});
+
+test('invalid mixed and hidden-session pins reject before every native write', async () => {
+  const f = fixture(['one']); const host = await f.start();
+  try {
+    for (const value of ['yesterday', 7, {}, '2026-99-99T00:00:00Z']) {
+      assert.equal((await patch(host, 'two', { pinnedAt: value })).error.code, 'BAD_REQUEST');
+    }
+    for (const status of ['archived', 'active', 'deleted']) {
+      assert.equal((await patch(host, 'two', { status, pinnedAt: '2026-11-03T00:00:00Z' })).error.code, 'BAD_REQUEST');
+    }
+    assert.equal((await patch(host, 'one', { pinnedAt: '2026-11-03T00:00:00Z' })).error.code, 'BAD_REQUEST');
+    await patch(host, 'two', { status: 'deleted' });
+    assert.equal((await patch(host, 'two', { pinnedAt: '2026-11-03T00:00:00Z' })).error.code, 'BAD_REQUEST');
+    assert.equal((await patch(host, 'not-visible', { pinnedAt: '2026-11-03T00:00:00Z' })).error.code, 'NOT_FOUND');
+    assert.deepEqual(f.calls, []);
+  } finally { await host.stop(); }
+});
+
+test('missing native pin API and persistence failure never fall back to local-only success', async () => {
+  const f = fixture(); const host = await f.start();
+  try {
+    f.setRegistry(undefined);
+    assert.equal((await patch(host, 'one', { pinnedAt: '2026-11-03T00:00:00Z' })).error.code, 'NOT_AVAILABLE');
+    f.setRegistry({ archivedSessionIds: [], pinnedSessionIds: [] });
+    assert.equal((await patch(host, 'one', { pinnedAt: null })).error.code, 'NOT_AVAILABLE');
+    f.setRegistry(f.registry); f.setError(new Error('native pin persistence failed'));
+    const failed = await host.invokeForTest('local-db:sessions:patch-meta', ['one', { pinnedAt: '2026-11-03T00:00:00Z' }]);
+    assert.equal(failed.ok, false); assert.match(failed.error, /native pin persistence failed/);
+    assert.deepEqual(f.state.pinnedSessionIds, []); assert.deepEqual(f.getFlags(), {});
+  } finally { await host.stop(); }
+});
+
+test('native pin order changes invalidate while the membership sentinel remains stable', async () => {
+  const f = fixture([], {}, ['one', 'two']); const seen = [];
+  const dispose = f.archive.onChange((ids, change) => seen.push({ ids, change }));
+  const host = await f.start();
+  try {
+    const before = await result(host, 'local-db:sessions:get', ['one']);
+    f.externalPins(['two', 'one']); await tick();
+    assert.deepEqual(new Set(seen[0].ids), new Set(['one', 'two']));
+    assert.equal((await result(host, 'local-db:sessions:get', ['one'])).pinnedAt, before.pinnedAt);
+    assert.deepEqual(f.calls, []);
+  } finally { dispose(); await host.stop(); }
+});
+
+test('mixed rename and pin or status changes reject before native rename', async () => {
+  const f = fixture(); let renames = 0;
+  const host = await f.start({ resolveCapabilities: () => ({ renameSession: async () => { renames++; } }) });
+  try {
+    for (const fields of [{ pinnedAt: '2026-11-03T00:00:00Z' }, { status: 'archived' }, { pinnedAt: null }, { status: 'unsupported' }]) {
+      assert.equal((await patch(host, 'one', { title: 'Changed', ...fields })).error.code, 'BAD_REQUEST');
+    }
+    assert.equal(renames, 0); assert.deepEqual(f.calls, []); assert.deepEqual(f.getFlags(), {});
   } finally { await host.stop(); }
 });

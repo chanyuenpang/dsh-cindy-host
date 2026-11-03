@@ -26,7 +26,7 @@ test('splits one DSH message into one row per renderable block, in order', () =>
 
   assert.deepEqual(rows.map((row) => row.role), ['thinking', 'tool_use', 'assistant']);
   // Thought → tool → answer: the order the user reads.
-  assert.equal(rows[0].content, 'thinking about it');
+  assert.deepEqual(rows[0].content, { text: 'thinking about it' });
   assert.equal(rows[1].toolUseId, 'call-1');
   assert.deepEqual(rows[1].content, { toolName: 'read_file', input: { path: 'a.ts' }, toolUseId: 'call-1' });
   assert.equal(rows[2].content, 'Done.');

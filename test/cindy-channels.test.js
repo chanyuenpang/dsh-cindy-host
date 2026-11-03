@@ -178,6 +178,22 @@ test('the supported set is exactly what the router serves', () => {
     'maker:send',
     'maker:set-effort',
     'maker:set-model',
+    'maker:compact-session',
+    'maker:fork',
+    'local-db:conversations:search',
+    'maker:session-background-tasks:list',
+    'local-db:subagent-runs:list',
+    'local-db:subagent-runs:detail',
+    'local-db:subagent-runs:transcript',
+    'maker:schedule:list',
+    'maker:schedule:get',
+    'maker:schedule:create',
+    'maker:schedule:update',
+    'maker:schedule:delete',
+    'sidebar-settings:get-project-order',
+    'sidebar-settings:apply-project-order',
+    'local-db:history:messages',
+    'maker:input:session-reference-capability',
     'text-file:read-preview',
   ].sort());
 });
@@ -1696,13 +1712,19 @@ test('refuses every channel outside the implemented set, with the code controlle
     // stay out, and `maker:goal:get-status` is a read, not a write.
     'maker:goal:block',
     'maker:goal:complete',
-    'maker:schedule:list',
     'totally:unknown',
   ]) {
     const result = await router(request(channel));
     assert.equal(result.payload.ok, false, `${channel} must not be served yet`);
     assert.equal(result.payload.error.code, 'CHANNEL_NOT_ALLOWED', `${channel} must fail closed`);
   }
+});
+
+test('known schedule channels without the native service refuse as unavailable, not unknown', async () => {
+  const { router } = makeRouter();
+  const result = await router(request('maker:schedule:list'));
+  assert.equal(result.payload.ok, false);
+  assert.equal(result.payload.error.code, 'NOT_AVAILABLE');
 });
 
 test('an addressable request with no channel is refused like any unknown channel', async () => {

@@ -7,6 +7,14 @@ import { DEFAULT_HOST_SETTINGS, SETTINGS_NAMESPACE, validateHostSettings } from 
 import { DshHostSource } from './dsh-host-source.js';
 import { createSessionControllerSource } from './dsh-session-source.js';
 import { createDshSessionArchive } from './dsh-session-archive.js';
+import { createDshManualCompact } from './dsh-manual-compact.js';
+import { createDshFork } from './dsh-fork.js';
+import { createDshKeywordSearch } from './dsh-keyword-search.js';
+import { createDshBackgroundJobs } from './dsh-background-jobs.js';
+import { createDshSubagentReads } from './dsh-subagent-reads.js';
+import { createDshReminders } from './dsh-reminders.js';
+import { createDshProjectOrder } from './dsh-project-order.js';
+import { createDshReferenceHistory } from './dsh-reference-history.js';
 import { readActiveSessionSummaries } from './dsh-active-sessions.js';
 import { createMessageCounter, createMessageReader, foldSessionEvent, isHarnessNotice, promptRpcIdOf } from './dsh-message-fold.js';
 import { createHistoryViewController } from './host-history-view.js';
@@ -117,6 +125,9 @@ const PRESET_INVENTORY_TTL_MS = 30_000;
  * @returns the source and the label naming its seam.
  */
 export function buildDshSource(ctx, serviceName, options = {}) {
+  // Production supplies the Host's guarded entry point; isolated source fixtures
+  // may own their own listener containment without constructing a whole Host.
+  const subscribe = options.subscribe ?? ((event, listener) => ctx.on(event, listener));
   if (serviceName === 'sessionController') {
     const sessionController = ctx.get('sessionController');
     const sessionQuery = ctx.get('sessionQuery');
@@ -160,7 +171,7 @@ export function buildDshSource(ctx, serviceName, options = {}) {
     });
     const sessionArchive = createDshSessionArchive({
       getRegistry: () => controls.workspaceRegistry,
-      subscribe: (event, listener) => ctx.on(event, listener),
+      subscribe,
     });
     ctx.inject(['planMode'], (planCtx) => {
       controls.planMode = planCtx.get('planMode');
@@ -741,7 +752,72 @@ export function buildDshSource(ctx, serviceName, options = {}) {
     });
     // The runtime observes native archive commits even when the relay is offline.
     sessionSource.archive = sessionArchive;
+    const compactServices = { commands: undefined };
+    const manualCompact = createDshManualCompact({
+      getCommands: () => compactServices.commands,
+      getSession: sessionId => sessionSource.getSession(sessionId),
+      resolveAgent: typeof sessionController.resolveAgent === 'function' ? sessionId => sessionController.resolveAgent(sessionId) : undefined,
+      isHidden: sessionId => sessionArchive.isArchived(sessionId) === true,
+      onSettled: sessionId => {
+        readMessages?.invalidate?.(sessionId);
+        historyView?.invalidate?.(sessionId);
+        sessionSource.invalidateActivityEvidence?.(sessionId);
+        sessionSource.invalidateListing?.();
+      },
+    });
+    ctx.inject(['commands'], commandCtx => {
+      compactServices.commands = commandCtx.get('commands');
+      return () => { compactServices.commands = undefined; manualCompact.cancelAll('Native command service removed'); };
+    });
+    sessionSource.manualCompact = manualCompact;
+    const forkSession = createDshFork({
+      getController: () => ctx.get('sessionController'),
+      getQuery: () => ctx.get('sessionQuery'),
+      getSession: sessionId => sessionSource.getSession(sessionId),
+      isHidden: sessionId => sessionArchive.isArchived(sessionId) === true,
+      invalidate: () => sessionSource.invalidateListing?.(),
+    });
+    sessionSource.forkSession = forkSession;
+    const keywordSearch = createDshKeywordSearch({
+      getQuery: () => ctx.get('sessionQuery'),
+      getSession: sessionId => sessionSource.getSession(sessionId),
+    });
+    sessionSource.keywordSearch = keywordSearch;
+    const backgroundJobs = createDshBackgroundJobs({
+      getRegistry: () => ctx.get('jobs'),
+      getSession: (sessionId, options) => sessionSource.getSession(sessionId, options),
+    });
+    sessionSource.backgroundJobs = backgroundJobs;
+    const subagentReads = createDshSubagentReads({
+      getSubagents: () => ctx.get('subagents'),
+      getQuery: () => ctx.get('sessionQuery'),
+      getAgents: () => ctx.get('agents'),
+      getParent: (id, options) => sessionSource.getSession(id, options),
+    });
+    sessionSource.subagentReads = subagentReads;
+    const reminders = createDshReminders({
+      getService: () => ctx.get('schedule'),
+      getSession: (id, options) => sessionSource.getSession(id, options),
+      subscribeChanged: listener => subscribe('schedule/changed', listener),
+    });
+    sessionSource.reminders = reminders;
+    const projectOrder = createDshProjectOrder({
+      getRegistry: () => ctx.get('workspaceRegistry'), getController: () => ctx.get('workspaceController'),
+      getOwner: () => options.getProjectOrderOwner?.(),
+      subscribeChanged: listener => subscribe('domain/changed', listener),
+    });
+    sessionSource.projectOrder = projectOrder;
+    const referenceHistory = createDshReferenceHistory({ getQuery: () => ctx.get('sessionQuery'), getSession: (id, options) => sessionSource.getSession(id, options) });
+    sessionSource.referenceHistory = referenceHistory;
     return {
+      referenceHistory,
+      projectOrder,
+      reminders,
+      subagentReads,
+      backgroundJobs,
+      keywordSearch,
+      forkSession,
+      manualCompact,
       kind: 'session-controller',
       sessionArchive,
       readMessages,
@@ -1419,6 +1495,14 @@ export function capabilityProvider(sources) {
     palette: sources.palette,
     sessionControls: sources.sessionControls,
     sessionArchive: sources.sessionArchive,
+    manualCompact: sources.manualCompact,
+    forkSession: sources.forkSession,
+    keywordSearch: sources.keywordSearch,
+    backgroundJobs: sources.backgroundJobs,
+    subagentReads: sources.subagentReads,
+    reminders: sources.reminders,
+    projectOrder: sources.projectOrder,
+    referenceHistory: sources.referenceHistory,
     fileBrowser: sources.fileBrowser,
   };
 }
@@ -1766,37 +1850,59 @@ export function apply(ctx, config) {
       const provider = credentialCtx.get?.('credentials') ?? credentialCtx.credentials;
       nativeCredentials = provider;
       if (runtime && scope.get().transportEnabled) {
-        void Promise.resolve().then(() => runtime.reconnectNow())
+        void Promise.resolve().then(() => rebuildRuntime())
           .catch(error => noteBoundaryError('credential-store-ready', error));
       }
       return () => { if (nativeCredentials === provider) nativeCredentials = undefined; };
     });
   });
 
-  ctx.effect(async () => {
-    runtime = await startHost(undefined, scope.get(), {
-      credentialPorts,
-      // A provider, not a snapshot: these callbacks come from the injected
-      // session service, which activates after `startHost` already awaited a
-      // Cindy session. Capturing them here would freeze an empty set and make a
-      // capable Host answer NOT_AVAILABLE forever.
-      resolveCapabilities: () => capabilityProvider({
-        ...currentSeam,
-        // The two capabilities that come from *other* injections rather than
-        // from the seam: the filesystem, and the goal service's writer.
-        files: currentFiles,
-        goalWrite: currentGoalWrite,
-      }),
-      // Delete/pin and old archive overlays persist here; new archives live in
-      // DSH's native workspace registry, not this plugin's settings section.
-      persistSessionFlags: sessionFlagsWriter(ctx.settings, settingsNamespace(SETTINGS_NAMESPACE)),
-      inputDeliveryDirectory: join(process.env.DSH_PROFILE_DIR || join(process.env.DSH_HOME || join(homedir(), '.dsh'), 'profiles', process.env.DSH_PROFILE || 'desktop'), 'state', 'dsh-cindy-host'),
+  let runtimeQueue = Promise.resolve();
+  let runtimeDisposed = false;
+  let disposeLoginRoutes = async () => {};
+  function rebuildRuntime(_session, lease = () => true) {
+    const replacement = runtimeQueue.catch(() => {}).then(async () => {
+      if (runtimeDisposed || !lease()) return;
+      const previous = runtime; runtime = undefined;
+      if (previous) await previous.stop();
+      if (runtimeDisposed || !lease()) return;
+      let admitted = false;
+      const next = await startHost(undefined, scope.get(), {
+        credentialPorts,
+        // A provider, not a snapshot: these callbacks come from the injected
+        // session service, which activates after `startHost` already awaited a
+        // Cindy session. Capturing them here would freeze an empty set and make a
+        // capable Host answer NOT_AVAILABLE forever.
+        resolveCapabilities: () => capabilityProvider({
+          ...currentSeam,
+          // The two capabilities that come from *other* injections rather than
+          // from the seam: the filesystem, and the goal service's writer.
+          files: currentFiles,
+          goalWrite: currentGoalWrite,
+        }),
+        // Delete/pin and old archive overlays persist here; new archives live in
+        // DSH's native workspace registry, not this plugin's settings section.
+        persistSessionFlags: sessionFlagsWriter(ctx.settings, settingsNamespace(SETTINGS_NAMESPACE)),
+        inputDeliveryDirectory: join(process.env.DSH_PROFILE_DIR || join(process.env.DSH_HOME || join(homedir(), '.dsh'), 'profiles', process.env.DSH_PROFILE || 'desktop'), 'state', 'dsh-cindy-host'),
+
+        identityIsCurrent: () => admitted || (!runtimeDisposed && lease()),
+      });
+      if (runtimeDisposed || !lease()) { await next.stop(); return; }
+      runtime = next; admitted = true;
+      await next.updateSettings(scope.get());
+      if (currentSource !== undefined) await next.setSource(currentSource);
+      return next;
     });
-    // Settings can change while startHost awaits authentication. Reconcile the
-    // latest snapshot after the runtime exists instead of dropping that update.
-    await runtime.updateSettings(scope.get());
-    if (currentSource !== undefined) await runtime.setSource(currentSource);
-    return () => runtime.stop();
+    runtimeQueue = replacement; return replacement;
+  }
+  ctx.effect(async () => {
+    await rebuildRuntime();
+    return async () => {
+      runtimeDisposed = true;
+      await disposeLoginRoutes();
+      await runtimeQueue.catch(() => {});
+      await runtime?.stop();
+    };
   }, 'dsh-cindy-host runtime');
   ctx.effect(() => scope.watch((settings) => runtime?.updateSettings(settings)), 'dsh-cindy-host settings');
 
@@ -1806,9 +1912,11 @@ export function apply(ctx, config) {
   for (const serviceName of SOURCE_SERVICES) {
     ctx.inject([serviceName], (sourceCtx) => {
       const built = buildDshSource(sourceCtx, serviceName, {
+        subscribe: (event, listener) => sourceCtx.on(event, guarded(event, listener)),
         // Read lazily: the runtime resolves after this seam is built, and the state changes on
         // every turn boundary.
         isSessionRunning: (sessionId) => runtime?.isSessionRunning?.(sessionId) === true,
+        getProjectOrderOwner: () => runtime?.getProjectOrderOwner?.(),
       });
       // The filesystem is a separate service; the controller's file reads are
       // only wired when this profile composes one.
@@ -1843,6 +1951,7 @@ export function apply(ctx, config) {
       void (async () => {
         try {
           for await (const frame of sessionController.control(controllerAbort.signal)) {
+            if (controllerAbort.signal.aborted || currentSource !== built.source) break;
             runtime?.applyControlFrame(frame);
           }
         } catch {
@@ -1851,6 +1960,14 @@ export function apply(ctx, config) {
       })();
       sourceCtx.effect(() => () => controllerAbort.abort(), `dsh-cindy-host: ${built.kind} control stream`);
       sourceCtx.effect(() => () => {
+        built.manualCompact?.dispose();
+        built.forkSession?.dispose();
+        built.keywordSearch?.dispose();
+        built.backgroundJobs?.dispose();
+        built.subagentReads?.dispose();
+        built.reminders?.dispose();
+        built.projectOrder?.dispose();
+        built.referenceHistory?.dispose();
         if (sourceKind === built.kind) sourceKind = 'none';
         currentSource = undefined;
         currentSeam = {};
@@ -1910,11 +2027,18 @@ export function apply(ctx, config) {
     // cache's whole value is that it never needs re-reading, and the controller
     // reaches for a session's history through a fresh subscription, not through a
     // stream this process was already following.
+    const reasoningWatched = runtime.watchersFor(sessionId) > 0;
+    const reasoningBefore = reasoningWatched ? currentSeam?.readMessages?.reasoningRows?.(sessionId) : null;
     if (currentSeam !== undefined && currentSeam !== null && typeof currentSeam.readMessages === 'function'
       && typeof currentSeam.readMessages.noteEvent === 'function') {
       currentSeam.readMessages.noteEvent(sessionId, event);
       currentSource?.invalidateActivityEvidence?.(sessionId);
     }
+    // Chunks are intentionally absent from deriveEventMessage. Publish a temporary
+    // thinking overlay too, retiring it before the durable assistant rows below.
+    runtime.pushSessionReasoning?.(sessionId, event, {
+      before: reasoningBefore, after: reasoningWatched ? currentSeam?.readMessages?.reasoningRows?.(sessionId) : null,
+    });
     // A harness notice is hidden from the phone (the fold returns no rows for it), and the count is
     // what keeps that hiding honest: "there was nothing to show" and "the Host dropped a message"
     // must not look alike from the desk.
@@ -1996,6 +2120,7 @@ export function apply(ctx, config) {
   // its settings still work, only the browser surface is missing.
   const routes = createHostRoutes({
     credentialPorts,
+    onAuthenticated: rebuildRuntime,
     getRuntime: () => runtime,
     getDiagnostics: () => buildDiagnostics({ runtime, sourceKind, seam: currentSeam, listingDiagnostics: currentListingDiagnostics, boundaries: boundaryState() }),
     // The Host's own relay identity outlives the credential: a phone links to the
@@ -2003,6 +2128,7 @@ export function apply(ctx, config) {
     getSettings: () => scope.get(),
     rememberDeviceId: (deviceId) => scope.update({ deviceId }),
   });
+  disposeLoginRoutes = () => routes.dispose();
   ctx.inject(['webServer'], (webCtx) => {
     webCtx.effect(
       () => webCtx.webServer.register({ kind: 'prefix', path: API_PREFIX, handler: routes.handle }),

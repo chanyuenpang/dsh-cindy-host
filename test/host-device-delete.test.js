@@ -33,7 +33,7 @@ test('refused, malformed, mismatched and failed responses never report deletion'
 test('route requires JSON and blocks cross-site requests, then forwards result', async () => {
   let calls = 0;
   const routes = createHostRoutes({ getRuntime: () => ({ deleteDevice: async id => { calls++; assert.equal(id, 'old'); return { ok: true }; }, getStatus: () => ({ devices: [] }) }) });
-  for (const [headers, expected] of [[{}, 403], [{ 'content-type': 'application/json', 'sec-fetch-site': 'cross-site' }, 403], [{ 'content-type': 'application/json' }, 200]]) {
+  for (const [headers, expected] of [[{}, 403], [{ 'content-type': 'application/json', 'sec-fetch-site': 'cross-site' }, 403], [{ host: '127.0.0.1:41489', origin: 'http://127.0.0.1:41489', 'content-type': 'application/json' }, 200]]) {
     const req = { method: 'POST', url: API_PREFIX + '/devices/delete', headers, socket: { remoteAddress: '127.0.0.1' }, async *[Symbol.asyncIterator]() { yield Buffer.from(JSON.stringify({ deviceId: 'old' })); } };
     const res = { writeHead(status) { this.status = status; }, end(body) { this.body = JSON.parse(body); } };
     await routes.handle(req, res); assert.equal(res.status, expected);

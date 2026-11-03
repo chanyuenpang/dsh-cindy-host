@@ -413,5 +413,5 @@ export function createHistoryViewController({
     return [...(expanded.get(sessionId) ?? new Set())];
   }
 
-  return { page, details, intent, expandedFor };
+  return { page, details, intent, expandedFor, invalidate: sessionId => expanded.delete(sessionId) };
 }

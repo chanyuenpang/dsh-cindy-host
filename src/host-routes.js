@@ -15,6 +15,8 @@ import { loadSession } from './credential-store.js';
 import { rememberedDeviceId } from './host-settings.js';
 import { requestLoginCode, verifyLoginCode, selectLoginAccount } from './cindy-login-flow.js';
 import { adoptSession, forgetSession } from './auth-session.js';
+import { createCindyAuthController } from './cindy-auth-controller.js';
+import { authError } from './cindy-auth-endpoints.js';
 
 /** Route prefix; the card hardcodes the same value. */
 export const API_PREFIX = '/api/dsh-cindy-host';
@@ -29,6 +31,21 @@ export function isLoopbackRequest(req) {
   const address = req?.socket?.remoteAddress;
   // A socket with no address (an injected test double) is treated as local.
   return address === undefined || address === null || LOOPBACK.has(address);
+}
+
+/** Real Node requests always have headers; missing headers are injected test doubles. */
+export function isSafeHostMutation(req) {
+  if (!req.headers) return true;
+  const type = String(req.headers['content-type'] ?? '').split(';')[0].trim().toLowerCase();
+  if (type !== 'application/json') return false;
+  const site = req.headers['sec-fetch-site'];
+  if (site && !['same-origin', 'none'].includes(site)) return false;
+  try {
+    const local = new URL(`${req.socket?.encrypted ? 'https' : 'http'}://${req.headers.host}`);
+    if (!['127.0.0.1', 'localhost', '[::1]'].includes(local.hostname)) return false;
+    if (req.headers.origin && new URL(req.headers.origin).origin !== local.origin) return false;
+  } catch { return false; }
+  return true;
 }
 
 function sendJson(res, status, body) {
@@ -63,12 +80,40 @@ export async function readJsonBody(req) {
  * @param options - the runtime accessor and an optional diagnostics producer.
  * @returns one handler per route, each owning its own response.
  */
-export function createHostRoutes({ getRuntime, getDiagnostics, getSettings, rememberDeviceId, credentialPorts, auth = {} }) {
+export function createHostRoutes({ getRuntime, getDiagnostics, getSettings, rememberDeviceId, credentialPorts, onAuthenticated, authOptions = {}, auth = {} }) {
   const loadCredential = auth.loadSession ?? credentialPorts?.loadSession ?? loadSession;
-  const saveCredential = auth.adoptSession ?? (session => adoptSession(session, credentialPorts));
+  const saveCredential = auth.adoptSession ?? ((session, isCurrent) => adoptSession(session, { ...credentialPorts, isCurrent }));
   const forgetCredential = auth.forgetSession ?? (() => forgetSession(credentialPorts));
   const verifyCredential = auth.verifyLoginCode ?? verifyLoginCode;
   const selectCredential = auth.selectLoginAccount ?? selectLoginAccount;
+  let identityEpoch = 0;
+  let disposed = false;
+  let identityWrites = Promise.resolve();
+  function commitLogin(session, lease = () => true) {
+    const generation = identityEpoch;
+    const valid = () => !disposed && generation === identityEpoch && lease();
+    const commit = identityWrites.catch(() => {}).then(async () => {
+      if (!valid()) throw authError('LOGIN_SUPERSEDED', 409);
+      await getRuntime()?.beginIdentityChange?.();
+      if (!valid()) throw authError('LOGIN_SUPERSEDED', 409);
+      await saveCredential(session, valid);
+      if (!valid()) throw authError('LOGIN_SUPERSEDED', 409);
+      if (onAuthenticated) await onAuthenticated(session, valid);
+      if (!valid()) throw authError('LOGIN_SUPERSEDED', 409);
+      const runtime = getRuntime();
+      if (runtime) {
+        runtime.status.setLogin({ authenticated: true, required: false, realm: session.realm ?? 'cn', kind: session.kind ?? null, identifier: session.identifier ?? null });
+        await runtime.connect();
+      }
+    });
+    identityWrites = commit;
+    return commit;
+  }
+  const loginFlow = createCindyAuthController({ ...authOptions, deviceId: hostDeviceId, commitSession: commitLogin, onStart: () => { identityEpoch++; } });
+  async function handleLoginFlow(req, res, body) {
+    const result = await loginFlow.command(body);
+    sendJson(res, result.ok ? 200 : (result.statusCode ?? 400), result);
+  }
   /**
    * The stable Cindy device handle for this Host.
    *
@@ -144,49 +189,33 @@ export function createHostRoutes({ getRuntime, getDiagnostics, getSettings, reme
   }
 
   async function handleVerifyCode(req, res, body) {
-    const result = await verifyCredential({
-      kind: body.kind,
-      identifier: body.identifier,
-      code: body.code,
-      deviceId: await hostDeviceId(),
-    });
-    if (!result.ok) {
-      sendJson(res, 400, result);
-      return;
-    }
+    const generation = ++identityEpoch;
+    await loginFlow.stop();
+    const result = await verifyCredential({ kind: body.kind, identifier: body.identifier, code: body.code, deviceId: await hostDeviceId() });
+    if (!result.ok) { sendJson(res, 400, result); return; }
+    await commitLogin(result.session, () => generation === identityEpoch);
     const runtime = getRuntime();
-    await runtime?.beginIdentityChange?.();
-    await saveCredential(result.session);
-    // A login while the switch is already on must finish the connect the user
-    // asked for; with the switch off it only stores the session.
-    if (runtime) {
-      runtime.status.setLogin({ authenticated: true, required: false, kind: result.session.kind ?? null, identifier: result.session.identifier ?? null });
-      await runtime.connect();
-    }
     sendJson(res, 200, { ok: true, deviceId: result.session.deviceId, status: runtime ? runtime.getStatus() : null });
   }
 
   async function handleSelectAccount(req, res, body) {
+    const generation = ++identityEpoch;
+    await loginFlow.stop();
     const result = await selectCredential({ loginTicket: body.loginTicket, accountId: body.accountId, deviceId: await hostDeviceId() });
-    if (!result.ok) {
-      sendJson(res, 400, result);
-      return;
-    }
+    if (!result.ok) { sendJson(res, 400, result); return; }
+    await commitLogin(result.session, () => generation === identityEpoch);
     const runtime = getRuntime();
-    await runtime?.beginIdentityChange?.();
-    await saveCredential(result.session);
-    if (runtime) {
-      runtime.status.setLogin({ authenticated: true, required: false });
-      await runtime.connect();
-    }
     sendJson(res, 200, { ok: true, deviceId: result.session.deviceId, status: runtime ? runtime.getStatus() : null });
   }
 
   async function handleLogout(req, res) {
+    identityEpoch++;
+    await loginFlow.stop();
+    await identityWrites.catch(() => {});
     const runtime = getRuntime();
     await runtime?.beginIdentityChange?.();
     await forgetCredential();
-    if (runtime) await runtime.disconnect();
+    if (runtime) { await runtime.disconnect(); runtime.status.setLogin({ authenticated: false, required: true, realm: null, kind: null, identifier: null }); }
     sendJson(res, 200, { ok: true, status: runtime ? runtime.getStatus() : null });
   }
 
@@ -237,6 +266,7 @@ export function createHostRoutes({ getRuntime, getDiagnostics, getSettings, reme
     ['POST /devices/delete', handleDeleteDevice],
     ['GET /status', handleStatus],
     ['POST /reconnect', handleReconnect],
+    ['POST /login/flow', handleLoginFlow],
     ['POST /login/request-code', handleRequestCode],
     ['POST /login/verify-code', handleVerifyCode],
     ['POST /login/select-account', handleSelectAccount],
@@ -245,7 +275,7 @@ export function createHostRoutes({ getRuntime, getDiagnostics, getSettings, reme
   ]);
 
   /** Paths that take a JSON body. */
-  const BODY_PATHS = new Set(['/devices/delete', '/reconnect', '/login/request-code', '/login/verify-code', '/login/select-account', '/logout', '/selftest']);
+  const BODY_PATHS = new Set(['/devices/delete', '/reconnect', '/login/flow', '/login/request-code', '/login/verify-code', '/login/select-account', '/logout', '/selftest']);
 
   /**
    * The one handler registered on the web server.
@@ -266,6 +296,9 @@ export function createHostRoutes({ getRuntime, getDiagnostics, getSettings, reme
       return;
     }
 
+    if (req.method === 'POST' && !isSafeHostMutation(req)) {
+      sendJson(res, 403, { ok: false, message: '仅允许同源 JSON 操作' }); return;
+    }
     let body = {};
     if (BODY_PATHS.has(suffix)) {
       try {
@@ -284,5 +317,5 @@ export function createHostRoutes({ getRuntime, getDiagnostics, getSettings, reme
     }
   }
 
-  return { handle, API_PREFIX };
+  return { handle, API_PREFIX, async dispose() { disposed = true; identityEpoch++; await loginFlow.dispose(); await identityWrites.catch(() => {}); } };
 }

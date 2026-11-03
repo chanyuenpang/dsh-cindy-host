@@ -1,12 +1,32 @@
-﻿# DeviceLink relay runtime and connection state
+# DeviceLink relay runtime and connection state
 
 <!-- state: current -->
 ## Current behavior
 
 `src/host.js` owns the Cindy DeviceLink connection for this Host. The switch in the
 settings card is the only user control; the runtime starts disconnected and prints
-nothing. Relay endpoint: `wss://device-link.cindy.com.cn/api/device-link/ws`
-(`RELAY_WS_URL`). Heartbeat: `HEARTBEAT_INTERVAL_MS = 20_000`.
+nothing. Relay selection follows the validated stored account region and endpoint snapshot,
+not a universal mainland constant. `RELAY_WS_URL` remains the legacy mainland default.
+Heartbeat: `HEARTBEAT_INTERVAL_MS = 20_000`.
+
+### Immutable regional network owner
+
+[Runtime composition](<src/host.js#L126-L172>) captures one validated network context.
+Relay socket, device-directory requests, media staging and ICE use its DeviceLink base;
+media/export refresh uses the captured authenticated lease rather than importing another identity.
+After credential commit, [plugin replacement](<src/dsh-plugin.js#L1824-L1857>) stops the old
+runtime and reconstructs socket/directory/media/ICE/export/controller owners. Late secure-store
+availability can also rebuild the runtime. An old runtime rejects a changed realm/snapshot
+on reconnect instead of sending new-region credentials to its old relay. Authentication
+metadata is checked before refresh; [login Truth](<.claw/truth/dsh-cindy-host-login.md>) owns
+the manifest/migration and credential rules.
+
+[Regional runtime regressions](<test/host-auth-region.test.js>) cover both regions with
+injected transports, successful media/peer RPC payloads and observed request URLs; they
+do not prove a live provider login or iOS discovery. The authentication change has not
+been published/activated or accepted with real Apple/enterprise-SSO/iOS identities.
+[ADR](<.claw/truth/adr/0018-regional-authentication-ownership.md>) records why the whole
+runtime is replaced instead of switching only the auth endpoint.
 
 Handshake and framing:
 
@@ -26,12 +46,13 @@ Handshake and framing:
 - An unanswered socket is dropped while the switch stays on, so the next attempt can
   reconnect instead of parking the state at `failed`.
 
-Connection state vocabulary (five states, the same set the card renders):
+Connection state vocabulary (six states, the same set the card renders, from [Host status](<src/host-status.js#L9-L47>)):
 
 | State | Meaning |
 |---|---|
 | `disconnected` | switch off, or nothing has started |
 | `authenticating` | a Cindy session is being read, refreshed, or logged in |
+| `connecting` | a lost connection is being retried automatically |
 | `waiting` | relay online (`hello-ack` received); no device has reached this Host |
 | `connected` | a device opened a link to, or invoked, this Host |
 | `failed` | a concrete failure; `message` names it |

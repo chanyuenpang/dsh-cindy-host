@@ -2,6 +2,7 @@ import { createAttachmentMaterializer, hostAttachmentsOf } from './host-attachme
 import { foldSessionEvent } from './dsh-message-fold.js';
 import { queuedRowFromController } from './host-input-queue.js';
 import { deliveryError } from './host-input-delivery-store.js';
+import { assertNoStructuredSessionReferences } from './session-reference-boundary.js';
 
 /** Replay only a validated persisted prefix. A claim removal is not a user receipt. */
 export function durableInputEvidence(events,sessionId) {
@@ -38,6 +39,7 @@ export function createDshInputDeliveryBackend({getServices,sessionController,get
     async readRows(sid){const events=await readLog(sid);const rows=[];for(const event of events){const folded=foldSessionEvent(event,{sessionId:sid});folded.forEach((row,index)=>{const rowid=event.seq*65536+index;if(!Number.isSafeInteger(rowid))throw deliveryError('DELIVERY_EVIDENCE_CORRUPT','Message order exceeds the safe protocol range');rows.push({...row,rowid});});}return rows.reverse();},
     async evidence(sid){const events=await readLog(sid);const proof=durableInputEvidence(events,sid);const agent=getServices().agents?.get(sid);return {...proof,running:agent?.status==='running',live:agent!==undefined};},
     async prepare(sid,row,{resolveAttachmentRef,mode='queue'}={}){
+      assertNoStructuredSessionReferences(row);
       services();const session=await getSession(sid);if(!session)throw deliveryError('NOT_FOUND','Session does not exist');
       const incoming=hostAttachmentsOf(row);if(Array.isArray(row.files)&&incoming.length!==row.files.length)throw deliveryError('ATTACHMENT_UNAVAILABLE','Every submitted attachment must be persistently obtainable');
       const text=typeof row.text==='string'?row.text:'';if(!text.trim()&&!incoming.length)throw deliveryError('BAD_REQUEST','Input has no text or attachment');
@@ -48,6 +50,7 @@ export function createDshInputDeliveryBackend({getServices,sessionController,get
       return {payload:{text,assets:owned.parts,consumed:owned.consumed,mode},queued:{...queued,files:incoming,chatMessage:{...queued.chatMessage,...(row.chatMessage?.images?{images:row.chatMessage.images}:{})}}};
     },
     async dispatch(entry,{releaseAttachmentRef}={}){
+      assertNoStructuredSessionReferences(entry.request,entry.payload);
       let agent;
       try{agent=await agentFor(entry.sessionId);}catch(error){error.deliveryNotAdmitted=true;throw error;}
       const content=entry.payload.text?[{type:'text',text:entry.payload.text}]:[];
@@ -72,6 +75,7 @@ export function createDshInputDeliveryBackend({getServices,sessionController,get
       try{await flush(sid);await readLog(sid);}catch(error){error.deliveryRemovalApplied=true;throw error;}
     },
     async recoverColdInbox(sid,entries){
+      for(const entry of entries)assertNoStructuredSessionReferences(entry.request,entry.payload);
       const initial=await backend.evidence(sid);if(initial.running||initial.inbox.some(item=>item.foreign))return false;
       const owned=new Map(entries.filter(e=>e.payload&&e.phase!=='accepted'&&e.phase!=='removed').map(e=>[e.clientId,e]));
       if(initial.inbox.some(item=>!owned.has(item.clientId)))return false;

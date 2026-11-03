@@ -22,6 +22,7 @@ import path from 'node:path';
 import { SUPPORTED_CHANNELS } from '../src/cindy-channels.js';
 import { HOST_PUSH_CHANNELS } from '../src/host-push-channels.js';
 import { UNSUPPORTED_INVOKES, UNSENT_PUSHES } from './compat-boundaries-20261028.mjs';
+import { importedChannelConstants, referencedChannels, literalChannelCalls } from './channel-audit-source.mjs';
 
 const args = process.argv.slice(2);
 const cindyIndex = args.indexOf('--cindy');
@@ -42,9 +43,16 @@ const INVOKE_POLICY = path.join(CINDY, 'packages/device-link/src/invokePolicy.ts
  */
 const DECLINED = [
   ...[...UNSUPPORTED_INVOKES].map(([name, why]) => ({ match: channel => channel === name, why })),
+  { match: channel => channel === 'maker:model-catalog:read', why: 'new controlled model-location catalog is not mapped; the existing provider:list/modelCatalog picker is not this cross-device catalog contract' },
+  { match: channel => channel === 'device-link:usage-widget:snapshot:v1', why: 'no verified native provider-account quota/widget snapshot; session token usage must not be substituted for account balances' },
+  { match: channel => channel === 'maker:machine:status', why: 'no verified native CPU/memory/disk/power/activity snapshot adapter; unknown machine facts are not fabricated as zero' },
+  { match: channel => ['maker:companion-cloud:caps', 'maker:companion-cloud:flush', 'maker:companion-cloud:hand-over', 'maker:companion-cloud:merge', 'maker:companion-cloud:targets'].includes(channel), why: 'companion cloud ownership/handover/merge has no verified native adapter; ordinary sessions, reminders and fork do not implement that protocol' },
+  { match: channel => channel === 'maker:remote-agent:v1', why: 'the remote-agent lifecycle bridge is not the native parent-authorized subagent read subset' },
+  { match: channel => channel === 'maker:task-copy', why: 'full cross-device task migration is not ordinary native prefix fork; no task-copy adapter is provided' },
+  { match: channel => channel === 'provider-group:remote', why: 'provider-group and shared-provider remote operations are not the local provider:list catalog and are not forwarded' },
   { match: (channel) => ['maker:model-favorites:get', 'maker:model-favorites:apply'].includes(channel), why: 'explicitly unavailable: this Host has no remote model-favorites store or synchronization API; it must not report a successful empty catalog', candidate: 'would require a persisted favorites store plus matching changed pushes' },
   { match: (channel) => channel === 'maker:predict-prompt', why: 'explicitly unavailable: optional next-prompt prediction has no DSH implementation; normal user sends remain independent', candidate: 'optional model-backed prompt prediction' },
-  { match: (channel) => channel.startsWith('maker:schedule:') || channel.startsWith('maker:project-automation:'), why: 'schedule family — plan rule' },
+  { match: (channel) => channel.startsWith('maker:schedule:') || channel.startsWith('maker:project-automation:'), why: 'outside the served native reminder CRUD/ready subset: full automation runs, pause/resume, run-now, scripts/templates, costs and unread state have no mapped native equivalent' },
   { match: (channel) => channel.startsWith('device-link:remote-desktop') || channel.startsWith('remote-desktop'), why: 'remote-desktop family — plan rule' },
   { match: (channel) => channel.startsWith('device-link:media:') || channel.startsWith('media:'), why: 'media pipeline — plan rule' },
   { match: (channel) => channel.startsWith('voice:') || channel.startsWith('device-link:voice:'), why: 'voice family — plan rule' },
@@ -66,7 +74,7 @@ const DECLINED = [
     match: (channel) => channel.startsWith('local-db:history:') || channel.startsWith('local-db:messages:view') || channel.startsWith('local-db:messages:around'),
     why: 'the newer history view; the paged transcript this Host does serve is the fallback, and the client has a designed path for that — `isHistoryViewUnavailable` matches exactly `CHANNEL_NOT_ALLOWED | UNSUPPORTED_CAPABILITY | not registered | No handler` (maker-shared/historyView.ts)',
   },
-  { match: (channel) => channel.startsWith('local-db:conversations:search') || channel.startsWith('local-db:recent-workdirs'), why: 'reads this Host does not implement (search/workdir history)' },
+  { match: (channel) => channel.startsWith('local-db:recent-workdirs'), why: 'recent-workdir history is not a native keyword-search operation' },
   {
     // Ahead of the general `local-db:sessions:` rule because this one is not a read:
     // both clients call it when the user dismisses an "this session was interrupted"
@@ -78,10 +86,10 @@ const DECLINED = [
   { match: (channel) => channel.startsWith('local-db:messages:work-details'), why: 'the history view\'s detail read; refusing it keeps the phone on the paged transcript this Host does serve' },
   { match: (channel) => channel.startsWith('local-db:messages:dismiss-error'), why: 'a client-side error affordance with no DSH counterpart' },
   { match: (channel) => channel.startsWith('maker:goal:') && !['maker:goal:get-status', 'maker:goal:set', 'maker:goal:pause', 'maker:goal:resume', 'maker:goal:clear', 'maker:goal:update'].includes(channel), why: 'goal reads/writes beyond the implemented set' },
-  { match: (channel) => channel.startsWith('maker:rewind') || channel.startsWith('maker:fork'), why: 'rewind/fork family — plan rule' },
+  { match: (channel) => channel.startsWith('maker:rewind') || channel.startsWith('maker:fork'), why: 'in-place rewind and strip-encrypted fork are not the ordinary native prefix-fork subset' },
   { match: (channel) => channel.startsWith('maker:subagent') || channel.startsWith('maker:get-session-tree') || channel.startsWith('maker:navigate-session-tree'), why: 'subagent/session-tree family — plan rule' },
   { match: (channel) => channel.startsWith('maker:switch-session-agent') || channel.startsWith('maker:get-session-agent-switch-intent'), why: 'deliberate: capabilities report supportsSessionAgentSwitch:false' },
-  { match: (channel) => channel.startsWith('maker:close-session'), why: 'DSH sessions are neither closed nor archived (patch-meta already refuses to pretend)' },
+  { match: (channel) => channel.startsWith('maker:close-session'), why: 'native archive is mapped through patch-meta; Cindy close/read-only session semantics are not the same operation and are not aliased to archive' },
   { match: (channel) => channel.startsWith('maker:message:delete'), why: 'the session log is append-only; there is nothing to delete' },
   { match: (channel) => channel.startsWith('maker:set-extra-dirs'), why: 'extra working directories are not part of this Host\'s scope' },
   {
@@ -92,7 +100,7 @@ const DECLINED = [
     // across this deployment's session logs are completed/interrupted/aborted/blocked;
     // there is no failure reason to translate yet.
     match: (channel) => channel.startsWith('maker:input:retry-last-error') || channel.startsWith('maker:input:clear-error') || channel.startsWith('local-db:messages:dismiss-error'),
-    why: 'the failed-turn affordances: the client offers retry/dismiss only for a trailing un-dismissed `role=\'error\'` row, and this Host emits none — DSH\'s observed turn/end reasons are completed/interrupted/aborted/blocked, so there is no failure state to surface',
+    why: 'native turn errors exist and source history exposes a safe terminal hint, but Cindy trailing-error-row retry/dismiss semantics have no verified native adapter; never infer absence of failures',
     candidate: 'would need two halves: map a failed turn to a trailing `role: \'error\'` row, and serve retry as a re-send of the last user prompt (or the shared continue prompt when the failed turn already produced output)',
   },
   { match: (channel) => channel.startsWith('maker:input:compact'), why: 'the Claude-Code-specific compact; the phone uses maker:compact-session for a pi session' },
@@ -101,11 +109,7 @@ const DECLINED = [
     match: (channel) => channel.startsWith('fs:mkdir-p'),
     why: 'not a gap: the phone declares `mkdirP` in its transport and has no call site for it, so nothing reaches this channel; `ctx.fs` also has no create-directory API',
   },
-  {
-    match: (channel) => channel.startsWith('maker:compact-session'),
-    why: 'blocked by the phone\'s own budget: it is absent from MOBILE_INVOKE_TIMEOUT_OVERRIDES_MS, so it gets the 15s mobile default, while a compaction is one LLM summarization call (the reference `/compact` command runs it with no such bound). Serving it would time out on the phone while the Host kept compacting — a failure the user sees and a history change they do not.',
-    candidate: 'waiting on a Cindy-side timeout entry, not on Host work',
-  },
+
 
   // ── the desktop controller's vocabulary ────────────────────────────────────────
   //
@@ -116,7 +120,7 @@ const DECLINED = [
   { match: (channel) => channel.startsWith('device-link:telegram:'), why: 'Telegram integration — plan rule' },
   { match: (channel) => channel.startsWith('fs:resolve-path'), why: 'the desktop\'s @-mention path resolution (relPath → absolute); the phone\'s @ palette resolves through maker:scan-at-resources, which this Host serves' },
   { match: (channel) => channel.startsWith('git-context:') || channel.startsWith('git-review:'), why: 'git context/review family — plan rule' },
-  { match: (channel) => channel.startsWith('local-db:subagent-runs:'), why: 'subagent runs family — plan rule' },
+  { match: (channel) => channel.startsWith('local-db:subagent-runs:'), why: 'outside the served parent-catalog-authorized child list/detail/transcript subset; unsupported variants do not gain native control or returned-result capability' },
   { match: (channel) => channel === 'maker:abort-session', why: 'the same effect this Host serves as maker:input:stop, which is the name the phone calls; nothing calls this one' },
   { match: (channel) => channel.startsWith('maker:agent:'), why: 'the controlled desktop\'s agent runtime (CLI install/version/status); DSH runs its agent in-process, so there is no such runtime to report' },
   { match: (channel) => channel === 'maker:any-session-in-turn', why: 'maker:session-in-turn is served for the per-session question and maker:list-active answers it for the whole list; nothing names this one' },
@@ -200,9 +204,7 @@ function listFiles(root, extensions) {
 
 /** The channels the phone asks for by literal name. */
 function channelsCalledByPhone(source) {
-  const found = new Map();
-  for (const match of source.matchAll(/\bcall\(\s*'([^']+)'/g)) found.set(match[1], (found.get(match[1]) ?? 0) + 1);
-  return found;
+  return literalChannelCalls(source);
 }
 
 /**
@@ -220,8 +222,9 @@ function channelsCalledByDesktop(sources) {
   const found = new Map();
   const bump = (channel) => found.set(channel, (found.get(channel) ?? 0) + 1);
   for (const source of sources) {
-    for (const match of source.matchAll(/\bt\(\s*'([a-z][a-z0-9-]*:[^']+)'/g)) bump(match[1]);
-    for (const match of source.matchAll(/invokeRemote\(\s*[^,]+,\s*'([^']+)'/g)) bump(match[1]);
+    for (const [channel, count] of literalChannelCalls(source, true)) {
+      for (let index = 0; index < count; index++) bump(channel);
+    }
   }
   return found;
 }
@@ -245,9 +248,11 @@ function channelsCalledByDesktop(sources) {
 function remoteInvokeAllowlist(text) {
   const lines = text.split(/\r?\n/);
   const found = new Set();
-  const add = (block) => {
-    for (const match of block.matchAll(/'([a-z][a-z0-9-]*:[a-z0-9:._-]+)'/g)) found.add(match[1]);
-  };
+  const constants = importedChannelConstants(text, specifier => {
+    const file = path.resolve(path.dirname(ALLOWLIST), specifier.replace(/\.js$/, '.ts'));
+    return readFileSync(file, 'utf8');
+  });
+  const add = block => { for (const channel of referencedChannels(block, constants)) found.add(channel); };
   // The `DL_*_CHANNEL` constants: the value sometimes sits on the following line.
   for (let index = 0; index < lines.length; index += 1) {
     if (!/export const DL_[A-Z0-9_]*CHANNEL/.test(lines[index])) continue;
@@ -274,12 +279,25 @@ function arrayRange(lines, name) {
 }
 
 const source = readFileSync(TRANSPORT, 'utf8');
-const called = channelsCalledByPhone(source);
+const allowlisted = remoteInvokeAllowlist(readFileSync(ALLOWLIST, 'utf8'));
+const called = new Map();
+const nonWireLiterals = new Set();
+const mobileFiles = listFiles(path.join(CINDY, 'apps/mobile/src'), ['.ts', '.tsx']);
+for (const file of mobileFiles) {
+  for (const [channel, count] of channelsCalledByPhone(readFileSync(file, 'utf8'))) {
+    // An arbitrary consumer's call() can be local IPC. Only the dedicated remote
+    // transport or an allowlisted name establishes a remote wire call here.
+    if (file === TRANSPORT || allowlisted.has(channel)) called.set(channel, (called.get(channel) ?? 0) + count);
+    else nonWireLiterals.add(channel);
+  }
+}
 // The desktop's own remote-invoke sites, read from the renderer that holds them.
 const rendererFiles = listFiles(path.join(CINDY, 'apps/desktop/src/renderer'), ['.ts', '.tsx']);
 const calledByDesktop = channelsCalledByDesktop(rendererFiles.map((file) => readFileSync(file, 'utf8')));
-for (const [channel, count] of calledByDesktop) called.set(channel, (called.get(channel) ?? 0) + count);
-const allowlisted = remoteInvokeAllowlist(readFileSync(ALLOWLIST, 'utf8'));
+for (const [channel, count] of calledByDesktop) {
+  if (allowlisted.has(channel)) called.set(channel, (called.get(channel) ?? 0) + count);
+  else nonWireLiterals.add(channel);
+}
 const served = new Set(SUPPORTED_CHANNELS);
 
 // The union of what a controller may ask for and what the phone names. A channel in
@@ -324,6 +342,7 @@ console.log(`  call sites seen: ${[...called.values()].reduce((a, b) => a + b, 0
 console.log(`  served:      ${serveds.length}`);
 console.log(`  declined:    ${declined.length}`);
 console.log(`  unclassified:${open.length}`);
+console.log(`  consumer literals outside remote allowlist (not certified wire calls): ${[...nonWireLiterals].sort().join(', ') || 'none'}`);
 console.log('');
 console.log('served:');
 for (const row of serveds) console.log(`  ${row.channel}`);
@@ -368,10 +387,11 @@ if (open.length > 0) {
  */
 const DECLINED_PUSH = [
   ...[...UNSENT_PUSHES].map(([name, why]) => ({ match: channel => channel === name, why })),
+  { match: channel => channel === 'maker:model-catalog:changed', why: 'the controlled model-location catalog read/revision stream is not mapped; no corresponding changed push is fabricated' },
   { match: (channel) => channel === 'maker:model-favorites:changed', why: 'no remote favorites store or mutation API is served, so this Host has no favorites change to announce' },
   { match: (channel) => channel.startsWith('usage:'), why: 'usage/account reads — plan rule' },
   { match: (channel) => /bot/.test(channel), why: 'bots family — plan rule' },
-  { match: (channel) => channel.startsWith('maker:schedule'), why: 'schedule family — plan rule' },
+  { match: (channel) => channel.startsWith('maker:schedule'), why: 'outside the served native reminder CRUD/ready subset: full automation runs, pause/resume, run-now, scripts/templates, costs and unread state have no mapped native equivalent' },
   { match: (channel) => /worktree/.test(channel), why: 'worktree family — plan rule' },
   { match: (channel) => channel.startsWith('maker:new-maker-draft'), why: 'desktop new-session preferences; this Host keeps no such draft state' },
   { match: (channel) => channel.startsWith('maker:session-model-pref'), why: 'desktop write-through preference; this Host stores the selection on the session instead' },

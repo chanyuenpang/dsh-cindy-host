@@ -55,8 +55,10 @@ Constraints and pitfalls:
   DSH Web shell, and the user's main profile stay untouched.
 - The external package must use only version-pinned public DSH packages and must
   never resolve DSH's nested `node_modules`.
-- `transportEnabled` is false by default, so a freshly mounted profile cannot log
-  in or connect until the switch is turned on.
+- `transportEnabled` is false by default. Authentication can be completed independently
+  through the [controller-backed settings flow](<.claw/truth/dsh-cindy-host-login.md>);
+  successful login does not turn the transport switch on. No relay connection is
+  established until the user enables it.
 
 Code anchors:
 
@@ -189,7 +191,7 @@ Failure containment and observability:
   installed=true`.
 - **DSH's own packages are peers, never dependencies** — this is the rule 0.1.1 broke.
   Every `@deepseek-ai/*` the plugin uses is a `peerDependency`; `dependencies` holds only
-  what the host does not provide (`keytar`, `ws`). A DSH package declared as a dependency
+  what the host does not provide (currently `werift`, `ws`; see [package manifest](<package.json>)). A DSH package declared as a dependency
   (or as an **optional** dependency — pnpm installs those by default) drags a whole DSH
   generation into the profile, and the host then composes a mixture of two generations and
   dies at load. Measured on 0.1.1: 21 profile-local `@deepseek-ai` packages at
@@ -200,16 +202,14 @@ Failure containment and observability:
   `SettingsProvider`, `SettingsConflictError`, `redactSecrets`, `default`); it was the
   reason the old generation had to be installed. It is a brand — validate
   `/^[a-z][a-z0-9-]*$/`, return the string — so it now lives in `src/dsh-plugin.js`.
-- **Optional capabilities may never block mounting.** `@deepseek-ai/dsh-host-apiproxy`
-  (only used on the older DSH `apiProxy` path) and `keytar` (native, and not built by
-  default under pnpm 10) are both loaded **lazily, inside a try/catch, with a
-  degradation path**; the proxy is an optional *peer* so it is never installed for us. A
-  top-level `import` of either one turns an optional capability into a hard
-  requirement that fails the whole profile at boot — that is exactly what 0.1.0 did.
-- **`keytar` is the one install-time compilation requirement** (`keytar.node`), because
-  the Cindy login session belongs in the OS credential store rather than on disk.
-  Since 0.1.1 a failed build still mounts the plugin, with credential abilities
-  answering `CREDENTIAL_STORE_UNAVAILABLE`.
+- **Optional capabilities may never block mounting.** The legacy `apiProxy` path
+  loads lazily and degrades when unavailable; it is no longer declared as a peer.
+  Current credential storage uses system keychains/DPAPI and DSH's injected native
+  record service, not a compiled `keytar` dependency. Missing storage support reports
+  `CREDENTIAL_STORE_UNAVAILABLE` without making unrelated mounting depend on a login.
+  [Login Truth](<.claw/truth/dsh-cindy-host-login.md>) owns backend and installation
+  isolation details; [credential store](<src/credential-store.js>) is the implementation.
+  Earlier keytar/proxy boot failures remain scoped to the evolution entries below.
 
 <!-- state: history -->
 ## Evolution history

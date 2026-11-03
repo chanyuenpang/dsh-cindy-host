@@ -1,5 +1,34 @@
 # Changelog
 
+## 0.1.33 — 2026-11-04
+
+- Add authorized current-surface reference-source history through native observations, real message identities, filters/cursors and explicit clipping metadata. Keep frozen target-reference capability false and reject structured contexts before every admission/edit/preparation/replay boundary; do not disguise source reads or plain links as target consumption.
+
+- Adapt the existing sidebar custom-order calls to native registered Workspaces and insertBefore, with verified account/device/source stamps, all-key prevalidation, serial native moves and truthful partial/concurrent failure snapshots. Refuse activity and cross-device/unregistered/ambiguous variants; do not create another order store.
+
+- Adapt existing-dialogue recurring reminder CRUD to the native schedule owner with complete-record update CAS, strict execution-field refusals, genuine one-time read/delete and known-created-ID recovery. Forward only committed ready notifications with authorized peer-lifetime cleanup; do not fabricate pause, run history, cost, completion or notifications. Cover the slice with focused Host tests only.
+
+- Adapt the three existing subagent read endpoints to native parent/descendant catalogs, actual consumed-work/live-state evidence and private-context-safe child-owned transcripts. Keep all controls and unproved returned-result capability false; add signed 25-entry/byte-bounded continuation/tail paging and Host-only focused tests. Consume the SDK work reader as a host-provided peer, without installing core/profile packages.
+
+- Add provider-backed Mainland/Global settings-page login: Apple/other enabled social providers, enterprise SSO, regional discovery/confirmation, code delivery, account selection, required binding and SSO verification. Use official endpoint manifests, hosted callback/PKCE/poll-secret or configured loopback fallback; keep all authentication tickets and tokens backend-only. CAPTCHA uses the official challenge page with an explicitly manual successful-URL return in a normal browser.
+- Fence login, cancellation, logout and refresh on the serialized encrypted-credential owner; reject stale UI steps and cross-origin/non-JSON mutations. Rebuild an immutable regional connection context so device-link, media and ICE cannot receive another region's credentials. Include isolated protocol, HTTP, actual local callback, UI state and runtime URL regressions. These regressions do not establish real Apple/enterprise login or iOS acceptance.
+
+- Adapt the official background-task roster to the native owner-fenced jobs registry and reuse native control frames for real task-status updates. Keep stopping nonterminal, omit unknown continuation claims, and never consume output, invent a file/provider/tool origin, or expose fictional stop/output channels. Cover Host owner/state mapping and stale-frame/source teardown fences with focused tests.
+
+- Serve native literal keyword search with real current-message identities/counts, all accepted filters/sorts, genuine limits over 20, bounded scans and cancellation. Refuse explicit semantic/hybrid requests without an enabled native backend; do not pretend global FTS is mounted. Add focused Host protocol field-mapping tests using the official schema as a read-only reference.
+
+- Adapt ordinary fork using committed message identities and exact native user-before/completed-assistant-turn cuts. Return the real child row, publish the existing created event, and retain child IDs across attachment/discovery/source failures without automatically creating another child. Unsupported branch/rewind/encrypted variants stay refused.
+
+- Serve the existing compact-session channel using verified native scoped DSH commands, with strict instructions refusal, real no-op/error results, in-process duplicate-envelope protection, stop/disconnect cancellation, and history invalidation. The Claude queue-compaction protocol is not treated as an alias.
+
+- Wire pin/unpin metadata to the native DSH workspace registry, with membership-only stable wire projection, committed desktop-to-controller refresh, idempotent retries, legacy-overlay retirement, and pre-write mixed-operation validation. No Cindy protocol extension or native timestamp/order claim.
+
+- Fix mobile thinking visibility: send structured `{ text }` content instead of the prose string the mobile normalizer silently drops. Keep ordinary user/assistant prose unchanged.
+- Forward public DSH reasoning chunks during generation, coalesce native thinking pushes, expose the active prefix through history/work details, and retire temporary rows when the durable or interrupted assistant message arrives. Do not transmit private replay metadata or count previews as durable activity.
+- Add regression coverage for the real pinned mobile thinking normalizer, cold/live history, preview retirement, cancellation, routing and teardown. Package/runtime checks are not live-handset acceptance.
+- Route native archive, reminder and project-order event subscriptions through the Host-owned guarded boundary, and pin native replacement fixtures to the real SDK `startSeq`/`endSeq` contract. Synchronize the development lock on the verified 0.2.1-rc.5 carrier while preserving the declared peer compatibility range.
+- Improve the read-only channel audit for imported scalar constants, generic/double-quoted call sites and independent mobile consumers. Explicitly document actual refusals of optional controlled-model catalog, usage widget, machine status and unmapped migration/cloud/provider protocols; this does not enable those features or certify all new Cindy protocols.
+
 ## 0.1.32 — 2026-11-03
 
 - Remove keytar and its native npm build chain. Linux/macOS keep system credential vaults through secret-tool/security; Windows encrypts with built-in DPAPI CurrentUser and persists ciphertext through the native DSH credential record service. Login, renewal and logout share one installation-scoped store; failures never fall back to plaintext or pretend a stored login is absent. Windows upgrades may require one explicit login; legacy vault entries are left untouched.

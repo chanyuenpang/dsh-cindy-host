@@ -60,6 +60,42 @@ async function runtimeWithSocket(options = {}) {
   return { runtime, socket };
 }
 
+test('reasoning chunks use session-scoped native thinking pushes and retire the temporary row before the durable one', async () => {
+  const timers = new Map();
+  let timerId = 0;
+  const { runtime, socket } = await runtimeWithSocket({
+    setTimeout: (callback, ms) => { const id = ++timerId; timers.set(id, { callback, ms }); return id; },
+    clearTimeout: id => timers.delete(id),
+  });
+  try {
+    socket.emit('open');
+    socket.frame({ v: 1, kind: 'hello-ack', payload: { serverProtocolVersion: 1, deviceId: 'dev-host', userId: 'user-1' } });
+    socket.frame({ v: 1, kind: 'invoke', id: 'sub-thought', src: 'phone', payload: { channel: 'device-link:subscribe', args: [{ topics: ['session:s1'] }] } });
+    await new Promise(resolve => setImmediate(resolve));
+    socket.sent.length = 0;
+    const event = { type: 'assistant/chunk', seq: 1, time: 1000, data: { turn: 1, step: 1,
+      chunk: { type: 'reasoning-delta', index: 0, text: '公开摘要' } } };
+    runtime.pushSessionReasoning('s1', event);
+    runtime.pushSessionReasoning('s2', event);
+    for (const { callback, ms } of [...timers.values()]) if (ms === 100) callback();
+    const created = socket.sent.filter(frame => frame.kind === 'push' && frame.payload.channel === 'local-db:messages:created');
+    assert.equal(created.length, 1);
+    assert.equal(created[0].dst, 'phone');
+    const row = created[0].payload.payload.message;
+    assert.deepEqual(row.content, { text: '公开摘要', isStreaming: true });
+    assert.equal(row.role, 'thinking');
+    runtime.pushSessionReasoning('s1', { type: 'assistant/message', seq: 2, data: { turn: 1, step: 1 } });
+    await runtime.pushSessionMessage('s1', { id: 'durable', clientId: 'durable', role: 'thinking', content: { text: '公开摘要' } });
+    const messages = socket.sent.filter(frame => frame.kind === 'push' && frame.payload.channel.startsWith('local-db:messages:'));
+    assert.deepEqual(messages.map(frame => frame.payload.channel), [
+      'local-db:messages:created', 'local-db:messages:deleted', 'local-db:messages:created',
+    ]);
+    assert.deepEqual(messages[1].payload.payload.clientIds, [row.clientId]);
+    runtime.pushSessionReasoning('s1', { ...event, seq: 3, data: { ...event.data, step: 2 } });
+  } finally { await runtime.stop(); }
+  assert.equal([...timers.values()].filter(timer => timer.ms === 100).length, 0, 'no reasoning timer outlives the Host');
+});
+
 test('device deletion removes only confirmed records and ignores stale owner completion', async () => {
   let release;
   const { runtime } = await runtimeWithSocket({

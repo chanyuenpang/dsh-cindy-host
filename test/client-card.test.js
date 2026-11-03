@@ -318,37 +318,23 @@ test('a Host that needs a login shows the form instead of a reconnect', () => {
   assert.equal(view.showReconnect, false);
 });
 
-test('renders the sign-in form with both identifier kinds', () => {
+test('renders region selection before loading provider-backed sign-in options', () => {
   const { moduleExports } = loadClientBundle();
   const { LoginForm } = moduleExports.__internals;
-  const html = render(
-    React.createElement(LoginForm, { busy: false, error: '验证码错误', notice: '验证码已发送', accounts: null, onSendCode() {}, onSignIn() {}, onSelectAccount() {} }),
-  );
-  assert.match(html, /登录 Cindy/);
-  assert.match(html, /手机号/);
-  assert.match(html, /邮箱/);
-  assert.match(html, /验证码/);
-  assert.match(html, /获取验证码/);
-  assert.match(html, /验证码错误/);
-  assert.match(html, /验证码已发送/);
+  const html = render(React.createElement(LoginForm, { flow: null, fields: { region: 'cn' }, error: '验证码错误' }));
+  assert.match(html, /登录 Cindy/); assert.match(html, /国内版/); assert.match(html, /国际版/);
+  assert.match(html, /加载登录方式/); assert.match(html, /验证码错误/);
+  assert.doesNotMatch(html, /通过 Apple 登录/, 'providers must be discovered before showing methods');
 });
 
-test('renders a multi-account choice when Cindy asks for one', () => {
+test('renders backend-owned multi-account choices without browser tickets', () => {
   const { moduleExports } = loadClientBundle();
   const { LoginForm } = moduleExports.__internals;
-  const html = render(
-    React.createElement(LoginForm, {
-      busy: false,
-      error: null,
-      notice: null,
-      accounts: [{ id: 'a1', displayName: 'Work' }, { id: 'a2', displayName: null }],
-      onSendCode() {},
-      onSignIn() {},
-      onSelectAccount() {},
-    }),
-  );
-  assert.match(html, /Work/);
-  assert.match(html, /a2/);
+  const html = render(React.createElement(LoginForm, { flow: { region: 'global', step: 'account-selection', accounts: [
+    { id: 'p1', displayName: '个人账户' }, { id: 'o1', displayName: '公司账户', orgName: '公司' },
+  ] } }));
+  assert.match(html, /请选择要登录的账户/); assert.match(html, /个人账户/); assert.match(html, /公司账户/);
+  assert.doesNotMatch(html, /loginTicket|bindTicket|accessToken/);
 });
 
 test('renders each device with its name, platform and id', () => {
@@ -484,6 +470,60 @@ test('status reads reject HTTP, application, malformed and network failures', as
   await assert.rejects(readStatus(), /offline/);
   response = { ok: true, json: async () => ({ ok: true, status: valid }) };
   assert.equal(await readStatus(), valid);
+});
+
+test('login UI shows enabled regional providers, continuation steps and safe official links only', () => {
+  const { LoginForm, safeLoginUrl } = loadClientBundle().moduleExports.__internals;
+  for (const region of ['cn', 'global']) {
+    const providers = { phone: region === 'cn', email: region === 'global', social: region === 'cn' ? ['apple', 'wechat'] : ['apple', 'google'] };
+    const html = render(React.createElement(LoginForm, { flow: { region, step: 'identifier', providers }, fields: { kind: 'phone' } }));
+    assert.match(html, /通过 Apple 登录/); assert.match(html, /企业 SSO 登录/);
+    assert.equal(html.includes('微信登录'), region === 'cn'); assert.equal(html.includes('Google'), region === 'global');
+  }
+  for (const [step, extra, expected] of [
+    ['binding', { bindType: 'email' }, /验证并绑定/],
+    ['sso-verification', { targetMasked: 'p***@example.com' }, /额外验证/],
+    ['region-confirmation', { targetRegion: 'global' }, /确认切换区域/],
+    ['captcha', { challengeUrl: 'https://auth.cindy.app/captcha/turnstile' }, /无法自动读取/],
+    ['browser', { authorizationUrl: 'https://auth.cindy.app/api/auth/social/apple/authorize' }, /noopener noreferrer/],
+  ]) assert.match(render(React.createElement(LoginForm, { flow: { region: 'global', step, ...extra } })), expected);
+  assert.equal(safeLoginUrl('javascript:alert(1)', 'global'), null);
+  assert.equal(safeLoginUrl('https://auth.cindy.com.cn/x', 'global'), null);
+  assert.equal(safeLoginUrl('https://user:secret@auth.cindy.app/x', 'global'), null);
+});
+
+function authPanelHarness(fetch) {
+  const hooks = []; let cursor = 0; const ticks = new Map(); let tickId = 0;
+  const react = { ...React,
+    useState(initial) { const i = cursor++; if (!(i in hooks)) hooks[i] = initial; return [hooks[i], value => { hooks[i] = typeof value === 'function' ? value(hooks[i]) : value; }]; },
+    useRef(initial) { const i = cursor++; if (!(i in hooks)) hooks[i] = { current: initial }; return hooks[i]; },
+    useEffect(callback, deps) { const i = cursor++; const old = hooks[i]; if (!old || deps.some((value, n) => value !== old.deps[n])) { old?.cleanup?.(); hooks[i] = { deps, pending: callback }; } },
+  };
+  const { AuthLoginPanel } = loadClientBundle({ react, fetch,
+    setInterval: callback => { ticks.set(++tickId, callback); return tickId; }, clearInterval: id => ticks.delete(id),
+  }).moduleExports.__internals;
+  let completions = 0;
+  const tree = () => { cursor = 0; const element = AuthLoginPanel({ onAuthenticated: () => { completions++; } });
+    for (const hook of hooks) if (hook?.pending) { const run = hook.pending; hook.pending = null; hook.cleanup = run(); } return element; };
+  return { tree, get completions() { return completions; }, unmount() { for (const hook of hooks) hook?.cleanup?.(); } };
+}
+
+test('login UI ignores an old poll after cancel and never stores backend tickets', async () => {
+  let finishRead; const delayed = new Promise(resolve => { finishRead = resolve; }); const calls = [];
+  const view = (step, revision) => ({ attemptId: 'owned', revision, region: 'global', step, providers: { phone: false, email: true, social: ['apple'] } });
+  const h = authPanelHarness(async (_url, init) => {
+    const body = JSON.parse(init.body); calls.push(body);
+    const result = body.action === 'read' ? await delayed : { ok: true, view: view(body.action === 'start' ? 'identifier' : body.action === 'cancel' ? 'cancelled' : 'browser', calls.length) };
+    return { ok: true, json: async () => result };
+  });
+  try {
+    await h.tree().props.onStart('global', false);
+    await h.tree().props.onAction('start_browser', { kind: 'social', providerOrConnectionId: 'apple' });
+    const poll = h.tree().props.onAction('read');
+    await h.tree().props.onAction('cancel'); finishRead({ ok: true, view: view('completed', 100) }); await poll;
+    assert.equal(h.tree().props.flow.step, 'cancelled'); assert.equal(h.completions, 0);
+    assert.doesNotMatch(JSON.stringify(calls), /loginTicket|bindTicket|accessToken|codeVerifier/);
+  } finally { h.unmount(); }
 });
 
 /** Run page hooks without a DOM so effects, handlers and subsequent renders are exercised. */

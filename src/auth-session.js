@@ -13,6 +13,7 @@
 import { randomUUID } from 'node:crypto';
 import { loginWithPhone } from './cindy-login.js';
 import { refreshStoredSession } from './cindy-login-flow.js';
+import { sessionEndpoints } from './cindy-auth-endpoints.js';
 import { loadSession, saveSession, credentialStoreAvailable, clearSession as clearStoredSession } from './credential-store.js';
 
 // One in-process writer for login/logout and guarded refresh commits. This is
@@ -26,8 +27,14 @@ function serializeWrite(action) {
 }
 function sameCredential(a, b) {
   return a != null && b != null && ['deviceId', 'authBaseUrl', 'accessToken', 'refreshToken']
-    .every((key) => a[key] === b[key]);
+    .every((key) => a[key] === b[key]) && a.realm === b.realm
+    && JSON.stringify(a.endpointSnapshot ?? null) === JSON.stringify(b.endpointSnapshot ?? null);
 }
+function validRealmMetadata(session) {
+  if (!session?.endpointSnapshot && session?.sessionVersion !== 2 && session?.realm === undefined) return true;
+  try { return sessionEndpoints(session) !== null; } catch { return false; }
+}
+const invalidRealm = () => ({ ok: false, reason: 'SESSION_REALM_MISMATCH', message: 'Cindy 账号区域配置无效，请重新登录' });
 const superseded = () => ({ ok: false, reason: 'OWNER_UNVERIFIED', message: 'Cindy 登录归属已变化，未采用旧操作结果' });
 
 /** Refresh only a captured authenticated lease, never import another stored identity. */
@@ -38,6 +45,7 @@ export async function refreshOwnedCredential(captured, ports = {}) {
   const current = ports.isCurrent ?? (() => false);
   const revision = credentialRevision;
   const snapshot = Object.freeze({ ...captured });
+  if (!validRealmMetadata(snapshot)) return invalidRealm();
   const stored = await load();
   if (revision !== credentialRevision || !current() || !sameCredential(snapshot, stored)) return superseded();
   const timeoutMs = Number.isSafeInteger(ports.timeoutMs) && ports.timeoutMs > 0 ? Math.min(ports.timeoutMs, 30_000) : 30_000;
@@ -68,6 +76,7 @@ export async function refreshOwnedCredential(captured, ports = {}) {
   }
   if (!refreshed?.ok) return { ok: false, reason: 'AUTH_FAILED', message: 'Cindy 登录续期失败' };
   const session = { ...snapshot, ...refreshed.session };
+  if (!validRealmMetadata(session)) return invalidRealm();
   if (session.deviceId !== snapshot.deviceId || session.authBaseUrl !== snapshot.authBaseUrl
       || typeof session.accessToken !== 'string' || !session.accessToken
       || typeof session.refreshToken !== 'string' || !session.refreshToken) return superseded();
@@ -107,12 +116,14 @@ export async function restoreSession(ports = {}) {
   const revision = credentialRevision;
   const saved = await load();
   if (!saved) return { ok: false, reason: 'missing', message: '本机还没有 Cindy 登录态' };
+  if (!validRealmMetadata(saved)) return invalidRealm();
 
   if (revision !== credentialRevision) return superseded();
   const refreshed = await refresh(saved);
   if (revision !== credentialRevision) return superseded();
   if (refreshed.ok) {
     const session = { ...saved, ...refreshed.session };
+    if (!validRealmMetadata(session)) return invalidRealm();
     return serializeWrite(async () => {
       const stored = await load();
       if (revision !== credentialRevision || !sameCredential(saved, stored)) return superseded();
@@ -155,9 +166,16 @@ export async function restoreSession(ports = {}) {
  */
 export async function adoptSession(session, ports = {}) {
   const save = ports.saveSession ?? saveSession;
+  const isCurrent = ports.isCurrent ?? (() => true);
+  const stale = () => Object.assign(new Error('Login superseded'), { code: 'LOGIN_SUPERSEDED' });
+  if (!isCurrent()) throw stale();
   const stored = { deviceId: session.deviceId ?? randomUUID(), ...session };
-  credentialRevision += 1; // Fence refreshes immediately, before waiting for an older writer.
-  await serializeWrite(() => save(stored));
+  const revision = ++credentialRevision; // Fence refreshes before waiting for an older writer.
+  await serializeWrite(async () => {
+    if (revision !== credentialRevision || !isCurrent()) throw stale();
+    await save(stored);
+    if (!isCurrent()) throw stale();
+  });
   return stored;
 }
 

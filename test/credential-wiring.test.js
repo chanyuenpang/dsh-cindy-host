@@ -5,7 +5,7 @@ import { createHostRoutes, API_PREFIX } from '../src/host-routes.js';
 import { startHost } from '../src/host.js';
 import { CredentialStoreUnavailableError } from '../src/credential-store.js';
 
-const SESSION = { deviceId: 'fake-device', authBaseUrl: 'https://auth.invalid', accessToken: 'fake-at', refreshToken: 'fake-rt' };
+const SESSION = { deviceId: 'fake-device', authBaseUrl: 'https://auth.cindy.com.cn', accessToken: 'fake-at', refreshToken: 'fake-rt' };
 function ports() {
   let saved = null;
   let refreshes = 0;
@@ -14,7 +14,7 @@ function ports() {
     loadSession: async () => saved,
     saveSession: async value => { saved = structuredClone(value); },
     clearSession: async () => { saved = null; },
-    refreshStoredSession: async () => ({ ok: true, session: { accessToken: 'fake-at-' + ++refreshes, refreshToken: 'fake-rt-' + refreshes } }),
+    refreshStoredSession: async stored => ({ ok: true, session: { ...stored, accessToken: 'fake-at-' + ++refreshes, refreshToken: 'fake-rt-' + refreshes } }),
   };
 }
 async function call(routes, path) {

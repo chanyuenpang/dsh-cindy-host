@@ -430,5 +430,5 @@ for (const operation of ['verify', 'select']) test('login route ' + operation + 
 test('logout route invalidates owner before credential clear and disconnect', async () => {
   const f = routeFixture();
   assert.equal((await routeCall(f.routes, '/logout')).status, 200);
-  assert.deepEqual(f.events, ['invalidate', 'clear', 'disconnect']);
+  assert.deepEqual(f.events, ['invalidate', 'clear', 'disconnect', 'set-login']);
 });

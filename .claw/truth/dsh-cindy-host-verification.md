@@ -1,16 +1,26 @@
-﻿# Verification and projection exclusion rules
+# Verification and projection exclusion rules
 
 <!-- state: current -->
 ## Current behavior
 
 The whole suite runs with `node --test` (`npm test`) on Node 22 or newer. Release 0.1.21 (maintained sibling worktree `../DSH-cindy-host-020`, commit `8699b61`) was verified with **759 passing / 1 skipped / 0 failed** out of 760 runner entries, with `CINDY_SOURCE_ROOT` set so the real Cindy consumer regression ran. The DeviceLink audit reported **54 served / 142 deliberately declined / 0 unclassified** (`npm run audit:channels`). These counts are evidence for that release, not timeless constants: future changes must record fresh command output rather than copying this paragraph.
 
+### Current native-adaptation verification boundary
+
+For ongoing Cindy phone/protocol adaptation, modify and test only this Host. Cindy source is read-only schema/consumer reference: do not modify it, copy it into executable fixtures, import/execute its consumer code or run Cindy tests. Write Host-owned wire assertions from the referenced contract. Run only directly affected Host tests; a repository-wide run requires explicit user authorization, not an automatic per-slice or smoke prerequisite. Historical consumer/full-suite procedures below describe prior release evidence and do not override this boundary.
+
+The [2026-11-03 native-subset delivery record](<../../doc/native-capability-adaptation-20261103.md#L41-L57>) reports targeted adapters, source composition, affected delivery/routes and lifecycle checks, plus a read-only channel audit of 72 served / 124 declined / 0 unclassified and 12 classified pushes. The [lifecycle suite](<../../test/native-capability-lifecycle.test.js>) covers source replacement, account boundary, socket-close cancellation, stale callbacks and one-peer isolation. No tests were rerun during knowledge maintenance; these are recorded implementation results, not a fresh full-suite pass, actual profile service-mount confirmation or handset certification.
+
+A pre-restriction full-suite run had a logout assertion difference (expected invalidate/clear/disconnect, actual included set-login) in [Host export integration](<../../test/host-export-integration.test.js>). Its current pass/fail and attribution are not established by this adaptation. Preserve it as historical evidence rather than silently changing expectations or claiming the whole repository green. Early copied/executed Cindy validation added by that work was withdrawn; existing unrelated/parallel tests and reasoning/authentication work were not counted as native-adaptation deliverables.
+
+Publication, plugin reload, actual mounted services and preset-specific compact, phone forms and real-data operations remain separately authorized deployment acceptance. Do not create real reminders, compact/fork sessions or reorder actual workspaces merely to certify this documentation. Current implementation scope is owned by [protocol Truth](<dsh-cindy-host-device-link-protocol.md>) and [ADR 0019](<adr/0019-native-capability-subset-boundary.md>).
+
 ### Cross-client evidence and deployment identity
 
-The model projection semantics have one owner: [new-conversation runtime](<.claw/truth/dsh-cindy-host-new-session-runtime.md>). For cross-client compatibility, verify the producer and consumer together:
+The model projection semantics have one owner: [new-conversation runtime](<dsh-cindy-host-new-session-runtime.md>). Historical cross-client release evidence verified producer and consumer together; the current read-only/Host-only boundary above governs new work:
 
 - Pin the actual worktree, installed package path, and running process separately. In the 0.1.21 incident the original workspace was older than the maintained release worktree; replacing the installed package from the old tree would discard newer fixes.
-- Use real Host wire output as input to the actual Cindy consumer code, not just idealized fixtures. The model regression runs with `CINDY_SOURCE_ROOT=<Cindy checkout> node --test test/host-models-cindy-contract.test.js` in the maintained worktree (Node with registerHooks/native TypeScript stripping). Check new and existing sessions, aliases, duplicate model IDs across providers, unavailable providers, missing/disabled runtime markers, absent optional metadata, and read failures.
+- The historical model regression used real Host wire output as input to actual Cindy consumer code rather than idealized fixtures. It ran with `CINDY_SOURCE_ROOT=<Cindy checkout> node --test test/host-models-cindy-contract.test.js` in the maintained worktree (Node with registerHooks/native TypeScript stripping). Check new and existing sessions, aliases, duplicate model IDs across providers, unavailable providers, missing/disabled runtime markers, absent optional metadata, and read failures.
 - After installation and restart, inspect only the required fields of `POST /api/dsh-cindy-host/selftest` read channels. The 0.1.21 runtime returned two providers/seven models; feeding those actual responses to Cindy's shared registry/unified picker yielded seven draft and session rows. These are incident measurements, not fixed expected model counts.
 - Default-model text, nonempty capability metadata, passing unit tests, package installation, and UI success are different evidence layers. Never promote any one into proof of all others. Model-list validation does not certify skills, commands, or every desktop/mobile feature.
 - Publishing evidence for 0.1.21: npm latest and v0.1.21 pointed to commit `8699b61`; registry SHA1 matched `c1e02cde7051c673e7a219267188f5495d3dbb64`. Tarball and registry installations into separate clean DSH 0.1.5-rc.2 profiles mounted successfully; the registry-installed authenticated page returned 200 with boot/plugin entries, without profile-local DSH packages. The desktop's locally patched module matched the release module; this does not assert that its package metadata was upgraded by publishing.
@@ -53,7 +63,7 @@ What each layer must prove:
 
 Verification rules:
 
-- Run `npm test` before the smoke gates; a clean run is the entry gate.
+- The historical release smoke procedure used a clean `npm test` run as its entry gate. For current adaptation, use only affected Host tests; obtain explicit authorization before a full-suite run or release/smoke expansion.
 - Gate 1: `dsh --profile cindy-smoke --dump-config` with a disposable `DSH_HOME`
   must compose the bundle.
 - Gate 2: `dsh --profile cindy-smoke --no-open --port 3081` must show a running host
@@ -110,6 +120,11 @@ Code anchors:
 
 <!-- state: history -->
 ## Evolution history
+
+<!-- dated: 2026-11-03 -->
+### Verification narrowed to Host-owned targeted contracts
+
+Earlier adaptation slices repeatedly ran the full suite and executed copied/reference Cindy consumer code. The clarified boundary withdrew that newly added validation and replaced it with Host-owned protocol assertions against read-only source, affected-module tests and read-only audits. This supersedes the earlier unconditional full-suite/consumer-execution recipe for ongoing phone adaptation; it does not erase historical release evidence or claim that the observed logout assertion difference has been fixed.
 
 <!-- dated: 2026-09-17 -->
 ### 文档断言的复核

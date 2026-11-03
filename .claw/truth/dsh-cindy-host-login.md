@@ -1,81 +1,45 @@
-﻿# Non-interactive Cindy login and credential store
+# Cindy regional browser login and credential ownership
 
 <!-- state: current -->
 ## Current behavior
 
-A DSH Host has no TTY, so the readline fallback used by the CLI can never run in the
-card. `src/cindy-login-flow.js` is the non-interactive login path shared by the card
-and the runtime; `src/cindy-login.js` keeps the interactive terminal path for
-`npm run login` / `npm run host`.
+The settings page uses the installation-scoped [authentication controller](<src/cindy-auth-controller.js#L45-L115>), not the terminal readline flow or the legacy direct-code API. It supports explicit `cn`/`global` selection, deployed provider discovery, enabled Apple/Google/WeChat browser authorization, phone/email codes, organization/email discovery, account selection, required contact binding and SSO secondary verification. Enterprise SSO and Apple are different entrypoints; neither an email nor an iOS/Apple identity proves a common regional account. Disabled providers are not invented. See the [operator guide](<doc/auth-login.md>) and [HTTP contract](<.claw/truth/dsh-cindy-host-card-api.md>).
 
-Non-interactive flow:
+### Trusted region and browser transport
 
-- `LOGIN_KINDS = ['phone', 'email']`. `validateIdentifier(kind, identifier)` rejects
-  an unknown kind, an empty value, a phone that does not match
-  `/^\+?[0-9][0-9\s-]{4,19}$/`, or an email that does not match
-  `/^[^\s@]+@[^\s@]+\.[^\s@]+$/`.
-- `requestLoginCode({ kind, identifier })` validates first and returns
-  `{ ok: true, identifier }` after Cindy accepted the request, or `{ ok: false, message }`
-  (`'验证码发送失败，请检查账号或网络'`) otherwise.
-- `verifyLoginCode({ kind, identifier, code, deviceId })` requires a non-empty code
-  and a `deviceId`; it maps Cindy's answers to values instead of exceptions:
-  `select_account` returns `{ ok: false, status: 'select_account', accounts, loginTicket }`,
-  `binding_required` and `sso_verification_required` return `{ ok: false, status, message }`,
-  and any other unknown non-`ok` status returns a message naming it.
-- A successful answer must contain string `accessToken` and `refreshToken`; otherwise
-  the call returns `{ ok: false, message: 'Cindy 未返回登录凭据' }`. `expiresAt` is
-  carried through only when present.
-- `selectLoginAccount({ loginTicket, accountId, deviceId })` finishes the
-  `select_account` branch.
-- Default auth base URL is the China-mainland endpoint
-  `https://auth.cindy.com.cn` (`MAINLAND_CINDY_AUTH_BASE_URL`). `CINDY_AUTH_BASE_URL`
-  (via `normalizeAuthBaseUrl`) is an explicit override for a non-mainland environment;
-  there is no implicit fallback between the two.
+- [Endpoint registry](<src/cindy-auth-endpoints.js#L1-L84>) fetches only the fixed public CN/global manifests. It checks schema, HTTPS, realm domains and callback/auth origin, refuses redirects and upstream error-body reflection, and freezes the snapshot. Successful v2 sessions retain `realm`, `endpointSnapshot` and selected `membershipId` with credentials. Only pre-v2 sessions at the two known official auth origins have a narrow migration mapping; unknown/custom origins without explicit network configuration fail closed.
+- [Organization/email discovery](<src/cindy-auth-controller.js#L116-L175>) does not turn partial network failure or ambiguity into absence. A discovered other-region organization requires explicit region confirmation; personal-email continuation deliberately returns to the initially selected region.
+- [Browser authorization](<src/cindy-browser-auth.js#L16-L103>) uses PKCE S256 and an independent poll secret. Hosted callback polling is selected when the trusted manifest supplies a callback; only challenge/hash enters the authorization URL. Only an empty callback configuration permits an ephemeral IPv4 loopback listener. Hosted errors never silently downgrade. Local callbacks check method, path and single-use state and never reflect provider input. Browser work has a five-minute budget, cancellation and bounded transient polling retries.
 
-Session lifecycle (`src/auth-session.js`):
+### State, secrets and continuations
 
-- `restoreSession()` loads the stored session and refreshes it. A rejected refresh
-  token is dropped (`clearSession()`), so the card shows a login form instead of
-  retrying a dead token forever; the failure reason is `missing` or `expired`.
-- `adoptSession(session)` persists a session the card just established, minting a
-  `deviceId` when Cindy did not supply one.
-- `forgetSession()` clears the stored session; the next connect starts from the login
-  form.
-- The CLI path (`getAuthenticatedSession()`) reuses a stored session when it can and
-  otherwise asks on the terminal.
+- The controller owns attempt capability ID, revision, epoch, deadline (15 minutes by default), pending tickets and asynchronous work. Its [whitelisted view](<src/cindy-auth-controller.js#L45-L79>) contains display state, enabled methods, public account choices, masked targets and official links, not tokens, login/bind/verification tickets, authorization codes, PKCE verifier or poll secret.
+- Four official outcomes are handled as protocol results: `ok`, `select_account`, `binding_required`, `sso_verification_required`. Only resource access/refresh tokens for the selected membership are committed; account-management tokens are not a Host session. [Outcome owner](<src/cindy-auth-controller.js#L86-L114>).
+- A second page cannot silently acquire an active attempt: start requires explicit takeover, and commands require the attempt ID plus current revision when mutating a step. Cancellation, replacement, logout and disposal fence late asynchronous results. The short sealed commit cannot be cancelled by the page; logout drains it before clearing credentials. [Command lifecycle](<src/cindy-auth-controller.js#L226-L265>), [route commit/logout](<src/host-routes.js#L83-L115>) and [logout handler](<src/host-routes.js#L211-L219>).
+- Ordinary browsers cannot automatically read the official CAPTCHA page's cross-origin success hash. The page explicitly asks the user to complete official verification and paste its complete successful URL containing `#cindy-captcha=ok.…`. The controller checks the exact auth origin/path and forwards only the proof in code delivery. Do not share or persist that URL; expired/consumed proofs require fresh verification. There is no proxy, injected script, guessed localhost site key or bypass. This code-delivery fallback is not an Apple/enterprise-SSO authorization prerequisite. [Controller](<src/cindy-auth-controller.js#L139-L185>), [client instructions](<lib/client.js#L450-L454>).
 
-Credential store (`src/credential-store.js`):
+### Credential lifecycle
 
-- Sessions live in the OS credential store through `keytar`, service `DSH Cindy Host`,
-  account `session-v1`, as JSON. Tokens only ever travel between that store and the
-  relay handshake; nothing prints them, and the card only ever sees booleans and a
-  masked identifier.
-- The OS credential store is shared across DSH profiles, so a session created by
-  `npm run login` is visible to the disposable smoke profile too. The smoke profile
-  itself only owns its settings document.
+- [Session owner](<src/auth-session.js>) serializes in-process login/logout/refresh writes and uses revision plus authenticated leases. V2 realm/snapshot consistency is checked before refresh; stale identities cannot replace current credentials. This is not a cross-process credential-store CAS.
+- `restoreSession()` preserves stored credentials on failure: transient failure can return the saved session with `refreshDeferred`; a rejected refresh reports `expired` and prompts login without deletion. Backend unavailability is not missing credentials. Only explicit `forgetSession()` deletes the stored login. [Restore](<src/auth-session.js#L102-L159>), [adopt/forget](<src/auth-session.js#L167-L192>).
+- The [existing secure store](<src/credential-store.js#L54-L113>) is reused, not migrated to plaintext or keytar. Linux uses Secret Service via `secret-tool`, macOS the system keychain via `security`; Windows uses current-user DPAPI and stores only ciphertext in DSH's native record service. Missing native service or system keychain support fails visibly; Windows standalone CLI has no plaintext fallback. [Backend operations](<src/credential-store.js#L115-L181>).
+- Service is `DSH Cindy Host`. Default DSH home uses `session-v1`, including an explicitly spelled default `DSH_HOME`; a different home uses `session-v1@<digest>`. Separate installations therefore do not share a relay device identity. Credentials and CAPTCHA proof never belong in settings, UI responses or logs.
+- CLI [interactive login](<src/cindy-login.js>) and [legacy non-interactive code helper](<src/cindy-login-flow.js>) remain compatibility paths. The latter retains phone/email validation, code request/verify and account selection; unsupported binding/SSO branches there are not the capabilities of the new settings flow. A nonempty code/device ID and both resource tokens are required for success. The CLI auth default remains mainland with explicit override, not an implicit cross-region fallback.
 
-Pitfalls:
+Legacy helper details remain relevant for compatibility: `LOGIN_KINDS` is phone/email; `validateIdentifier()` rejects empty/unknown identifiers, validates phone with `/^\+?[0-9][0-9\s-]{4,19}$/` and email with `/^[^\s@]+@[^\s@]+\.[^\s@]+$/`. `requestLoginCode()` returns the normalized identifier on success. `verifyLoginCode()` and `selectLoginAccount()` return values rather than conflating official continuations with transport exceptions; resource token parsing accepts flat/nested token pairs and carries optional `expiresAt`. [Helper implementation](<src/cindy-login-flow.js>), [helper regressions](<test/cindy-login-flow.test.js>), [CLI tests](<test/cindy-login.test.js>) and [session lifecycle tests](<test/auth-session.test.js>). The older empty-identifier HTTP smoke result (400 without contacting Cindy) is not an end-to-end authentication result.
 
-- Do not turn the `select_account` / `binding_required` / `sso_verification_required`
-  answers into thrown transport errors: the card must render them as answers, and
-  callers must be able to tell "Cindy said no" from "the request broke".
-- Never log or return tokens over HTTP; the routes surface only `deviceId` and status.
+### Verification and activation boundary
 
-Code anchors:
+Offline regressions live in [controller tests](<test/cindy-auth-controller.test.js>), [browser callback tests](<test/cindy-browser-auth.test.js>), [credential lease tests](<test/auth-session-lease.test.js>), [HTTP security/race tests](<test/host-auth-routes.test.js>), [regional runtime tests](<test/host-auth-region.test.js>) and [settings tests](<test/client-card.test.js>). Preserve coverage for replay/cancel/expiry, wrong-origin CAPTCHA, stale UI polls, secret-free responses, encrypted-store failure and logout racing commit. Regional tests exercise actual runtime composition with injected network transports and assert successful media/peer RPC payloads and socket/directory/staging/ICE URLs; they are not live IdP tests.
 
-- `src/cindy-login-flow.js` (`LOGIN_KINDS`, `validateIdentifier`, `requestLoginCode`,
-  `verifyLoginCode`, `selectLoginAccount`, `refreshStoredSession`)
-- `src/auth-session.js` (`restoreSession`, `adoptSession`, `forgetSession`,
-  `getAuthenticatedSession`)
-- `src/credential-store.js` (`SERVICE`, `ACCOUNT`)
-- `src/cindy-login.js` (CLI readline path, `MAINLAND_CINDY_AUTH_BASE_URL`)
-- `src/host-routes.js` (login/verify/select-account/logout handlers)
+Recorded 2026-11-03 verification: [full-suite log](<artifacts/auth-full-suite.log#L1119-L1126>) reports 1048 tests, 1047 pass, 1 skipped and 0 fail. This governance pass did not rerun tests. The recorded [channel audit](<artifacts/auth-channel-audit.log#L4-L8>) reports 60 served / 136 declined / 0 unclassified; [dry-run package contents](<artifacts/auth-pack.json>) include the new modules, not a publication. No production publish/install/reload or real Apple/enterprise-SSO/iOS acceptance was performed for this authentication implementation. Authorized human acceptance must cover both regions, a real enterprise IdP, binding/secondary verification/CAPTCHA, cancel/logout, iOS same-account discovery and file/image round trip before claiming success for a user's account.
 
-Verification rules:
+The immutable network-runtime owner and region-replacement rules live in [relay runtime Truth](<.claw/truth/dsh-cindy-host-relay-runtime.md>); rationale lives in [regional authentication ADR](<.claw/truth/adr/0018-regional-authentication-ownership.md>).
 
-- `test/cindy-login-flow.test.js` covers identifier validation, `ok`/nested/flat token
-  answers, and the `select_account` / `binding_required` / `sso_verification_required`
-  branches; `test/cindy-login.test.js` and `test/cindy-sessions.test.js` cover the CLI
-  path and session handling.
-- Live check used for this Host: `POST …/login/request-code` with an empty identifier
-  answered `400` without touching Cindy.
+<!-- state: history -->
+## Evolution history
+
+<!-- dated: 2026-11-03 -->
+### Direct-code-only settings authentication replaced
+
+The original settings form called phone/email code helpers directly, retained a login ticket for account selection, and could not continue contact binding or SSO secondary verification. The controller-backed flow replaces that page path while keeping the direct endpoints for compatibility. Old documentation also claimed rejected refreshes deleted credentials, keytar was required and smoke profiles shared the default credential; current session/store implementations disprove those claims. Keep those distinctions for rollback and diagnosing accidental credential deletion or cross-installation device kicking, not as current behavior.

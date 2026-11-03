@@ -20,6 +20,7 @@ import { toAgentSkills, toAgentCommands, toAtResources } from './host-palette.js
 import { toGoalStatusPayload } from './host-goals.js';
 import { hostAttachmentsOf } from './host-attachments.js';
 import { historyLocateOptions, locateCommittedMessages, capReferenceRows } from './host-history-locate.js';
+import { assertNoStructuredSessionReferences } from './session-reference-boundary.js';
 
 async function deliveryReply(request, operation) {
   try { return invokeResult(request, await operation()); }
@@ -231,6 +232,22 @@ export const SUPPORTED_CHANNELS = Object.freeze([
   ...QUEUE_COMMAND_CHANNELS,
   'maker:input:move',
   'maker:set-model',
+  'maker:compact-session',
+  'maker:fork',
+  'local-db:conversations:search',
+  'maker:session-background-tasks:list',
+  'local-db:subagent-runs:list',
+  'local-db:subagent-runs:detail',
+  'local-db:subagent-runs:transcript',
+  'maker:schedule:list',
+  'maker:schedule:get',
+  'maker:schedule:create',
+  'maker:schedule:update',
+  'maker:schedule:delete',
+  'sidebar-settings:get-project-order',
+  'sidebar-settings:apply-project-order',
+  'local-db:history:messages',
+  'maker:input:session-reference-capability',
   'maker:set-effort',
   'fs:list-dir',
   'fs:stat-path',
@@ -538,6 +555,22 @@ export function createChannelRouter({
 
     const channel = request?.payload?.channel;
     const args = Array.isArray(request?.payload?.args) ? request.payload.args : [];
+    if (['maker:create-session', 'maker:send', 'maker:input:enqueue', 'maker:input:steer', 'maker:input:update-text', 'maker:input:update-content'].includes(channel)) {
+      try { assertNoStructuredSessionReferences(args); }
+      catch (error) { return invokeError(request, 'NOT_AVAILABLE', error.message); }
+    }
+    if (channel === 'maker:input:session-reference-capability') {
+      if (args.length) return invokeError(request, 'BAD_REQUEST', 'Reference capability probe accepts no arguments');
+      return invokeResult(request, { supported: false, version: 1 });
+    }
+    if (channel === 'local-db:history:messages') {
+      if (args.length !== 1) return invokeError(request, 'BAD_REQUEST', 'Source history needs one request object');
+      const capabilities = capabilitiesNow(); const port = capabilities.referenceHistory;
+      if (typeof port?.read !== 'function') return invokeError(request, 'NOT_AVAILABLE', 'Native reference source history is not composed');
+      if (capabilities.sessionHidden?.(args[0]?.sessionId) === true) return invokeError(request, 'NOT_FOUND', 'Source session is hidden');
+      try { return invokeResult(request, await port.read(args[0], { getView: id => sessionRow(id) })); }
+      catch (error) { return invokeError(request, refusalCodeOf(error), String(error?.message ?? error)); }
+    }
 
     if (channel === SUBSCRIBE) {
       const topics = acceptTopics(args?.[0]?.topics);
@@ -1065,6 +1098,10 @@ export function createChannelRouter({
       // as every list/get read, never just the requested status.
       const capabilities = capabilitiesNow();
       const rename = capabilities.renameSession;
+      if (typeof capabilities.validateSessionMetaPatch === 'function') {
+        try { capabilities.validateSessionMetaPatch(patch); }
+        catch (error) { return invokeError(request, refusalCodeOf(error), String(error.message)); }
+      }
       let wrote = false;
       if (typeof rename === 'function' && typeof patch.title === 'string' && patch.title.trim() !== '') {
         await rename({ sessionId, title: patch.title.trim() });
@@ -1374,6 +1411,7 @@ export function createChannelRouter({
         // `keepQueue: true` (see `stopOptionsForProjection`).
         try {
           await control.cancel({ sessionId });
+          capabilities.manualCompact?.cancelSession?.(sessionId, 'Stopped by controller');
         } catch (error) {
           return invokeError(request, 'THREW', String(error?.message ?? error));
         }
@@ -1511,6 +1549,100 @@ export function createChannelRouter({
 
     // Approvals. The questions are DSH's own pending `approval/request`s, routed
     // here only while a controller is watching the asking session.
+    if (channel === 'sidebar-settings:get-project-order' || channel === 'sidebar-settings:apply-project-order') {
+      const read = channel === 'sidebar-settings:get-project-order';
+      if (args.length !== (read ? 0 : 1)) return invokeError(request, 'BAD_REQUEST', 'Invalid project-order argument count');
+      const port = capabilitiesNow().projectOrder;
+      if (!port) return read ? invokeResult(request, { authoritative: false, available: false, manualProjectOrder: [], projectOrder: 'activity' }) : invokeError(request, 'NOT_AVAILABLE', 'Native Workspace ordering is not composed');
+      try { return invokeResult(request, read ? await port.read() : await port.apply(args[0])); }
+      catch (error) { return invokeError(request, refusalCodeOf(error), String(error?.message ?? error)); }
+    }
+
+    if (['maker:schedule:list', 'maker:schedule:get', 'maker:schedule:create', 'maker:schedule:update', 'maker:schedule:delete'].includes(channel)) {
+      const method = channel.slice(channel.lastIndexOf(':') + 1);
+      const expected = method === 'list' ? undefined : method === 'update' ? 2 : 1;
+      if (expected === undefined ? args.length > 1 : args.length !== expected) return invokeError(request, 'BAD_REQUEST', 'Invalid native reminder argument count');
+      const port = capabilitiesNow().reminders;
+      if (typeof port?.[method] !== 'function') return invokeError(request, 'NOT_AVAILABLE', 'Native existing-session reminders are not composed');
+      const options = { getView: id => sessionRow(id), requestKey: JSON.stringify([request.src, request.id, channel]) };
+      try { const value = method === 'update' ? await port.update(args[0], args[1], options) : await port[method](args[0], options); return invokeResult(request, value); }
+      catch (error) { return invokeError(request, refusalCodeOf(error), String(error?.message ?? error)); }
+    }
+
+    if (['local-db:subagent-runs:list', 'local-db:subagent-runs:detail', 'local-db:subagent-runs:transcript'].includes(channel)) {
+      if (args.length !== 1) return invokeError(request, 'BAD_REQUEST', 'Subagent reads need one request object');
+      const method = channel.slice(channel.lastIndexOf(':') + 1); const port = capabilitiesNow().subagentReads;
+      if (typeof port?.[method] !== 'function') return invokeError(request, 'NOT_AVAILABLE', 'Native read-only subagent catalog is not composed');
+      try { return invokeResult(request, await port[method](args[0])); }
+      catch (error) { return invokeError(request, refusalCodeOf(error), String(error?.message ?? error)); }
+    }
+
+    if (channel === 'maker:session-background-tasks:list') {
+      if (args.length !== 1 || typeof args[0] !== 'string' || !args[0].trim()) return invokeError(request, 'BAD_REQUEST', 'Background task list needs one session identity');
+      const port = capabilitiesNow().backgroundJobs;
+      if (typeof port?.read !== 'function') return invokeError(request, 'NOT_AVAILABLE', 'Native background jobs are not composed');
+      try { return invokeResult(request, await port.read(args[0])); }
+      catch (error) { return invokeError(request, refusalCodeOf(error), String(error?.message ?? error)); }
+    }
+
+    if (channel === 'local-db:conversations:search') {
+      if (args.length !== 1) return invokeError(request, 'BAD_REQUEST', 'Conversation search needs one request object');
+      const port = capabilitiesNow().keywordSearch;
+      if (typeof port?.run !== 'function') return invokeError(request, 'NOT_AVAILABLE', 'Native keyword search is not composed');
+      try {
+        return invokeResult(request, await port.run(args[0], { getCandidates: async () => {
+          const rows = await sessionRows();
+          if (capabilitiesNow().keywordSearch !== port) throw refusalError('NOT_AVAILABLE', 'Native search source changed during candidate discovery');
+          return rows;
+        } }));
+      } catch (error) { return invokeError(request, refusalCodeOf(error), String(error?.message ?? error)); }
+    }
+
+    if (channel === 'maker:fork') {
+      const [sessionId, messageClientId] = args;
+      if (args.length !== 2 || typeof sessionId !== 'string' || !sessionId.trim() ||
+        typeof messageClientId !== 'string' || !messageClientId.trim()) return invokeError(request, 'BAD_REQUEST', 'fork needs exact source and message identities');
+      const capabilities = capabilitiesNow(); const port = capabilities.forkSession;
+      if (typeof port?.run !== 'function') return invokeError(request, 'NOT_AVAILABLE', 'Native ordinary fork is not composed');
+      if (capabilities.sessionHidden?.(sessionId) === true) return invokeError(request, 'NOT_AVAILABLE', 'Hidden source sessions cannot be forked');
+      let created;
+      try {
+        created = await port.run({ sessionId, messageClientId, requestKey: JSON.stringify([request.src, request.id]) });
+        invalidateSessionRows();
+        if (capabilitiesNow().forkSession !== port) return invokeError(request, 'NOT_AVAILABLE', 'Native child was created but the source changed; sessionId=' + created.sessionId + '; do not repeat fork');
+        capabilities.publishSessionCreated?.(created.sessionId);
+        if (created.partial) return invokeError(request, 'THREW', created.partial + '; sessionId=' + created.sessionId + '; do not repeat fork; read the created session');
+        const row = await sessionRow(created.sessionId);
+        if (!row) return invokeError(request, 'NOT_AVAILABLE', 'Native child was created but its row is not yet readable; sessionId=' + created.sessionId + '; do not repeat fork');
+        return invokeResult(request, row);
+      } catch (error) {
+        const evidence = created?.sessionId ? '; native child already created; sessionId=' + created.sessionId + '; do not repeat fork' : '';
+        return invokeError(request, refusalCodeOf(error), String(error?.message ?? error) + evidence);
+      }
+    }
+
+    if (channel === 'maker:compact-session') {
+      const sessionId = args[0];
+      const instructions = args[1];
+      if (args.length > 2 || typeof sessionId !== 'string' || sessionId.trim() === '' ||
+        (instructions !== undefined && typeof instructions !== 'string')) {
+        return invokeError(request, 'BAD_REQUEST', 'compact-session needs a session id and optional string instructions');
+      }
+      if (instructions?.trim()) return invokeError(request, 'NOT_AVAILABLE', 'Native DSH /compact does not accept custom instructions');
+      const capabilities = capabilitiesNow();
+      if (typeof capabilities.manualCompact?.run !== 'function') return invokeError(request, 'NOT_AVAILABLE', 'Native manual compaction is not composed');
+      if (capabilities.sessionHidden?.(sessionId) === true) return invokeError(request, 'NOT_AVAILABLE', 'An archived or hidden session cannot be compacted');
+      try {
+        return invokeResult(request, await capabilities.manualCompact.run({ sessionId, instructions,
+          requestKey: JSON.stringify([request.src, request.id]) }));
+      } catch (error) {
+        return invokeError(request, refusalCodeOf(error), String(error?.message ?? error));
+      } finally {
+        invalidateSessionRows();
+        capabilities.invalidateHistoryView?.(sessionId);
+      }
+    }
+
     if (channel === 'maker:get-context-usage') {
       // How full the session's context is. The controller reads the answer
       // leniently (`totalTokens`/`contextTokens`, `maxTokens`/`contextWindow`,

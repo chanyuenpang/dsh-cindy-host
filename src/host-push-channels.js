@@ -16,7 +16,9 @@
 
 /** Push channel → the emitting path in this Host. */
 export const HOST_PUSH_CHANNELS = new Map([
-  ['maker:event', 'host.js announceTurnRunning/announceTurnIdle (turn boundaries)'],
+  ['maker:event', 'host.js announceTurnRunning/announceTurnIdle + publishNativeJobUpdates (real native task status)'],
+  ['maker:schedule:event', 'host.js observeRemindersSource (committed native ready invalidation)'],
+  ['sidebar-settings:project-order-changed', 'host.js observeProjectOrderSource (native order snapshot + owner stamp)'],
   ['local-db:messages:created', 'host.js pushSessionMessage (live fold)'],
   // The history view's own invalidation. The controller handles this channel *before* any
   // store logic (`DeviceLinkContext`: `historyView?.invalidate(); return;`), and it is what

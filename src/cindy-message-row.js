@@ -11,7 +11,7 @@
  * (`apps/mobile/src/session/messageNormalize.ts`), not by this file:
  *
  *   assistant / user  content: string (or `{ text, files }` for attachments)
- *   thinking          content: string
+ *   thinking          content: { text } (mobile drops plain strings for this role)
  *   tool_use          content: { toolName, input }   read by `parseMessageToolUse`
  *   tool_result       content: anything previewable  read by `contentToPreview`
  */
@@ -360,7 +360,9 @@ export function toCindyMessageRows(message, { sessionId, createdAt, now = () => 
         return;
       case 'reasoning':
         if (typeof block.text !== 'string' || block.text === '') return;
-        rows.push({ ...base, content: block.text });
+        // Thinking is a structured native role on both Cindy clients. Unlike
+        // ordinary prose, a string here is discarded by mobile normalizeThinking.
+        rows.push({ ...base, content: { text: block.text } });
         return;
       case 'tool-call':
         rows.push({

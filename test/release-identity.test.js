@@ -6,7 +6,7 @@ test('runtime package version matches publish identity and keeps Cindy compatibi
   const pkg = JSON.parse(readFileSync(new URL('../package.json', import.meta.url), 'utf8'));
   assert.equal(pkg.name, 'dsh-cindy-host');
   assert.equal(pkg.version, HOST_PLUGIN_VERSION);
-  assert.equal(HOST_PLUGIN_VERSION, '0.1.32');
+  assert.equal(HOST_PLUGIN_VERSION, '0.1.33');
   assert.equal(HOST_APP_VERSION, '0.1.82');
   assert.equal(pkg.dependencies?.keytar, undefined);
   assert.equal(pkg.optionalDependencies?.keytar, undefined);

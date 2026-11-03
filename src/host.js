@@ -27,6 +27,7 @@ import { realpath as realpathImpl, stat as statImpl } from 'node:fs/promises';
 import { extname as extnameImpl, resolve as resolvePathImpl } from 'node:path';
 import { restoreSession } from './auth-session.js';
 import { createChannelRouter, invokeError, refusalError } from './cindy-channels.js';
+import { NATIVE_PIN_MEMBERSHIP_AT } from './dsh-session-archive.js';
 import { createApprovalRegistry } from './host-approvals.js';
 import { createInputQueueTracker, queuedRowFromController } from './host-input-queue.js';
 import { createProjectionTracker, toGoalStatusPayload } from './host-goals.js';
@@ -34,6 +35,7 @@ import { ReadOnlyProjection } from './projection.js';
 import { SessionReadModel } from './session-read-model.js';
 import { ProjectionReadModelSink } from './projection-read-model-sink.js';
 import { publishLifecycle, runningStatusEvent, turnEventFor } from './session-publisher.js';
+import { createReasoningPublisher } from './reasoning-publisher.js';
 import { acceptLink } from './host-authorization.js';
 import { AuthorizationPolicy } from './authorization-policy.js';
 import { HostStatus } from './host-status.js';
@@ -52,6 +54,8 @@ import { createExportJobs } from './host-export-jobs.js';
 import { createExportOwner } from './host-export-owner.js';
 import { createTransferDiagnostics } from './host-transfer-diagnostics.js';
 import { normalizeAuthBaseUrl } from './cindy-login-flow.js';
+import { loadSession as loadNetworkCredential } from './credential-store.js';
+import { sessionEndpoints, relayForEndpoints } from './cindy-auth-endpoints.js';
 import { RECONNECT_STABLE_RESET_MS, computeReconnectDelayMs } from './host-reconnect.js';
 import { MAX_FRAME_BYTES, FRAME_BUDGET_BYTES, fitInvokeResultToFrame, frameByteLength } from './host-frame-budget.js';
 
@@ -120,11 +124,30 @@ async function fetchDeviceDirectory(session, relayUrl) {
  * @returns the runtime handle used by the plugin, the routes, and the tests.
  */
 export async function startHost(initialSource, settings = DEFAULT_HOST_SETTINGS, options = {}) {
+  // Freeze one network context for this runtime. A region/account change rebuilds
+  // every owner, rather than changing only the socket while media/ICE keep old URLs.
+  let boundEndpoints = options.connectionEndpoints ?? null;
+  let networkError = null;
+  if (!boundEndpoints && !options.resolveSession && !options.relayUrl) {
+    try { boundEndpoints = sessionEndpoints(await (options.credentialPorts?.loadSession ?? loadNetworkCredential)()); }
+    catch (error) { if (['SESSION_REALM_MISMATCH', 'INVALID_ENDPOINT_MANIFEST', 'INVALID_REGION'].includes(error?.code)) networkError = error; }
+  }
+  const resolver = options.resolveSession ?? (() => restoreSession(options.credentialPorts));
+  const resolveSession = async () => {
+    const current = options.identityIsCurrent ?? (() => true);
+    if (!current() || networkError) return { ok: false, reason: 'SESSION_REALM_MISMATCH', message: '登录身份或账号区域已改变，请重新连接' };
+    const result = await resolver();
+    if (!current()) return { ok: false, reason: 'SESSION_REALM_MISMATCH', message: '登录身份已改变' };
+    if (result.ok && (boundEndpoints || (!options.resolveSession && !options.relayUrl))) {
+      let actual; try { actual = sessionEndpoints(result.session); } catch { actual = null; }
+      if (!actual || !boundEndpoints || JSON.stringify(actual) !== JSON.stringify(boundEndpoints)) return { ok: false, reason: 'SESSION_REALM_MISMATCH', message: '账号区域已改变，请重新加载 Host 连接' };
+    }
+    return result;
+  };
   const {
-    resolveSession = () => restoreSession(options.credentialPorts),
     openSocket = openRelaySocket,
     listDevices = fetchDeviceDirectory,
-    relayUrl = RELAY_WS_URL,
+    relayUrl = boundEndpoints ? relayForEndpoints(boundEndpoints) : RELAY_WS_URL,
     now = () => new Date(),
     heartbeatMs = HEARTBEAT_INTERVAL_MS,
     heartbeatMissLimit = HEARTBEAT_MISS_LIMIT,
@@ -347,7 +370,14 @@ export async function startHost(initialSource, settings = DEFAULT_HOST_SETTINGS,
         (current?.transportEnabled || current?.remoteControlEnabled) && status.ownDeviceId ? session : null, deviceId: status.ownDeviceId });
   }
   let source = initialSource;
+  let sourceRevision = 0;
+  let disposeProjectOrderObservation = null;
+  let projectOrderObserverSource;
+  let projectOrderObserverPort;
   let disposeArchiveObservation = null;
+  let disposeReminderObservation = null;
+  let reminderObserverSource;
+  let reminderObserverPort;
   const sessionMetaWrites = new Map();
   function serializeSessionMeta(sessionId, operation) {
     const pending = (sessionMetaWrites.get(sessionId) ?? Promise.resolve()).then(operation);
@@ -358,25 +388,67 @@ export async function startHost(initialSource, settings = DEFAULT_HOST_SETTINGS,
   }
   function projectSessionRows(rows) {
     const archived = source?.archive?.snapshot(); // Read the native set once per page, not once per row.
-    return sessionFlags.projectAll(rows).map(row => archived?.has(String(row.id)) === true
-      ? { ...row, status: row.status === 'deleted' ? 'deleted' : 'archived', pinnedAt: null }
-      : row);
+    const pinned = source?.archive?.pinSnapshot?.();
+    return sessionFlags.projectAll(rows).map(row => {
+      if (archived?.has(String(row.id)) === true) {
+        return { ...row, status: row.status === 'deleted' ? 'deleted' : 'archived', pinnedAt: null };
+      }
+      if (pinned instanceof Set) {
+        const hidden = row.status === 'deleted' || row.status === 'archived';
+        return { ...row, pinnedAt: hidden ? null : pinned.has(String(row.id))
+          ? NATIVE_PIN_MEMBERSHIP_AT : sessionFlags.flagsFor(row.id)?.pinnedAt ?? null };
+      }
+      return row;
+    });
   }
   function sessionIsHidden(sessionId) {
     return sessionFlags.isHidden(sessionId) || source?.archive?.isArchived(sessionId) === true;
+  }
+  function observeProjectOrderSource() {
+    const owner = source; const port = owner?.projectOrder;
+    const enabled = active && !stopped && [...acceptedControllers].some(id => policy.canAccept(id)) && typeof port?.onChange === 'function';
+    if (enabled && disposeProjectOrderObservation && projectOrderObserverSource === owner && projectOrderObserverPort === port) return;
+    disposeProjectOrderObservation?.(); disposeProjectOrderObservation = null;
+    projectOrderObserverSource = undefined; projectOrderObserverPort = undefined;
+    if (!enabled) return;
+    projectOrderObserverSource = owner; projectOrderObserverPort = port;
+    disposeProjectOrderObservation = port.onChange(snapshot => {
+      if (stopped || !active || source !== owner || source?.projectOrder !== port || !snapshot?.available) return;
+      const devices = [...subscribers].filter(id => acceptedControllers.has(id) && policy.canAccept(id) && !offlineDevices.has(id));
+      if (!devices.length) return;
+      recordPush(null, 'sidebar-settings:project-order-changed', devices.length, snapshot);
+      for (const deviceId of devices) send({ v: PROTOCOL_VERSION, kind: 'push', dst: deviceId, payload: { channel: 'sidebar-settings:project-order-changed', payload: [snapshot, snapshot.ownerStamp] } });
+    });
+  }
+  function observeRemindersSource() {
+    observeProjectOrderSource();
+    const owner = source; const port = owner?.reminders;
+    const enabled = active && !stopped && [...acceptedControllers].some(id => policy.canAccept(id)) && typeof port?.onChange === 'function';
+    if (enabled && disposeReminderObservation && reminderObserverSource === owner && reminderObserverPort === port) return;
+    disposeReminderObservation?.(); disposeReminderObservation = null;
+    reminderObserverSource = undefined; reminderObserverPort = undefined;
+    if (!enabled) return;
+    reminderObserverSource = owner; reminderObserverPort = port;
+    disposeReminderObservation = port.onChange(event => {
+      if (stopped || !active || source !== owner || source?.reminders !== port || event?.type !== 'ready') return;
+      const devices = [...acceptedControllers].filter(id => policy.canAccept(id) && !offlineDevices.has(id));
+      if (!devices.length) return;
+      const payload = { type: 'ready' }; recordPush(null, 'maker:schedule:event', devices.length, payload);
+      for (const deviceId of devices) send({ v: PROTOCOL_VERSION, kind: 'push', dst: deviceId, payload: { channel: 'maker:schedule:event', payload } });
+    });
   }
   function observeArchiveSource() {
     disposeArchiveObservation?.();
     disposeArchiveObservation = null;
     const observedSource = source;
     if (typeof observedSource?.archive?.onChange !== 'function') return;
-    disposeArchiveObservation = observedSource.archive.onChange(ids => {
+    disposeArchiveObservation = observedSource.archive.onChange((ids, change) => {
       routeInvoke.invalidateSessionRows(); // A committed desktop edit invalidates warm phone lists immediately.
       for (const sessionId of ids) {
         void serializeSessionMeta(sessionId, async () => {
           if (stopped || source !== observedSource) return;
           // DSH drops its pin on archive; retire the Host's legacy pin too.
-          if (source.archive.isArchived(sessionId) === true && sessionFlags.flagsFor(sessionId)?.pinnedAt) {
+          if ((source.archive.isArchived(sessionId) === true || change?.pinIds?.includes(sessionId)) && sessionFlags.flagsFor(sessionId)?.pinnedAt) {
             await sessionFlags.apply(sessionId, { pinnedAt: null });
           }
           if (stopped || source !== observedSource) return;
@@ -384,17 +456,48 @@ export async function startHost(initialSource, settings = DEFAULT_HOST_SETTINGS,
           const [row] = projectSessionRows([{ ...cached, id: sessionId, status: 'active' }]);
           if (cached) sessionRowCache.set(sessionId, row);
           routeInvoke.invalidateSessionRows();
-          publishSessionMeta(sessionId, { status: row.status, ...(row.status === 'archived' ? { pinnedAt: null } : {}) });
+          const nativePinsKnown = source.archive.pinSnapshot?.() instanceof Set;
+          publishSessionMeta(sessionId, { status: row.status, ...(nativePinsKnown || row.status === 'archived' ? { pinnedAt: row.pinnedAt ?? null } : {}) });
         }).catch(error => recordHandlerError('native-session-archive', error));
       }
     });
+  }
+  function validateSessionMetaPatch(patch) {
+    if (!source?.archive) return;
+    const pinRequested = patch.pinnedAt !== undefined;
+    const pinValue = patch.pinnedAt !== null && patch.pinnedAt !== '';
+    if (patch.status !== undefined && !['active', 'archived', 'deleted'].includes(patch.status)) {
+      throw refusalError('BAD_REQUEST', 'Unknown session status');
+    }
+    if (pinRequested && patch.pinnedAt !== null && patch.pinnedAt !== '' &&
+      (typeof patch.pinnedAt !== 'string' || !/^\d{4}-\d{2}-\d{2}T/.test(patch.pinnedAt) || !Number.isFinite(Date.parse(patch.pinnedAt)))) {
+      throw refusalError('BAD_REQUEST', 'pinnedAt must be an ISO string or null');
+    }
+    if (pinRequested && pinValue && patch.status !== undefined) {
+      throw refusalError('BAD_REQUEST', 'Pinning and a status change require separate native operations');
+    }
+    if (patch.title !== undefined && (pinRequested || patch.status !== undefined)) {
+      throw refusalError('BAD_REQUEST', 'Rename and metadata changes require separate native operations');
+    }
   }
   function applySessionMetadataFlags(sessionId, patch) {
     const owner = source;
     return serializeSessionMeta(sessionId, async () => {
       if (stopped || source !== owner) throw refusalError('NOT_AVAILABLE', 'The DSH session source changed before the metadata write');
       const archive = owner?.archive;
-      if (archive && (patch.status === 'archived' || patch.status === 'active')) {
+      const pinRequested = patch.pinnedAt !== undefined;
+      const pinValue = patch.pinnedAt !== null && patch.pinnedAt !== '';
+      validateSessionMetaPatch(patch);
+      const archiveRequested = patch.status === 'archived' || patch.status === 'active';
+      if (archive && (archiveRequested || (pinRequested && patch.status !== 'deleted'))) {
+        // Source exact reads are the ordinary-session visibility boundary; do not
+        // let the global Workspace registry authorize arbitrary child/session IDs.
+        const visible = typeof owner.getSession === 'function' ? await owner.getSession(sessionId)
+          : (await owner.listSessions()).find(row => String(row.id) === sessionId);
+        if (!visible) throw refusalError('NOT_FOUND', 'No visible DSH session for this metadata write');
+        if (stopped || source !== owner) throw refusalError('NOT_AVAILABLE', 'The DSH source changed during the metadata read');
+      }
+      if (archive && archiveRequested) {
         // Validate other fields before the native write, so malformed metadata has no side effect.
         if (patch.pinnedAt !== undefined && patch.pinnedAt !== null && typeof patch.pinnedAt !== 'string') {
           throw refusalError('BAD_REQUEST', 'pinnedAt must be an ISO string or null');
@@ -406,6 +509,16 @@ export async function startHost(initialSource, settings = DEFAULT_HOST_SETTINGS,
         // after success. Keep unrelated legacy flags and never mutate other sessions.
         const local = await sessionFlags.apply(sessionId, { status: 'active', pinnedAt: archived ? null : patch.pinnedAt });
         return { ...local, status: archived ? 'archived' : 'active' };
+      }
+      if (archive && pinRequested && patch.status !== 'deleted') {
+        if (pinValue && (sessionFlags.isHidden(sessionId) || archive.isArchived(sessionId) === true)) {
+          throw refusalError('BAD_REQUEST', 'An archived or deleted session cannot be pinned');
+        }
+        if (typeof archive.setPinned !== 'function') throw refusalError('NOT_AVAILABLE', 'Native DSH pinning is unavailable');
+        await archive.setPinned(sessionId, pinValue);
+        if (stopped || source !== owner) throw refusalError('NOT_AVAILABLE', 'The DSH source changed during the pin write');
+        const local = await sessionFlags.apply(sessionId, { pinnedAt: null });
+        return { ...local, pinnedAt: pinValue ? NATIVE_PIN_MEMBERSHIP_AT : null };
       }
       return sessionFlags.apply(sessionId, patch);
     });
@@ -634,11 +747,23 @@ export async function startHost(initialSource, settings = DEFAULT_HOST_SETTINGS,
    * @param next - the source, or undefined to detach.
    */
   async function setSource(next) {
+    if (source !== next) {
+      sourceRevision++;
+      source?.manualCompact?.cancelAll('DSH source replaced');
+      source?.forkSession?.cancelAll();
+      source?.keywordSearch?.cancelAll();
+      source?.backgroundJobs?.cancelAll();
+      source?.subagentReads?.cancelAll();
+      source?.reminders?.cancelAll();
+      source?.projectOrder?.cancelAll();
+      source?.referenceHistory?.cancelAll();
+    }
     source = next === undefined ? undefined : next;
     if (stopped) return;
     routeInvoke.invalidateSessionRows();
     sessionRowCache.clear();
     observeArchiveSource();
+    observeRemindersSource();
     if (projection !== null) {
       const closing = projection;
       projection = null;
@@ -870,6 +995,7 @@ export async function startHost(initialSource, settings = DEFAULT_HOST_SETTINGS,
   function linkController(deviceId) {
     const known = status.snapshot().devices.find((device) => device.deviceId === deviceId);
     acceptedControllers.add(deviceId);
+    observeRemindersSource();
     status.upsertDevice(deviceId, { isController: true, linkedAt: now().toISOString(), online: true });
     status.refreshConnectionState();
     // A device that linked with no presence broadcast is a bare id until the
@@ -914,6 +1040,7 @@ export async function startHost(initialSource, settings = DEFAULT_HOST_SETTINGS,
       if (result.ok) {
         directoryEpoch++;
         acceptedControllers.delete(deviceId);
+        observeRemindersSource();
         subscribers.delete(deviceId);
         status.removeDevice(deviceId);
         status.refreshConnectionState();
@@ -1149,6 +1276,11 @@ export async function startHost(initialSource, settings = DEFAULT_HOST_SETTINGS,
   const HISTORY_VIEW_PUSH_COALESCE_MS = 1000;
   /** `sessionId` → the pending view invalidation. */
   const historyViewPushes = new Map();
+  const reasoningPublisher = createReasoningPublisher({
+    push: pushSessionUpdate, invalidate: pushHistoryViewChanged,
+    watched: (sessionId) => watchersFor(sessionId) > 0,
+    setTimeout: setTimeoutImpl, clearTimeout: clearTimeoutImpl,
+  });
 
   /**
    * Tell the controllers watching a session that its history view changed.
@@ -1335,9 +1467,11 @@ export async function startHost(initialSource, settings = DEFAULT_HOST_SETTINGS,
         resolveInteraction: (requestId, decision) => approvals.settle(requestId, decision),
         // The archive/delete/pin writes, and the one reader that decides whether a
         // session still belongs on the controller's live surfaces.
+        validateSessionMetaPatch,
         applySessionFlags: applySessionMetadataFlags,
         sessionHidden: sessionIsHidden,
         publishSessionMeta,
+        publishSessionCreated,
         // The controller's only way to *see* a file that lives on this machine: an image
         // the agent produced, or one picked in the file browser. Host-owned because the
         // upload needs this runtime's account session.
@@ -1664,6 +1798,20 @@ export async function startHost(initialSource, settings = DEFAULT_HOST_SETTINGS,
    * @param sessionId - the session the controller edited.
    * @param patch - the fields the controller wrote, with this Host's effective values.
    */
+  function publishNativeJobUpdates(sessionId, jobs) {
+    const owner = source; const port = owner?.backgroundJobs;
+    if (stopped || watchersFor(sessionId) === 0 || typeof port?.updates !== 'function') return;
+    void port.updates(sessionId, jobs).then(events => {
+      if (stopped || source !== owner || source?.backgroundJobs !== port || watchersFor(sessionId) === 0) return;
+      for (const event of events) pushSessionUpdate(sessionId, 'maker:event', { sessionId, event });
+    }).catch(error => {
+      if (!stopped && source === owner && watchersFor(sessionId) > 0) record('background-jobs', String(error?.message ?? error));
+    });
+  }
+  function publishSessionCreated(sessionId) {
+    if (ws !== null) publishLifecycle(ws, subscribers, { kind: 'session-added', sessionId },
+      (channel, count, payload) => recordPush(sessionId, channel, count, payload));
+  }
   function publishSessionMeta(sessionId, patch) {
     publishRowPatch(sessionId, { ...patch, updatedAt: now().toISOString() });
   }
@@ -2125,6 +2273,7 @@ export async function startHost(initialSource, settings = DEFAULT_HOST_SETTINGS,
         if (typeof frame.src !== 'string') return;
         filePeer.closePeer(frame.src);
         acceptedControllers.delete(frame.src);
+        observeRemindersSource();
         status.upsertDevice(frame.src, { isController: false });
         status.refreshConnectionState();
         return;
@@ -2325,6 +2474,16 @@ export async function startHost(initialSource, settings = DEFAULT_HOST_SETTINGS,
    *   attempt) instead of returning the status to `disconnected`.
    */
   async function disconnect({ keepSwitch = false, preserveExports = false } = {}) {
+    source?.manualCompact?.cancelAll('Host link disconnected');
+    source?.forkSession?.cancelAll();
+    source?.keywordSearch?.cancelAll();
+    source?.backgroundJobs?.cancelAll();
+    source?.subagentReads?.cancelAll();
+    source?.reminders?.cancelAll();
+    source?.projectOrder?.cancelAll();
+    source?.referenceHistory?.cancelAll();
+    disposeProjectOrderObservation?.(); disposeProjectOrderObservation = null;
+    disposeReminderObservation?.(); disposeReminderObservation = null;
     if (!preserveExports) exportOwner.invalidate();
     generation += 1;
     deviceNameSync.reset(current?.deviceName?.trim() || null);
@@ -2333,6 +2492,7 @@ export async function startHost(initialSource, settings = DEFAULT_HOST_SETTINGS,
     // A pending view invalidation has no socket to reach once this returns; firing it later
     // would push to a link that is gone.
     clearHistoryViewPushes();
+    reasoningPublisher.clear();
     acceptedControllers.clear();
     subscribers.clear();
     sessionSubscribers.clear();
@@ -2396,6 +2556,7 @@ export async function startHost(initialSource, settings = DEFAULT_HOST_SETTINGS,
     // to have moved them. `replace` never writes back — see `session-flags.js`.
     sessionFlags.replace(next?.sessionFlags);
     policy.update(next);
+    observeRemindersSource();
     filePeer.pruneUnauthorized();
     fileExports.pruneUnauthorized();
     const wanted = next?.transportEnabled === true || next?.remoteControlEnabled === true;
@@ -2445,6 +2606,11 @@ export async function startHost(initialSource, settings = DEFAULT_HOST_SETTINGS,
     acceptedControllers,
     policy,
     status,
+    getProjectOrderOwner: () => {
+      const owner = exportOwner.capture(); const deviceId = status.ownDeviceId;
+      if (!active || stopped || !source || !owner || !deviceId || !['waiting', 'connected'].includes(status.snapshot().state)) return undefined;
+      return { dataOwnerId: 'dsh:' + owner.runtimeId + ':' + deviceId + ':' + sourceRevision, ownerGeneration: owner.epoch };
+    },
     getStatus: () => ({ ...status.snapshot(), pluginVersion: HOST_PLUGIN_VERSION, nameSync: deviceNameSync.snapshot(), inputDelivery: { ready: activeDelivery !== null, version: activeDelivery ? 1 : null, pending: activeDelivery?.diagnostics().slice(0, 30) ?? [], lastError: deliveryLastError } }),
     deleteDevice,
     subscribeStatus: (listener) => status.subscribe(listener),
@@ -2528,6 +2694,7 @@ export async function startHost(initialSource, settings = DEFAULT_HOST_SETTINGS,
     }),
     /** Push one live session message to the controllers watching that session. */
     pushSessionMessage,
+    pushSessionReasoning: reasoningPublisher.noteEvent,
     /**
      * Announce a real turn boundary to a session's watchers.
      *
@@ -2591,6 +2758,10 @@ export async function startHost(initialSource, settings = DEFAULT_HOST_SETTINGS,
     /** Fold one `sessionController.control()` frame into the input queue. */
     applyControlFrame: (frame) => {
       inputQueue.apply(frame);
+      // Reuse DSH's existing source-owned control stream: no per-phone job
+      // stream, output cursor or extra observer remains alive after disconnect.
+      if (frame?.type === 'jobs' && typeof frame.sessionId === 'string') publishNativeJobUpdates(frame.sessionId, frame.jobs);
+      if (frame?.type === 'baseline') for (const [id, jobs] of Object.entries(frame.value?.jobs ?? {})) publishNativeJobUpdates(id, jobs);
       // A goal the Host advances on its own — the round driver counting a round,
       // the phase turning `complete` — changes the projection exactly like a user
       // write does, and the controller's goal card refreshes from
