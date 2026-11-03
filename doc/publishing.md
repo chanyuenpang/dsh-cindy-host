@@ -55,9 +55,9 @@ dsh plugin --profile <profile> add dsh-cindy-host@<version>
 2. **DSH 自己的包一律 `peerDependencies`，绝不进 `dependencies`（也绝不进
    `optionalDependencies`）**。宿主提供它们；插件自己装一份，就等于把**另一代 DSH** 装进别人的
    profile，宿主再组合这个混合体便起不来。0.1.1 犯的正是这个错，实测与规则见 §5.4 / §5.6。
-   `dependencies` 里只放宿主不提供的库（本包是 `keytar`、`ws` 与固定版本的 `werift`）。
-3. **原生依赖要写清**：`keytar` 是原生模块（Windows 凭据管理器）。发布说明里必须写明平台/Node ABI
-   要求（本包 `engines.node >= 22`），否则会出现"装上了但起不来"。
+   `dependencies` 里只放宿主不提供的库（本包是 `ws` 与固定版本的 `werift`）。
+3. **凭据能力不得要求用户编译**：当前源码已移除 keytar。Linux/macOS 使用系统钥匙串命令；
+   Windows 用系统 DPAPI 加密，交 DSH 原生 credentials 服务持久化密文。平台前提见 §5.2。
 4. **`private` 必须是 `false`**（发布到 registry 的必要条件；它是防止误发布的开关，不是发布配置。
    0.1.2 起本包为 `false` + `license: MIT`，仓库根有 `LICENSE`）。
 5. **包内容必须是白名单**，而不是"整个目录"。`.sandbox/`（含凭据与会话）、`.claw/runtime`、验收日志、
@@ -111,18 +111,14 @@ dsh plugin --profile <profile> add dsh-cindy-host@<version>
 
 ### 5.2 安装方须知（写进面向用户的说明）
 
-**这个包在安装时需要编译一个原生模块**，这不是可选项，是它的依赖决定的：
+0.1.32 起已移除 keytar，不需要安装 C++ 编译工具或批准该依赖的构建脚本。
 
-- `keytar` 是**原生模块**（Windows 凭据管理器 / macOS Keychain / Linux Secret Service），
-  安装时必须编译出 `keytar.node`。**原因**：Cindy 的登录会话必须存放进操作系统的凭据库，
-  而不是明文写进配置或仓库——这是本插件的凭据存储方式，没有纯 JS 的等价物。
-- 因此安装需要**编译工具链**：Windows 上通常是 VS Build Tools（含 C++ 工作负载），
-  macOS 需要 Xcode Command Line Tools，Linux 需要 `libsecret-1-dev` 等。
-- **pnpm 用户**还必须显式允许构建脚本（pnpm 10 默认不跑依赖的构建脚本）：
-  `pnpm approve-builds`，或在 profile 的 `package.json` 里加
-  `"pnpm": { "onlyBuiltDependencies": ["keytar"] }` 后重装。npm 默认会跑构建脚本。
-- **编译失败也能装上**（0.1.1 起）：插件照常 mount，只是登录/凭据相关能力明确不可用。
-  换句话说，**"要编译"只影响凭据能力，不影响插件能否挂载**。
+- Linux：安装 `secret-tool`（常见发行版为 libsecret-tools/libsecret 包），并在该运行用户的会话中提供可用、已解锁的 Secret Service/DBus。无桌面 Linux 不保证天然具备这些服务。
+- macOS：使用 `/usr/bin/security` 访问系统 Keychain；保留既有 service/account，系统拒绝授权时明确报错。
+- Windows：通过系统 Windows PowerShell/.NET DPAPI CurrentUser 加密，使用 DSH 原生 `credentials.readRecord/modifyRecord/deleteRecord` 保存版本化密文。服务不可用或企业策略禁用 PowerShell 时明确报错，绝不回退明文。
+- Windows 独立 CLI 没有 DSH 凭据上下文，需通过 DSH 设置卡片登录/退出。旧版 Windows 凭据不自动删除；升级可能需重新登录一次。Linux/macOS 沿用既有系统钥匙串记录。
+- 凭据不可读不等于不存在；只允许用户明确退出时删除当前后端记录。发布前需以假凭据验证保存、重启读取和退出，不能只验证插件 mount。
+
 
 ### 5.3 测 tarball 时的一个陷阱
 

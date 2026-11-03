@@ -147,3 +147,62 @@ test('one source/router response survives real desktop ingress and mobile cache 
     assert.equal(failure.payload.error.code, 'NOT_AVAILABLE');
   } finally { client.evictMobileProviders(device); client.dispose(); }
 });
+
+// This tests the shipped Host against the unmodified Cindy guard. Native DSH's
+// selectForNextRequest policy (not a client-side capacity estimate) is authoritative.
+test('native DSH model switching reaches the controller and can switch back under every Cindy alias', {
+  skip: !process.env.CINDY_SOURCE_ROOT && 'Set CINDY_SOURCE_ROOT to execute the actual Cindy window guard',
+}, async () => {
+  const sharedUrl = pathToFileURL(resolve(process.env.CINDY_SOURCE_ROOT, 'packages/maker-shared/src/agentCapabilities.ts'));
+  const { normalizeMobileAgentCapabilities, shouldBlockLegacyRemoteModelWindowSwitch } = await import(sharedUrl);
+  const catalog = { default: { provider: 'dsh', model: 'large' }, groups: [{ id: 'dsh', models: [
+    { id: 'large', contextWindow: 1_000_000 }, { id: 'small', contextWindow: 200_000 }, { id: 'unknown' },
+  ] }] };
+  const calls = [];
+  let selected = catalog.default;
+  const services = {
+    sessionController: {
+      list: async () => [], modelCatalog: async () => catalog,
+      selectModel: async (request) => {
+        calls.push(request);
+        if (request.model === 'unavailable') throw Object.assign(new Error('native route unavailable'), { code: 'session/model-unavailable' });
+        selected = { provider: request.provider, model: request.model };
+        return { selected };
+      },
+      cancel: () => { throw new Error('model selection must not interrupt a running request'); },
+    },
+    sessionQuery: { listSessions: async () => [] },
+  };
+  const ctx = { get: name => services[name], on: () => () => {}, effect: run => run(),
+    inject(names, callback) { if (names.every(name => services[name])) callback(ctx); return () => {}; } };
+  const source = buildDshSource(ctx, 'sessionController');
+  const router = createChannelRouter({
+    listSessions: async () => [{ id: 'busy', running: true, contextTokens: 300_000, contextWindow: 1_000_000 }],
+    subscribers: new Set(), resolveCapabilities: () => source,
+  });
+  const invoke = (channel, args) => router({ v: 1, id: 'model-switch', src: 'phone', kind: 'invoke', payload: { channel, args } });
+  for (const alias of DSH_AGENT_KINDS) {
+    const reply = await invoke('maker:get-capabilities', [alias]);
+    assert.equal(reply.payload.ok, true);
+    const capability = normalizeMobileAgentCapabilities(JSON.parse(JSON.stringify(reply.payload.result)));
+    assert.equal(capability.supportsModelWindowSwitchGuard, true);
+    for (const targetContextWindow of [200_000, undefined]) {
+      assert.equal(shouldBlockLegacyRemoteModelWindowSwitch({
+        hostGuardSupported: capability.supportsModelWindowSwitchGuard,
+        agentKind: alias, contextTokens: 300_000, currentContextWindow: 1_000_000, targetContextWindow,
+      }), false, 'Cindy must defer to DSH, not reject high or unknown capacity on its behalf');
+    }
+    for (const model of ['small', 'unknown', 'large']) {
+      const result = await invoke('maker:set-model', ['busy', model, 'dsh']);
+      assert.equal(result.payload.ok, true);
+      assert.deepEqual(result.payload.result.selected, { provider: 'dsh', model });
+    }
+    const failure = await invoke('maker:set-model', ['busy', 'unavailable', 'dsh']);
+    assert.equal(failure.payload.ok, false);
+    assert.equal(failure.payload.error.code, 'NOT_AVAILABLE');
+    assert.deepEqual(selected, { provider: 'dsh', model: 'large' });
+    const restored = await invoke('maker:set-model', ['busy', 'large', 'dsh']);
+    assert.equal(restored.payload.ok, true, 'a rejected native choice must not disable selecting the original model');
+  }
+  assert.equal(calls.length, DSH_AGENT_KINDS.length * 5);
+});

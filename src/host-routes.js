@@ -63,10 +63,10 @@ export async function readJsonBody(req) {
  * @param options - the runtime accessor and an optional diagnostics producer.
  * @returns one handler per route, each owning its own response.
  */
-export function createHostRoutes({ getRuntime, getDiagnostics, getSettings, rememberDeviceId, auth = {} }) {
-  const loadCredential = auth.loadSession ?? loadSession;
-  const saveCredential = auth.adoptSession ?? adoptSession;
-  const forgetCredential = auth.forgetSession ?? forgetSession;
+export function createHostRoutes({ getRuntime, getDiagnostics, getSettings, rememberDeviceId, credentialPorts, auth = {} }) {
+  const loadCredential = auth.loadSession ?? credentialPorts?.loadSession ?? loadSession;
+  const saveCredential = auth.adoptSession ?? (session => adoptSession(session, credentialPorts));
+  const forgetCredential = auth.forgetSession ?? (() => forgetSession(credentialPorts));
   const verifyCredential = auth.verifyLoginCode ?? verifyLoginCode;
   const selectCredential = auth.selectLoginAccount ?? selectLoginAccount;
   /**

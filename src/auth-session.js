@@ -92,14 +92,14 @@ export async function refreshOwnedCredential(captured, ports = {}) {
  */
 export async function restoreSession(ports = {}) {
   const load = ports.loadSession ?? loadSession;
-  // A missing native dependency says nothing about whether the OS holds a login.
-  // Injected stores do not depend on this machine's keytar unless they opt in.
+  // An unavailable backend says nothing about whether a stored login exists.
+  // Injected stores own their availability check.
   const available = ports.credentialStoreAvailable ?? (load === loadSession ? credentialStoreAvailable : undefined);
   if (available && !available()) {
     return {
       ok: false,
       reason: 'CREDENTIAL_STORE_UNAVAILABLE',
-      message: '本机 Cindy 凭据存储不可用，无法读取已有登录态。请修复当前 DSH 配置中的 keytar 原生模块（允许安装构建脚本或重新构建），然后重启 DSH；请勿因此清除登录态或重复登录。',
+      message: '本机 Cindy 凭据存储不可用。Linux 请检查 secret-tool 和已解锁的 Secret Service；macOS 请检查钥匙串授权；Windows 请检查系统 PowerShell 和 DSH 原生凭据服务，然后重启 DSH。请勿因此清除已有登录态。',
     };
   }
   const save = ports.saveSession ?? saveSession;
@@ -181,6 +181,7 @@ export async function forgetSession(ports = {}) {
 export async function getAuthenticatedSession() {
   const restored = await restoreSession();
   if (restored.ok) return restored.session;
+  if (restored.reason === 'CREDENTIAL_STORE_UNAVAILABLE') throw Object.assign(new Error(restored.message), { code: restored.reason });
   const session = await loginWithPhone({ clientType: 'desktop' });
   await adoptSession(session);
   return session;

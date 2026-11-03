@@ -1,4 +1,4 @@
-﻿# New-conversation runtime: what maker:create-session installs
+# New-conversation runtime: what maker:create-session installs
 
 <!-- state: current -->
 ## Current behavior
@@ -35,6 +35,12 @@ create and through the same seams the explicit channels use:
   supply both model and provider; when only the provider is missing, a model uniquely matched
   in the catalog (or matching its default route) may resolve it. A model shared across providers
   is not sufficient evidence. The chosen alias never changes DSH model routing.
+
+### Runtime model switching and capacity guard ownership
+
+For an existing session, `maker:set-model` remains available only when the composed native `selectModel` seam exists; the channel forwards the requested selection and returns DSH errors rather than treating capacity estimates as authoritative. The Host advertises `supportsModelWindowSwitchGuard` exactly when native selection exists, including when catalog reads are unavailable, and does not advertise it when that seam is absent. This lets the remote controller defer the switching decision to DSH instead of applying its legacy context-window threshold. Selection—including switching back—uses the same native route; a successful selection targets the next model request and does not cancel an already-issued request. Switching back does not undo any context compaction already performed.
+
+Implementation anchors: [`maker:get-agent-capabilities` and `maker:set-model`](<../../src/cindy-channels.js#L750-L850>), [`applyModelSelection`](<../../src/dsh-plugin.js#L450-L495>), and capability projection in [`host-models.js`](<../../src/host-models.js#L100-L125>). Regression coverage is in `test/cindy-channels.test.js`, `test/host-models.test.js`, and `test/host-models-cindy-contract.test.js`. The source-plan closeout recorded the full Node test suite as 927 pass, 1 skip, 0 fail; that is a historical run, not a claim of current workspace test execution. The feature was not published or plugin-reloaded, and phone hardware acceptance remains unverified.
 
 ### Provider discovery contract (current installed compatibility pass)
 

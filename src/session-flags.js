@@ -1,12 +1,13 @@
 /**
- * The three session actions DSH itself has no concept of: archive, delete, pin.
+ * Legacy controller-only archive/delete/pin metadata. New archives use native DSH.
  *
  * A controller's session list offers 删除 / 归档 / 置顶 / 重命名, and all four are
  * the *same* write (`local-db:sessions:patch-meta`, see
  * `Cindy/apps/desktop/src/renderer/lib/sessionService.ts` and
- * `Cindy/apps/mobile/src/session/useSessionListActions.ts`). Only 重命名 has a DSH
- * counterpart — DSH sessions are a log-backed store with no archived, hidden or
- * pinned state — so this module is the Host's own bookkeeping for the other three.
+ * `Cindy/apps/mobile/src/session/useSessionListActions.ts`). Native DSH now owns
+ * archive/unarchive; this store preserves old archived flags until an explicit
+ * operation retires them. Delete remains a non-destructive hide, and controller
+ * pin timestamps remain local metadata.
  *
  * Three consequences are deliberate and must stay visible:
  *

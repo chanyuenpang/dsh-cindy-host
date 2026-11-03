@@ -1,5 +1,5 @@
 import { loginWithPhone } from "./cindy-login.js";
-import { saveSession } from "./credential-store.js";
+import { loadSession, saveSession } from "./credential-store.js";
 
 if (process.argv.includes("--help")) {
   console.log("Usage: CINDY_AUTH_BASE_URL=https://auth.example npm run login");
@@ -10,14 +10,11 @@ const authBaseUrl = process.env.CINDY_AUTH_BASE_URL || readFlag("--auth-base-url
 const clientType = process.env.CINDY_CLIENT_TYPE || "desktop";
 
 try {
+  // Fail before contacting auth when persistence is unavailable. Windows CLI
+  // has no DSH context: use the DSH settings card, not a plaintext fallback.
+  await loadSession();
   const session = await loginWithPhone({ authBaseUrl, clientType });
-  // Persist so the settings card sees the same session the terminal just made.
-  // Best-effort: a host with no OS credential store still gets a usable handle.
-  try {
-    await saveSession(session);
-  } catch {
-    console.error("Cindy logged in, but the OS credential store is unavailable; the settings card will not see this session");
-  }
+  await saveSession(session);
   // Deliberately expose only the non-secret local device handle.
   console.log(JSON.stringify({ status: "authenticated", deviceId: session.deviceId }, null, 2));
 } catch (error) {

@@ -6,6 +6,7 @@ import { createDshInputDeliveryBackend } from './dsh-input-delivery.js';
 import { DEFAULT_HOST_SETTINGS, SETTINGS_NAMESPACE, validateHostSettings } from './host-settings.js';
 import { DshHostSource } from './dsh-host-source.js';
 import { createSessionControllerSource } from './dsh-session-source.js';
+import { createDshSessionArchive } from './dsh-session-archive.js';
 import { readActiveSessionSummaries } from './dsh-active-sessions.js';
 import { createMessageCounter, createMessageReader, foldSessionEvent, isHarnessNotice, promptRpcIdOf } from './dsh-message-fold.js';
 import { createHistoryViewController } from './host-history-view.js';
@@ -18,6 +19,7 @@ import { refusalError } from './cindy-channels.js';
 import { enrichModelCatalog } from './host-model-catalog.js';
 import { hydrateImageAttachments } from './cindy-message-row.js';
 import { API_PREFIX, createHostRoutes } from './host-routes.js';
+import { createCredentialStore } from './credential-store.js';
 
 export const name = 'dsh-cindy-host';
 export const inject = ['settings'];
@@ -42,8 +44,8 @@ function settingsNamespace(value) {
   return value;
 }
 const ControllerSchema = Schema.object({ state: Schema.union(['authorized', 'revoked']), displayName: Schema.string(), grantedAt: Schema.string(), revokedAt: Schema.string(), grantRevision: Schema.natural() });
-// The archive/delete/pin flags a controller writes: this Host's own answer to three
-// actions DSH has no concept of. `pinnedAt: ''` is a remembered unpin (settings
+// Legacy archive and controller-only delete/pin metadata. Native DSH owns new
+// archive writes. `pinnedAt: ''` is a remembered unpin (settings
 // reject `null`, and an absent field cannot be told apart from "never pinned").
 const SessionFlagSchema = Schema.object({ status: Schema.union(['active', 'archived', 'deleted']), pinnedAt: Schema.string() });
 
@@ -151,7 +153,15 @@ export function buildDshSource(ctx, serviceName, options = {}) {
      * same trap the original `apiProxy` seam fell into. Neither is required, so
      * each keeps its own availability instead of failing the whole Host.
      */
-    const controls = { planMode: undefined, permissionPresets: undefined, fileUploads: undefined, tokenMeter: undefined, llm: undefined, sessionTitle: undefined, skills: undefined };
+    const controls = { planMode: undefined, permissionPresets: undefined, fileUploads: undefined, tokenMeter: undefined, llm: undefined, sessionTitle: undefined, skills: undefined, workspaceRegistry: undefined };
+    ctx.inject(['workspaceRegistry'], (workspaceCtx) => {
+      controls.workspaceRegistry = workspaceCtx.get('workspaceRegistry');
+      return () => { controls.workspaceRegistry = undefined; };
+    });
+    const sessionArchive = createDshSessionArchive({
+      getRegistry: () => controls.workspaceRegistry,
+      subscribe: (event, listener) => ctx.on(event, listener),
+    });
     ctx.inject(['planMode'], (planCtx) => {
       controls.planMode = planCtx.get('planMode');
       return () => { controls.planMode = undefined; };
@@ -214,33 +224,43 @@ export function buildDshSource(ctx, serviceName, options = {}) {
      * answered `skills: 6` once it was live. Both lists describe one session; two
      * different answers there is not purity, it is a missing menu the user sees.
      *
-     * A request naming **no** session is the new-task composer, and there the honest
-     * answer is what a new session would offer: `agentPresets.standingKeyFor()`,
-     * which DSH documents as "the standing scope key of one preset, for a host
-     * reader with no agent … ensuring the mount composes plugins but starts no
-     * agent, no session, and no turn". A session that *is* named but cannot be
-     * resolved answers nothing: inventing the default composition's skills for an
-     * unknown session would be a claim about a session this Host cannot see.
+     * A request naming **no** session is the new-task composer. Current DSH
+     * supplies `agentPresets.acquireScope()` instead of `standingKeyFor()`:
+     * keep that revision lease until the asynchronous catalog read settles,
+     * then release it even when the read fails. Neither path starts an Agent.
+     * Older carriers may still supply the non-owning standing key.
      * @param sessionId - the session whose agent to use as a viewing scope, if any.
-     * @returns the viewing scope key, or undefined when none can be named.
+     * @param read - the scoped catalog operation; must settle before lease disposal.
+     * @returns the catalog operation's result.
      */
-    async function agentScopeFor(sessionId) {
+    async function withAgentScope(sessionId, read) {
       const named = typeof sessionId === 'string' && sessionId !== '';
       const live = liveAgentFor(sessionId);
-      if (live !== undefined) return live;
+      if (live !== undefined) return read(live);
       if (named) {
         const resolved = await sessionController.resolveAgent(sessionId);
-        return resolved?.error === undefined ? resolved.agent : undefined;
+        return read(resolved?.error === undefined ? resolved.agent : undefined);
       }
       const presets = ctx.get('agentPresets');
-      if (typeof presets?.standingKeyFor !== 'function') return undefined;
-      try {
-        return await presets.standingKeyFor();
-      } catch {
-        // An unusable default composition is not a reason to fail a menu; the
-        // caller then reads the global layer.
-        return undefined;
+      if (typeof presets?.acquireScope === 'function') {
+        let lease;
+        try {
+          lease = await presets.acquireScope();
+        } catch {
+          // An unusable default composition retains the global-only palette.
+          return read(undefined);
+        }
+        try {
+          return await read(lease.key);
+        } finally {
+          await lease[Symbol.asyncDispose]();
+        }
       }
+      let scope;
+      if (typeof presets?.standingKeyFor === 'function') {
+        try { scope = await presets.standingKeyFor(); } catch { /* Global-only fallback. */ }
+      }
+      return read(scope);
     }
 
     /**
@@ -719,8 +739,11 @@ export function buildDshSource(ctx, serviceName, options = {}) {
         }
       },
     });
+    // The runtime observes native archive commits even when the relay is offline.
+    sessionSource.archive = sessionArchive;
     return {
       kind: 'session-controller',
+      sessionArchive,
       readMessages,
       readAllMessages: readMessages === undefined ? undefined : committedRows,
       inputDeliveryBackend,
@@ -1011,9 +1034,12 @@ export function buildDshSource(ctx, serviceName, options = {}) {
        * the read that can be trusted. The lease is always released.
        */
       readSessionState: readSessionStateNow,
-      /** Apply the controller's model choice to one session. */
-      selectModel: async ({ sessionId, provider, model, reasoningEffort }) =>
-        applyModelSelection({ sessionId, provider, model, reasoningEffort }),
+      /** Native DSH validates and records selections for the next model request,
+       * including during a turn. Do not advertise that authority when absent. */
+      selectModel: typeof sessionController.selectModel === 'function'
+        ? async ({ sessionId, provider, model, reasoningEffort }) =>
+          applyModelSelection({ sessionId, provider, model, reasoningEffort })
+        : undefined,
       /**
        * Change one session's reasoning effort.
        *
@@ -1061,17 +1087,20 @@ export function buildDshSource(ctx, serviceName, options = {}) {
          * empty while its command list was not).
          *
          * The scope comes from the session's own agent, which is the only way a
-         * preset's layer is visible at all — see `agentScopeFor`.
+         * preset's layer is visible at all — see `withAgentScope`.
          */
-        skills: async ({ cwd, sessionId }) => {
-          const skills = controls.skills;
+        skills: async ({ cwd, sessionId }) => withAgentScope(sessionId, async (scope) => {
+          const presets = ctx.get('agentPresets');
+          // A live Agent's preset may isolate its skill service from the Host.
+          const scoped = scope?.ctx !== undefined && typeof presets?.serviceFor === 'function'
+            ? presets.serviceFor(scope, 'skills') : undefined;
+          const skills = scoped ?? controls.skills;
           if (skills === undefined || typeof skills.list !== 'function') return [];
-          const scope = await agentScopeFor(sessionId);
           return skills.list({
             ...(scope === undefined ? {} : { scope }),
             ...(cwd === undefined ? {} : { cwd }),
           });
-        },
+        }),
         commands: async ({ sessionId }) => {
           const commands = ctx.get('commands');
           if (commands === undefined || typeof commands.list !== 'function') return [];
@@ -1389,6 +1418,7 @@ export function capabilityProvider(sources) {
     ensureAgent: sources.ensureAgent,
     palette: sources.palette,
     sessionControls: sources.sessionControls,
+    sessionArchive: sources.sessionArchive,
     fileBrowser: sources.fileBrowser,
   };
 }
@@ -1618,6 +1648,8 @@ export async function arbitrateInteraction({ request, next, begin, settleLocal }
 export function apply(ctx, config) {
   const scope = createSettingsScope(ctx, settingsNamespace(SETTINGS_NAMESPACE), config);
   let runtime;
+  let nativeCredentials;
+  const credentialPorts = createCredentialStore({ getCredentials: () => nativeCredentials });
   // The source can arrive before OR after the runtime: `startHost` awaits a
   // Cindy session before resolving, while `ctx.inject` fires the moment the DSH
   // service activates. Holding it here and re-applying after the await covers
@@ -1728,8 +1760,22 @@ export function apply(ctx, config) {
     }));
   }
 
+  // Only Windows needs DSH persistence; missing/late service must not break mounting.
+  ctx.inject(['credentials'], (credentialCtx) => {
+    credentialCtx.effect(() => {
+      const provider = credentialCtx.get?.('credentials') ?? credentialCtx.credentials;
+      nativeCredentials = provider;
+      if (runtime && scope.get().transportEnabled) {
+        void Promise.resolve().then(() => runtime.reconnectNow())
+          .catch(error => noteBoundaryError('credential-store-ready', error));
+      }
+      return () => { if (nativeCredentials === provider) nativeCredentials = undefined; };
+    });
+  });
+
   ctx.effect(async () => {
     runtime = await startHost(undefined, scope.get(), {
+      credentialPorts,
       // A provider, not a snapshot: these callbacks come from the injected
       // session service, which activates after `startHost` already awaited a
       // Cindy session. Capturing them here would freeze an empty set and make a
@@ -1741,8 +1787,8 @@ export function apply(ctx, config) {
         files: currentFiles,
         goalWrite: currentGoalWrite,
       }),
-      // The controller's archive/delete/pin writes go straight to this plugin's
-      // settings section, so the whole flag store reloads with the process.
+      // Delete/pin and old archive overlays persist here; new archives live in
+      // DSH's native workspace registry, not this plugin's settings section.
       persistSessionFlags: sessionFlagsWriter(ctx.settings, settingsNamespace(SETTINGS_NAMESPACE)),
       inputDeliveryDirectory: join(process.env.DSH_PROFILE_DIR || join(process.env.DSH_HOME || join(homedir(), '.dsh'), 'profiles', process.env.DSH_PROFILE || 'desktop'), 'state', 'dsh-cindy-host'),
     });
@@ -1949,6 +1995,7 @@ export function apply(ctx, config) {
   // in headless compositions, so the row is injected optionally: the runtime and
   // its settings still work, only the browser surface is missing.
   const routes = createHostRoutes({
+    credentialPorts,
     getRuntime: () => runtime,
     getDiagnostics: () => buildDiagnostics({ runtime, sourceKind, seam: currentSeam, listingDiagnostics: currentListingDiagnostics, boundaries: boundaryState() }),
     // The Host's own relay identity outlives the credential: a phone links to the

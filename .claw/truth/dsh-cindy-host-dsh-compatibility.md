@@ -3,7 +3,9 @@
 <!-- state: current -->
 ## Current behavior
 
-The published `dsh-cindy-host` 0.1.31 package accepts the DSH session and settings peers at `0.2.1-rc.3`, `0.2.1-rc.4`, and `0.2.1-rc.5`; the release's isolated registry-install smoke test used DSH 0.2.1-rc.5. `package.json` is the compatibility authority for peer ranges. This verified runtime does not imply support for every DSH prerelease or guarantee all optional host services.
+The published `dsh-cindy-host` 0.1.31 package accepts the DSH session and settings peers at `0.2.1-rc.3`, `0.2.1-rc.4`, and `0.2.1-rc.5`; the release's isolated registry-install smoke test used DSH 0.2.1-rc.5. The current working tree additionally declares exact `0.2.2-alpha.2` peers for session/settings and `3.18.6-alpha.1` for Schemastery, while retaining the three rc peers and `^3.18.1`; this is not yet a published package claim (the package version remains `0.1.31`). `package.json` is the compatibility authority for peer ranges. Neither source-level support nor the isolated alpha smoke establishes activation in a normal profile or support for other prereleases.
+
+For the reviewed `0.2.2-alpha.2` candidate, `test/dsh-alpha-compat.test.js` locks the exact peer list, lockfile synchronization, lease release on successful/failed reads, and legacy fallback behavior. `tools/dsh-compat-smoke.mjs` checks the actual DSH compatibility evaluator against accepted and rejected versions, then exercises alpha Loader activation, Session message/input identity, and preset-scoped skill lookup using an isolated npm SDK and unpacked plugin. The recorded run passed 7/7 core smoke checks. This is not Web rendering, settings persistence, relay, handset end-to-end, or live-profile activation; alpha API method presence checks are structural only. The candidate remains unpublished until the package version and release are advanced.
 
 The live session projection uses the host services present in current DSH Web:
 
@@ -16,9 +18,10 @@ The release was installed from the registry in a clean DSH home and started succ
 ## Code anchors
 
 - `package.json` (`version`, `peerDependencies`)
-- `src/dsh-plugin.js` (optional service discovery and source selection)
+- `src/dsh-plugin.js` (optional service discovery and source selection; `withAgentScope` uses `acquireScope()`/async disposal for draft skills and keeps the legacy fallback)
 - `src/dsh-session-source.js` (`createSessionControllerSource`, session visibility filtering)
 - `test/dsh-plugin.test.js`, `test/dsh-session-source.test.js` (plugin/source contracts)
+- `test/dsh-alpha-compat.test.js` and `tools/dsh-compat-smoke.mjs` (exact alpha compatibility and isolated alpha core-contract coverage)
 - Release verification: the durable, user-facing statement is in `README.md` and `CHANGELOG.md` (0.1.31). The raw run logs for that gate live under the gitignored `.sandbox/` and `.release/` and are not part of the record.
 
 ## Verification rules

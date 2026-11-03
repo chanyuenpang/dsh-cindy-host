@@ -93,9 +93,10 @@ export function toEffortLevels(availableModels) {
 /**
  * The capability payload for one agent kind.
  * @param catalog - a DSH `ModelCatalog`, or undefined when none loaded.
+ * @param options - whether the composed Host forwards model changes to native DSH.
  * @returns the payload `maker:get-capabilities` answers with.
  */
-export function toAgentCapabilities(catalog) {
+export function toAgentCapabilities(catalog, { nativeModelSelection = false } = {}) {
   const availableModels = toAvailableModels(catalog);
   return {
     availableModels,
@@ -107,7 +108,11 @@ export function toAgentCapabilities(catalog) {
     // Read as an object by the controller; a boolean here is silently ignored.
     planMode: { supported: false },
     supportsSessionAgentSwitch: false,
-    supportsModelWindowSwitchGuard: false,
+    // On the wire this delegates window decisions to the Host. DSH accepts a
+    // selection for the next model request and owns context handling itself;
+    // Cindy must not impose its legacy Pi/unknown-window veto ahead of DSH.
+    // This does not claim Cindy-style remote summary/rebuild support.
+    supportsModelWindowSwitchGuard: nativeModelSelection === true,
   };
 }
 

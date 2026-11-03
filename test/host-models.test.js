@@ -62,6 +62,13 @@ test('builds the flat effort list as a stable union of every model', () => {
   assert.equal(models.length, 2);
 });
 
+test('delegates model-window decisions only when native DSH model selection is composed', () => {
+  assert.equal(toAgentCapabilities(catalog()).supportsModelWindowSwitchGuard, false);
+  assert.equal(toAgentCapabilities(catalog(), { nativeModelSelection: true }).supportsModelWindowSwitchGuard, true);
+  assert.equal(toAgentCapabilities(undefined, { nativeModelSelection: true }).supportsModelWindowSwitchGuard, true);
+  assert.equal(toAgentCapabilities(catalog(), { nativeModelSelection: 'true' }).supportsModelWindowSwitchGuard, false);
+});
+
 test('reports plan mode as the object the controller reads', () => {
   const capabilities = toAgentCapabilities(catalog());
   // `planModeSupported` would be silently ignored: the reader looks at

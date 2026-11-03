@@ -81,10 +81,9 @@ export function toCindySessionListRow(item, { now = () => new Date(), device, de
     // `'active' | 'archived' | 'deleted'`; the controller's default status filter
     // is `'active'`, so this field decides whether a row is visible at all.
     //
-    // DSH has no archived or deleted state, so the value can only come from this
-    // Host's own flags (`session-flags.js`), folded onto the source row before it
-    // reaches here. A row that carries none is active, which is what every row was
-    // before the flags existed.
+    // Native DSH archives and legacy controller metadata are folded together
+    // before reaching this wire adapter. A row with no status is active; delete
+    // remains a Host-only hide and never destroys DSH history.
     status: item.status === 'archived' || item.status === 'deleted' ? item.status : 'active',
     agentKind: agentKindForModel({ model: item.model ?? defaultModel, provider: item.providerId, catalog }),
     // The controller looks the current model up by id in the catalog it fetched
@@ -134,11 +133,11 @@ export function toCindySessionListRow(item, { now = () => new Date(), device, de
     // moment the user selects this Host — which is the only way to see it.
     deviceLinkDeviceId: device?.deviceId ?? null,
     deviceLinkDeviceName: device?.deviceName ?? null,
-    // Present only when a controller pinned this session here (the flag store's
-    // doing, not DSH's). The controller reads a missing field as "not pinned" — and
-    // on a write reply it reads a missing field as "keep what I have", which is
-    // exactly how an unpin stays applied without this row asserting `null`.
-    ...(typeof item.pinnedAt === 'string' && item.pinnedAt !== '' ? { pinnedAt: item.pinnedAt } : {}),
+    // Preserve a known unpin (including native archival). A missing field is
+    // 'keep what I have' on a write reply, so dropping explicit null can retain
+    // the controller's old pin even though DSH has archived the session.
+    ...(item.pinnedAt === null ? { pinnedAt: null }
+      : typeof item.pinnedAt === 'string' && item.pinnedAt !== '' ? { pinnedAt: item.pinnedAt } : {}),
   };
 }
 

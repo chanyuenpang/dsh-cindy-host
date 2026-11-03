@@ -2,9 +2,9 @@ export const SETTINGS_NAMESPACE = 'dsh-cindy-host';
 
 // Network access is opt-in. A newly mounted bundle only projects local DSH data.
 //
-// `sessionFlags` is the one section a *controller* writes: DSH has no archived,
-// deleted or pinned session state, so the phone's 删除/归档/置顶 are this Host's own
-// bookkeeping and they have to survive a restart (see `session-flags.js`).
+// Controller-only delete/pin metadata and legacy archive flags survive restart.
+// New archive/unarchive operations persist in DSH's native workspace registry;
+// legacy archived flags are retained until explicitly retired (see `session-flags.js`).
 export const DEFAULT_HOST_SETTINGS = Object.freeze({ transportEnabled: false, remoteControlEnabled: false, controllers: {}, deviceId: '', deviceName: '', sessionFlags: {} });
 
 /**

@@ -26,7 +26,7 @@ import { createInputDeliveryCoordinator } from './host-input-delivery.js';
 import { realpath as realpathImpl, stat as statImpl } from 'node:fs/promises';
 import { extname as extnameImpl, resolve as resolvePathImpl } from 'node:path';
 import { restoreSession } from './auth-session.js';
-import { createChannelRouter, invokeError } from './cindy-channels.js';
+import { createChannelRouter, invokeError, refusalError } from './cindy-channels.js';
 import { createApprovalRegistry } from './host-approvals.js';
 import { createInputQueueTracker, queuedRowFromController } from './host-input-queue.js';
 import { createProjectionTracker, toGoalStatusPayload } from './host-goals.js';
@@ -121,7 +121,7 @@ async function fetchDeviceDirectory(session, relayUrl) {
  */
 export async function startHost(initialSource, settings = DEFAULT_HOST_SETTINGS, options = {}) {
   const {
-    resolveSession = restoreSession,
+    resolveSession = () => restoreSession(options.credentialPorts),
     openSocket = openRelaySocket,
     listDevices = fetchDeviceDirectory,
     relayUrl = RELAY_WS_URL,
@@ -186,7 +186,7 @@ export async function startHost(initialSource, settings = DEFAULT_HOST_SETTINGS,
         sessionRefreshedAt = Date.now();
         return renewed !== null;
       }
-      const result = await restoreSession();
+      const result = await restoreSession(options.credentialPorts);
       sessionRefreshedAt = Date.now();
       if (stopped || callerGeneration !== generation || exportOwner.capture()) return false;
       if (result?.ok === true && result.session !== undefined) {
@@ -305,7 +305,7 @@ export async function startHost(initialSource, settings = DEFAULT_HOST_SETTINGS,
    */
   const remoteOwnedSessions = new Set();
   /**
-   * The session metadata DSH has no concept of: archived, deleted, pinned.
+   * Controller-only delete/pin metadata and compatibility archive flags.
    *
    * Owned by the runtime rather than the plugin because it is per-process state the
    * channel layer and the row projection must agree on, and it is persisted through
@@ -347,6 +347,69 @@ export async function startHost(initialSource, settings = DEFAULT_HOST_SETTINGS,
         (current?.transportEnabled || current?.remoteControlEnabled) && status.ownDeviceId ? session : null, deviceId: status.ownDeviceId });
   }
   let source = initialSource;
+  let disposeArchiveObservation = null;
+  const sessionMetaWrites = new Map();
+  function serializeSessionMeta(sessionId, operation) {
+    const pending = (sessionMetaWrites.get(sessionId) ?? Promise.resolve()).then(operation);
+    const settled = pending.then(() => {}, () => {});
+    sessionMetaWrites.set(sessionId, settled);
+    void settled.then(() => { if (sessionMetaWrites.get(sessionId) === settled) sessionMetaWrites.delete(sessionId); });
+    return pending;
+  }
+  function projectSessionRows(rows) {
+    const archived = source?.archive?.snapshot(); // Read the native set once per page, not once per row.
+    return sessionFlags.projectAll(rows).map(row => archived?.has(String(row.id)) === true
+      ? { ...row, status: row.status === 'deleted' ? 'deleted' : 'archived', pinnedAt: null }
+      : row);
+  }
+  function sessionIsHidden(sessionId) {
+    return sessionFlags.isHidden(sessionId) || source?.archive?.isArchived(sessionId) === true;
+  }
+  function observeArchiveSource() {
+    disposeArchiveObservation?.();
+    disposeArchiveObservation = null;
+    const observedSource = source;
+    if (typeof observedSource?.archive?.onChange !== 'function') return;
+    disposeArchiveObservation = observedSource.archive.onChange(ids => {
+      routeInvoke.invalidateSessionRows(); // A committed desktop edit invalidates warm phone lists immediately.
+      for (const sessionId of ids) {
+        void serializeSessionMeta(sessionId, async () => {
+          if (stopped || source !== observedSource) return;
+          // DSH drops its pin on archive; retire the Host's legacy pin too.
+          if (source.archive.isArchived(sessionId) === true && sessionFlags.flagsFor(sessionId)?.pinnedAt) {
+            await sessionFlags.apply(sessionId, { pinnedAt: null });
+          }
+          if (stopped || source !== observedSource) return;
+          const cached = sessionRowCache.get(sessionId);
+          const [row] = projectSessionRows([{ ...cached, id: sessionId, status: 'active' }]);
+          if (cached) sessionRowCache.set(sessionId, row);
+          routeInvoke.invalidateSessionRows();
+          publishSessionMeta(sessionId, { status: row.status, ...(row.status === 'archived' ? { pinnedAt: null } : {}) });
+        }).catch(error => recordHandlerError('native-session-archive', error));
+      }
+    });
+  }
+  function applySessionMetadataFlags(sessionId, patch) {
+    const owner = source;
+    return serializeSessionMeta(sessionId, async () => {
+      if (stopped || source !== owner) throw refusalError('NOT_AVAILABLE', 'The DSH session source changed before the metadata write');
+      const archive = owner?.archive;
+      if (archive && (patch.status === 'archived' || patch.status === 'active')) {
+        // Validate other fields before the native write, so malformed metadata has no side effect.
+        if (patch.pinnedAt !== undefined && patch.pinnedAt !== null && typeof patch.pinnedAt !== 'string') {
+          throw refusalError('BAD_REQUEST', 'pinnedAt must be an ISO string or null');
+        }
+        const archived = patch.status === 'archived';
+        await archive.setArchived(sessionId, archived);
+        if (stopped || source !== owner) throw refusalError('NOT_AVAILABLE', 'The DSH session source changed during the archive write');
+        // Native state owns new archives; clear old archived/deleted overlays only
+        // after success. Keep unrelated legacy flags and never mutate other sessions.
+        const local = await sessionFlags.apply(sessionId, { status: 'active', pinnedAt: archived ? null : patch.pinnedAt });
+        return { ...local, status: archived ? 'archived' : 'active' };
+      }
+      return sessionFlags.apply(sessionId, patch);
+    });
+  }
   let active = false;
   let connecting = null; // Generation owning the in-flight connect, not a global latch.
   let session = null;
@@ -376,6 +439,7 @@ export async function startHost(initialSource, settings = DEFAULT_HOST_SETTINGS,
   let fileExports;
   const exportOwner = createExportOwner({
     ...options.exportCredentialOptions, now: () => Number(now()),
+    ports: { ...options.credentialPorts, ...options.exportCredentialOptions?.ports },
     onSession: (next) => { session = next; },
     onInvalidate: () => { void fileExports?.invalidateOwner(); transferDiagnostics.clear(); },
   });
@@ -572,6 +636,9 @@ export async function startHost(initialSource, settings = DEFAULT_HOST_SETTINGS,
   async function setSource(next) {
     source = next === undefined ? undefined : next;
     if (stopped) return;
+    routeInvoke.invalidateSessionRows();
+    sessionRowCache.clear();
+    observeArchiveSource();
     if (projection !== null) {
       const closing = projection;
       projection = null;
@@ -1227,7 +1294,7 @@ export async function startHost(initialSource, settings = DEFAULT_HOST_SETTINGS,
         ? await source.getSession(sessionId)
         : (await source.listSessions()).find((candidate) => String(candidate.id) === sessionId);
       if (row == null) return undefined;
-      const [flagged] = sessionFlags.projectAll([row]);
+      const [flagged] = projectSessionRows([row]);
       if (flagged !== undefined) sessionRowCache.set(String(flagged.id), flagged);
       return flagged;
     },
@@ -1237,7 +1304,7 @@ export async function startHost(initialSource, settings = DEFAULT_HOST_SETTINGS,
       // The archive/delete/pin flags ride the source row's `status`/`pinnedAt`, which
       // is how they reach the wire row (`cindy-session-row.js`) at every read path —
       // list, get, and the row echoed back to a writer.
-      const flagged = sessionFlags.projectAll(rows);
+      const flagged = projectSessionRows(rows);
       sessionRowCache.clear();
       for (const row of flagged) sessionRowCache.set(String(row.id), row);
       return flagged;
@@ -1256,7 +1323,7 @@ export async function startHost(initialSource, settings = DEFAULT_HOST_SETTINGS,
     listSessionStates: async (requestedSessionId) => {
       if (source === undefined || source === null) throw new Error('no DSH session source is attached');
       const rows = typeof source.listSessionStates === 'function' ? await source.listSessionStates(requestedSessionId) : await source.listSessions();
-      return sessionFlags.projectAll(rows);
+      return projectSessionRows(rows);
     },
     // Resolved per request. The approval pair lives here because the registry is
     // this runtime's own; everything else comes from the plugin, whose DSH
@@ -1268,8 +1335,8 @@ export async function startHost(initialSource, settings = DEFAULT_HOST_SETTINGS,
         resolveInteraction: (requestId, decision) => approvals.settle(requestId, decision),
         // The archive/delete/pin writes, and the one reader that decides whether a
         // session still belongs on the controller's live surfaces.
-        applySessionFlags: (sessionId, patch) => sessionFlags.apply(sessionId, patch),
-        sessionHidden: (sessionId) => sessionFlags.isHidden(sessionId),
+        applySessionFlags: applySessionMetadataFlags,
+        sessionHidden: sessionIsHidden,
         publishSessionMeta,
         // The controller's only way to *see* a file that lives on this machine: an image
         // the agent produced, or one picked in the file browser. Host-owned because the
@@ -1621,7 +1688,7 @@ export async function startHost(initialSource, settings = DEFAULT_HOST_SETTINGS,
     } catch {
       return;
     }
-    const running = rows.filter((row) => row?.running === true && !sessionFlags.isHidden(row.id));
+    const running = rows.filter((row) => row?.running === true && !sessionIsHidden(row.id));
     if (running.length === 0) return;
     for (const row of running) {
       const payload = { sessionId: String(row.id), event: runningStatusEvent() };
@@ -2199,8 +2266,10 @@ export async function startHost(initialSource, settings = DEFAULT_HOST_SETTINGS,
       let resolved;
       try {
         resolved = await serializeCredentialOperation(() => resolveSession());
-      } catch {
-        resolved = { ok: false, message: '读取本机 Cindy 登录态失败' };
+      } catch (error) {
+        resolved = error?.code === 'CREDENTIAL_STORE_UNAVAILABLE'
+          ? { ok: false, reason: error.code, message: error.message }
+          : { ok: false, message: '读取本机 Cindy 登录态失败' };
       }
       if (stopped || !active || myGeneration !== generation) return;
 
@@ -2354,6 +2423,8 @@ export async function startHost(initialSource, settings = DEFAULT_HOST_SETTINGS,
   /** Full stop: used by plugin teardown, not by the switch. */
   async function stop() {
     stopped = true;
+    disposeArchiveObservation?.();
+    disposeArchiveObservation = null;
     active = false;
     await disconnect();
     await fileExports.stop();
@@ -2363,6 +2434,8 @@ export async function startHost(initialSource, settings = DEFAULT_HOST_SETTINGS,
     status.setState('disconnected');
   }
 
+  /** Follow native metadata even while transport is off; reconnect reads the same registry. */
+  observeArchiveSource();
   /** Start if the resolved settings already ask for transport. */
   await updateSettings(settings);
 

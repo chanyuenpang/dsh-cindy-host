@@ -577,9 +577,10 @@ ledger. The projection is not left idling: it exists to feed the phone.
 
 A host has no TTY, so the CLI's readline fallback could never run there. The
 card drives the same three Cindy auth calls as steps: request code, verify code,
-and (when Cindy answers `select_account`) pick an account. Tokens go to the OS
-credential store through `keytar` and are never sent to the browser — the card
-only ever sees booleans and a masked identifier.
+and (when Cindy answers `select_account`) pick an account. Linux/macOS tokens stay
+in the system credential vault via secret-tool/security. Windows persists only
+DPAPI CurrentUser ciphertext through DSH’s native credential record service. Tokens
+are never sent to the browser — the card only sees booleans and a masked identifier.
 
 ### Who may control this Host
 
@@ -699,9 +700,10 @@ Turning the switch off returned the status to `disconnected`, cleared the device
 ledger and the host identity, and left the process with **zero** established
 sockets — the relay connection was genuinely closed rather than idled.
 
-Note: the OS credential store is shared across DSH profiles (`keytar` service
-`DSH Cindy Host`), so a session created by `npm run login` is visible to the
-smoke profile too. The smoke profile itself only owns its settings document.
+Historical note: profiles using the same DSH home shared the `DSH Cindy Host`
+keychain entry. This remains the Linux/macOS CLI behavior. Windows now needs the
+DSH-native credential context and uses the settings card, not standalone npm login.
+Different DSH homes retain separate account keys.
 
 ### Two installations on one machine need two credentials, and the rule is the *home*
 

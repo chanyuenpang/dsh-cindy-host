@@ -631,6 +631,15 @@ test('picker catalog enriches exact route capacity from the injected LLM owner',
   assert.deepEqual(catalog.routableProviders, raw.routableProviders);
 });
 
+test('does not expose model selection when the native DSH controller lacks it', () => {
+  const source = buildDshSource(makeCtx({
+    sessionController: { list: async () => [], modelCatalog: async () => ({ groups: [] }) },
+    sessionQuery: { listSessions: async () => [] },
+  }), 'sessionController');
+  assert.equal(source.selectModel, undefined);
+  assert.equal(capabilityProvider(source).selectModel, undefined);
+});
+
 test('resolves the provider a chosen model belongs to from the catalog', async () => {
   // The controller sends a model id and usually no provider: its model option
   // has no provider field, because the catalog flattens models out of their

@@ -530,7 +530,7 @@ export function createChannelRouter({
     return row;
   }
 
-  return async function handleInvoke(request) {
+  const handleInvoke = async function handleInvoke(request) {
     // A reply is addressed by `id` + `src`; without both there is nothing the
     // relay could route, so this answers nothing rather than fabricating a frame.
     if (request === null || typeof request !== 'object') return null;
@@ -754,8 +754,13 @@ export function createChannelRouter({
       // The catalog is a live read, not a constant: it is what the picker lists,
       // and answering from a frozen copy would keep offering models that this
       // Host can no longer route to.
-      const readCatalog = capabilitiesNow().modelCatalog;
-      if (typeof readCatalog !== 'function') return invokeResult(request, DSH_AGENT_CAPABILITIES);
+      const composed = capabilitiesNow();
+      // DSH, not the controller's legacy Pi/90%-window heuristic, owns whether
+      // a model may be selected. Advertise only when that native path is composed.
+      const nativeModelSelection = typeof composed.selectModel === 'function';
+      const fallback = { ...DSH_AGENT_CAPABILITIES, supportsModelWindowSwitchGuard: nativeModelSelection };
+      const readCatalog = composed.modelCatalog;
+      if (typeof readCatalog !== 'function') return invokeResult(request, fallback);
       let catalog;
       try {
         catalog = await readCatalog();
@@ -764,13 +769,13 @@ export function createChannelRouter({
         agentCatalog = null;
         catalogDefaultModel = null;
         invalidateSessionRows();
-        return invokeResult(request, DSH_AGENT_CAPABILITIES);
+        return invokeResult(request, fallback);
       }
       agentCatalog = catalog;
       const defaultModel = catalog?.default?.model;
       catalogDefaultModel = typeof defaultModel === 'string' && defaultModel !== '' ? defaultModel : null;
       invalidateSessionRows();
-      const capabilities = toAgentCapabilities(catalog);
+      const capabilities = toAgentCapabilities(catalog, { nativeModelSelection });
       // These two fields are what make the controls appear at all: the controller
       // draws the permission picker only when presets are advertised, and the
       // plan-mode switch only when support is — and DSH documents a missing
@@ -1055,9 +1060,9 @@ export function createChannelRouter({
       // therefore not a refusal — it is an instruction to revert the user's edit,
       // which is how these three actions used to look like dead buttons.
       //
-      // Only the title has a DSH counterpart; the other three are this Host's own
-      // bookkeeping (`session-flags.js`), so the reply is built from the source row
-      // with the flags folded back on — the same fold every read path uses.
+      // The runtime delegates archive/restore to native DSH and keeps delete/pin
+      // compatibility metadata. The reply uses that same effective projection
+      // as every list/get read, never just the requested status.
       const capabilities = capabilitiesNow();
       const rename = capabilities.renameSession;
       let wrote = false;
@@ -1071,7 +1076,13 @@ export function createChannelRouter({
       if (writesMeta) {
         const applyFlags = capabilities.applySessionFlags;
         if (typeof applyFlags !== 'function') return invokeError(request, 'NOT_AVAILABLE', 'This DSH Host cannot archive, delete or pin sessions');
-        const applied = await applyFlags(sessionId, { status: patch.status, pinnedAt: patch.pinnedAt });
+        let applied;
+        try {
+          applied = await applyFlags(sessionId, { status: patch.status, pinnedAt: patch.pinnedAt });
+        } catch (error) {
+          if (error?.refusalCode !== undefined) return invokeError(request, refusalCodeOf(error), String(error.message));
+          throw error;
+        }
         wrote = true;
         // Echo only what was written, with this Host's effective value: that is the
         // same patch the controller applied optimistically, so other devices converge
@@ -1771,4 +1782,6 @@ export function createChannelRouter({
     // Fail closed and say so. The controller degrades on CHANNEL_NOT_ALLOWED.
     return invokeError(request);
   };
+  handleInvoke.invalidateSessionRows = invalidateSessionRows;
+  return handleInvoke;
 }

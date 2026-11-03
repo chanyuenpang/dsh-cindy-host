@@ -80,7 +80,8 @@ test('an unavailable default credential store reports repair rather than missing
   });
   assert.equal(result.ok, false);
   assert.equal(result.reason, 'CREDENTIAL_STORE_UNAVAILABLE');
-  assert.match(result.message, /keytar/);
+  assert.match(result.message, /secret-tool.*钥匙串.*PowerShell.*DSH/);
+  assert.doesNotMatch(result.message, /keytar|重新构建/);
   assert.match(result.message, /重启 DSH/);
   assert.doesNotMatch(result.message, /还没有 Cindy 登录态|登录态已过期/);
 });

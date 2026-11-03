@@ -1,5 +1,18 @@
 # Changelog
 
+## 0.1.32 — 2026-11-03
+
+- Remove keytar and its native npm build chain. Linux/macOS keep system credential vaults through secret-tool/security; Windows encrypts with built-in DPAPI CurrentUser and persists ciphertext through the native DSH credential record service. Login, renewal and logout share one installation-scoped store; failures never fall back to plaintext or pretend a stored login is absent. Windows upgrades may require one explicit login; legacy vault entries are left untouched.
+
+- Add exact DSH `0.2.2-alpha.2` session/settings peers and its Schemastery `3.18.6-alpha.1` peer, retaining the existing rc.3/rc.4/rc.5 carriers. Alpha's own Node.js >=24.9 requirement still applies.
+- Replace removed `standingKeyFor` draft discovery with the current preset revision lease (`acquireScope`), released after successful or failed reads; prefer isolated live-Agent skill services and retain older-carrier fallback.
+- Add lease-lifecycle regressions and a reproducible isolated-alpha core-contract smoke covering real compatibility admission, Loader activation, Session message/input identity and preset skill visibility. Controller/settings/archive method checks are structural only; alpha Web, persistent settings, relay and handset acceptance remain separate gates. The core-contract smoke does not modify or reload a production profile.
+
+- Connect archive/restore metadata to native DSH workspace-registry durability, with native activity checks, cross-device committed archive updates, list-cache invalidation, and explicit unpin acknowledgements. Preserve legacy controller archive flags until an explicit operation retires them; deletion remains non-destructive and Host-local.
+
+- Delegate remote model switching to native DSH when its selection API is composed. The Host now advertises model-window authority so Cindy does not reject DSH selections with its legacy Pi/unknown-capacity precheck. Running-turn selections and selecting the original model again use the same DSH next-request API; no Cindy or DSH core patch is required.
+- Keep missing native selection unavailable and preserve native refusal propagation. Regression coverage includes capability/catalog degradation, all three client aliases, switching back, and the unmodified Cindy consumer guard.
+
 ## 0.1.31 — 2026-10-31
 
 - Merge `main` into the DSH 0.2.1 carrier. `main` was a single working-tree snapshot that had diverged since the 0.2.1 peers landed; every conflict was resolved by keeping the newer, functionally wider side and re-taking `main`'s unique fixes rather than picking a whole file.

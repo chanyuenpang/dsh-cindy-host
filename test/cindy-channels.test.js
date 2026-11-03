@@ -1170,6 +1170,32 @@ test('a capability provider that throws is reported, not swallowed', async () =>
   await assert.rejects(() => router(request('local-db:messages:list', ['a'])), /provider exploded/);
 });
 
+test('model-window authority follows the live DSH selection capability, even without catalog metadata', async () => {
+  for (const catalogState of ['ready', 'missing', 'failed']) {
+    let canSelect = true;
+    const router = createChannelRouter({
+      listSessions: async () => ROWS, subscribers: new Set(),
+      resolveCapabilities: () => ({
+        ...(catalogState === 'missing' ? {} : { modelCatalog: async () => {
+          if (catalogState === 'failed') throw new Error('catalog unavailable');
+          return { groups: [] };
+        } }),
+        ...(canSelect ? { selectModel: async () => ({ selected: { provider: 'dsh', model: 'm' } }) } : {}),
+      }),
+    });
+    for (const alias of ['claude-code', 'codex', 'pi']) {
+      const reply = await router(request('maker:get-capabilities', [alias]));
+      assert.equal(reply.payload.ok, true);
+      assert.equal(reply.payload.result.supportsModelWindowSwitchGuard, true, catalogState + ':' + alias);
+    }
+    canSelect = false;
+    const unavailable = await router(request('maker:get-capabilities', ['pi']));
+    assert.equal(unavailable.payload.result.supportsModelWindowSwitchGuard, false);
+    const refused = await router(request('maker:set-model', ['a', 'm']));
+    assert.equal(refused.payload.error.code, 'NOT_AVAILABLE');
+  }
+});
+
 test('answers the agent roster the phone asks for on every device open', async () => {
   const { router } = makeRouter();
 
