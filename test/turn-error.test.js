@@ -33,7 +33,9 @@ test('only durable failed turn boundaries render; attempts and other endings are
     assert.equal(turnErrorRow({ ...failed(), type }, 's1'), null);
   }
   for (const kind of ['completed', 'aborted', 'blocked', 'max-tokens']) {
-    assert.deepEqual(foldSessionEvent({ ...failed(), data: { reason: { kind } } }, { sessionId: 's1' }), []);
+    const end = { ...failed(), data: { reason: { kind } } };
+    assert.equal(turnErrorRow(end, 's1'), null);
+    assert.ok(foldSessionEvent(end, { sessionId: 's1' }).every(row => row.role !== 'error'));
   }
   for (const seq of [-1, 1.5, NaN, Number.MAX_SAFE_INTEGER + 1]) assert.equal(turnErrorRow(failed(seq), 's1'), null);
 });

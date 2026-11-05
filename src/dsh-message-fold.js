@@ -17,7 +17,7 @@
  */
 import { deriveEventMessage, isAppendSurfaceEvent } from '@deepseek-ai/dsh-session/surface';
 import { createReasoningStream } from './reasoning-stream.js';
-import { turnErrorRow, turnStateFromEvents } from './turn-error.js';
+import { turnDiagnosticRow, turnStateFromEvents } from './turn-error.js';
 import { toCindyMessageRows, toCindyMessages, hydrateImageAttachments } from './cindy-message-row.js';
 
 /** Default page size when the controller does not ask for one. */
@@ -82,8 +82,8 @@ export const TRANSCRIPT_CACHE_SESSIONS = 3;
  */
 export function foldSessionEvent(event, { sessionId, now = () => new Date() }) {
   if (event === null || typeof event !== 'object') return [];
-  const error = turnErrorRow(event, sessionId);
-  if (error) return [error];
+  const diagnostic = turnDiagnosticRow(event, sessionId);
+  if (diagnostic) return [diagnostic];
   if (!isAppendSurfaceEvent(event)) return [];
   let message;
   try {
@@ -390,9 +390,9 @@ export function createMessageReader({
       // gap as "nothing happened here".
       if (Number.isFinite(event.seq)) lastSeq = event.seq;
       reasoning.consume(event);
-      const error = turnErrorRow(event, sessionId);
-      if (error) {
-        entries.push({ rows: [error] });
+      const diagnostic = turnDiagnosticRow(event, sessionId);
+      if (diagnostic) {
+        entries.push({ rows: [diagnostic] });
         continue;
       }
       const todo = entryForTodoWrite(event);

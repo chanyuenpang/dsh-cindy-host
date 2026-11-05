@@ -2033,6 +2033,7 @@ export function apply(ctx, config) {
     // Make the failed history row readable before publishing its terminal identity.
     // Everything above is synchronous, so a new turn cannot interleave here.
     if (event?.type === 'turn/end' && typeof runtime.pushTurnIdle === 'function') runtime.pushTurnIdle(sessionId, event);
+    if (typeof runtime.pushSessionDiagnostic === 'function') runtime.pushSessionDiagnostic(sessionId, event);
     // Chunks are intentionally absent from deriveEventMessage. Publish a temporary
     // thinking overlay too, retiring it before the durable assistant rows below.
     runtime.pushSessionReasoning?.(sessionId, event, {

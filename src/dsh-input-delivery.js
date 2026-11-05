@@ -1,5 +1,6 @@
 import { createAttachmentMaterializer, hostAttachmentsOf } from './host-attachments.js';
 import { foldSessionEvent } from './dsh-message-fold.js';
+import { interruptedTurnClosers } from '@deepseek-ai/dsh-session';
 import { queuedRowFromController } from './host-input-queue.js';
 import { deliveryError } from './host-input-delivery-store.js';
 import { assertNoStructuredSessionReferences } from './session-reference-boundary.js';
@@ -36,7 +37,14 @@ export function createDshInputDeliveryBackend({getServices,sessionController,get
   const backend={
     available(){try{services();return true;}catch{return false;}},
     stop(){active=false;},
-    async readRows(sid){const events=await readLog(sid);const rows=[];for(const event of events){const folded=foldSessionEvent(event,{sessionId:sid});folded.forEach((row,index)=>{const rowid=event.seq*65536+index;if(!Number.isSafeInteger(rowid))throw deliveryError('DELIVERY_EVIDENCE_CORRUPT','Message order exceeds the safe protocol range');rows.push({...row,rowid});});}return rows.reverse();},
+    async readRows(sid){
+      const persisted=await readLog(sid);const s=services();
+      // Match native session-query cold reads. This is a display-only overlay;
+      // evidence()/receipts still read the untouched persisted prefix. A live
+      // session or agent must never be diagnosed as a crashed writer.
+      const cold=!s.sessions.get(sid)&&typeof s.agents?.get==='function'&&!s.agents.get(sid);
+      const events=cold?[...persisted,...interruptedTurnClosers(persisted)]:persisted;
+      const rows=[];for(const event of events){const folded=foldSessionEvent(event,{sessionId:sid});folded.forEach((row,index)=>{const rowid=event.seq*65536+index;if(!Number.isSafeInteger(rowid))throw deliveryError('DELIVERY_EVIDENCE_CORRUPT','Message order exceeds the safe protocol range');rows.push({...row,rowid});});}return rows.reverse();},
     async evidence(sid){const events=await readLog(sid);const proof=durableInputEvidence(events,sid);const agent=getServices().agents?.get(sid);return {...proof,running:agent?.status==='running',live:agent!==undefined};},
     async prepare(sid,row,{resolveAttachmentRef,mode='queue'}={}){
       assertNoStructuredSessionReferences(row);

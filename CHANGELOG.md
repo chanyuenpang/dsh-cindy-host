@@ -1,5 +1,11 @@
 # Changelog
 
+## 0.1.35 — 2026-11-05
+
+- Show distinct native interruption, cancellation, sign-out, output-limit and blocked-turn notices without inventing model failures. Keep explicit native scheduled/started retries nonterminal, with safe known-code/count/delay details and stable live/history identities.
+- Match native cold-query diagnostic recovery only when both the native session and Agent are absent. Apply display-only interrupted-turn closers without changing stored events, receipt evidence or live tool outcomes; restore notices before terminal envelopes under the existing authorization and generation guards.
+- Render canonical tool-role results alongside legacy nested results, preserving call pairing, output and error/unknown-outcome markers. Extend Host diagnostic regressions and the opt-in actual mobile contract; source tests are not handset or arbitrary desktop-UI parity certification.
+
 ## 0.1.34 — 2026-11-05
 
 - Project durable native failed turns as stable, sanitized error rows and terminal maker events in both cold history and live delivery. Preserve native failure/retry ownership, expose only fixed known-code messages and validated HTTP status, and repair reconnect state without stopping newer turns or leaking provider diagnostics.

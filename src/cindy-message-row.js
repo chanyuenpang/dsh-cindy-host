@@ -288,12 +288,22 @@ const RENDERABLE_SOURCE_KINDS = new Set(['user', 'model', 'tool']);
  */
 export function toCindyMessageRows(message, { sessionId, createdAt, now = () => new Date(), promptClientId = null }) {
   const rows = [];
+  // Canonical DSH results use a tool-role message with root outcome/call ID,
+  // not the legacy user-role nested tool-result block. Keep both formats.
+  if (message?.role === 'tool') {
+    if (message.source?.kind !== undefined && message.source.kind !== 'tool') return rows;
+    if (typeof message.toolCallId !== 'string' || !message.toolCallId) return rows;
+    const id = `${sessionId}:${message.id}:0`;
+    return [{ id, clientId: id, sessionId, role: 'tool_result', toolUseId: message.toolCallId, agentMeta: null,
+      createdAt: createdAt ?? now().toISOString(),
+      content: { text: flattenToolResult(message.content), isError: message.isError === true } }];
+  }
   const role = ROW_ROLE_BY_MESSAGE_ROLE.get(message?.role);
   // `system` (the prompt injection), a hook's injected turn, or any role this
   // Host has never seen: none of them is something a participant said.
   if (role === undefined) return rows;
   const blocks = Array.isArray(message?.content) ? message.content : [];
-  // DSH records a tool result as a `user`-role message whose source is
+  // Older DSH messages record a tool result as a `user`-role message whose source is
   // `{kind: 'tool'}`. Its content block is what makes it a result row; a *text*
   // block on such a message is not the user speaking, so it is not rendered as
   // one.

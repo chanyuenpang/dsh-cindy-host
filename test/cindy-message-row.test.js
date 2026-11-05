@@ -95,6 +95,19 @@ test('a user message keeps the user role', () => {
   assert.equal(rows[0].role, 'user');
 });
 
+test('canonical tool-role results retain output, failure flag, pairing and stable identity', () => {
+  for (const isError of [true, false]) {
+    const message = { id: 'native', role: 'tool', toolCallId: 'call-1', isError, source: { kind: 'tool', callId: 'call-1' },
+      content: [{ type: 'text', text: 'tool failure details' }] };
+    const [row] = toCindyMessageRows(message, { sessionId: SESSION, createdAt: AT });
+    assert.equal(row.role, 'tool_result'); assert.equal(row.toolUseId, 'call-1');
+    assert.equal(row.id, `${SESSION}:native:0`); assert.equal(row.id, row.clientId);
+    assert.deepEqual(row.content, { text: 'tool failure details', isError });
+    assert.deepEqual(toCindyMessageRows({ ...message, source: { kind: 'plugin' } }, { sessionId: SESSION, createdAt: AT }), []);
+    assert.deepEqual(toCindyMessageRows({ ...message, toolCallId: undefined }, { sessionId: SESSION, createdAt: AT }), []);
+  }
+});
+
 test('a tool result pairs to its call and flattens its nested text', () => {
   const rows = toCindyMessageRows(
     {

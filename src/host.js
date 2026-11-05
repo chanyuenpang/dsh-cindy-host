@@ -36,7 +36,7 @@ import { SessionReadModel } from './session-read-model.js';
 import { ProjectionReadModelSink } from './projection-read-model-sink.js';
 import { publishLifecycle, runningStatusEvent, turnEventFor } from './session-publisher.js';
 import { createReasoningPublisher } from './reasoning-publisher.js';
-import { turnErrorRow, turnErrorPayload } from './turn-error.js';
+import { turnDiagnosticRow, turnDiagnosticPayload } from './turn-error.js';
 import { acceptLink } from './host-authorization.js';
 import { AuthorizationPolicy } from './authorization-policy.js';
 import { HostStatus } from './host-status.js';
@@ -925,12 +925,18 @@ export async function startHost(initialSource, settings = DEFAULT_HOST_SETTINGS,
   }
 
   /** Send a native terminal identity once per authorized subscription/connection. */
-  function sendNativeTerminal(deviceId, sessionId, payload, identity) {
+  function sendNativeTerminal(deviceId, sessionId, payload, identity, row) {
     if (stopped || !active || !acceptedControllers.has(deviceId) || !policy.canAccept(deviceId) || sessionIsHidden(sessionId)
       || !sessionSubscribers.get(sessionId)?.has(deviceId)) return false;
     const key = terminalAnnounceKey(deviceId, sessionId);
     const stamp = `${generation}:${subscriptionLeases.get(key) ?? 0}:${identity}`;
     if (terminalIdentities.get(key) === stamp) return false;
+    // Reconnect must restore the actual diagnostic, not merely stop a spinner.
+    if (row) {
+      const notice = { sessionId, message: row };
+      recordPush(sessionId, 'local-db:messages:created', offlineDevices.has(deviceId) ? 0 : 1, notice);
+      send({ v: PROTOCOL_VERSION, kind: 'push', dst: deviceId, payload: { channel: 'local-db:messages:created', payload: notice } });
+    }
     recordPush(sessionId, 'maker:event', offlineDevices.has(deviceId) ? 0 : 1, payload);
     send({ v: PROTOCOL_VERSION, kind: 'push', dst: deviceId, payload: { channel: 'maker:event', payload } });
     if (!offlineDevices.has(deviceId)) {
@@ -978,7 +984,7 @@ export async function startHost(initialSource, settings = DEFAULT_HOST_SETTINGS,
       if (!valid() || !live || typeof live.running !== 'boolean') return;
       if (live.running) {
         setCachedRunning(sessionId, true);
-        const payload = { sessionId, event: runningStatusEvent() };
+        const payload = { sessionId, event: runningStatusEvent(state.retryNotice?.content ?? 'running') };
         recordPush(sessionId, 'maker:event', 1, payload);
         send({ v: PROTOCOL_VERSION, kind: 'push', dst: deviceId, payload: { channel: 'maker:event', payload } });
         return;
@@ -987,8 +993,9 @@ export async function startHost(initialSource, settings = DEFAULT_HOST_SETTINGS,
       if ((nativeBoundaries.get(sessionId)?.seq ?? -1) > state.boundarySeq) return;
       // No await after the final guard: a new boundary cannot interleave with send.
       setCachedRunning(sessionId, false);
-      const payload = state.error ? turnErrorPayload(state.error) : { sessionId, event: { type: 'done' } };
-      sendNativeTerminal(deviceId, sessionId, payload, `end:${state.boundarySeq}`);
+      const diagnostic = state.error ?? state.notice;
+      const payload = diagnostic ? turnDiagnosticPayload(diagnostic) : { sessionId, event: { type: 'done' } };
+      sendNativeTerminal(deviceId, sessionId, payload, `end:${state.boundarySeq}`, diagnostic);
     } catch {
       if (!valid()) return;
       // Never reflect arbitrary upstream exception prose into remote diagnostics.
@@ -1363,7 +1370,7 @@ export async function startHost(initialSource, settings = DEFAULT_HOST_SETTINGS,
    */
   function pushSessionUpdate(sessionId, channel, payload) {
     if (channel === 'maker:input:projection' && activeDelivery) payload = activeDelivery.currentProjection(sessionId, [], payload);
-    const guarded = payload?.message?.role === 'error' || payload?.event?.type === 'error';
+    const guarded = channel === 'local-db:messages:created' || channel === 'maker:event';
     const devices = guarded
       ? new Set([...(sessionSubscribers.get(sessionId) ?? [])].filter(id => !sessionIsHidden(sessionId) && acceptedControllers.has(id) && policy.canAccept(id)))
       : sessionSubscribers.get(sessionId);
@@ -1450,7 +1457,7 @@ export async function startHost(initialSource, settings = DEFAULT_HOST_SETTINGS,
       // nothing, which is the same class of failure as the bug being fixed.)
       const provider = typeof options.resolveCapabilities === 'function' ? options.resolveCapabilities() : undefined;
       const hydrate = provider?.hydrateImages;
-      if (message?.role !== 'error' && typeof hydrate === 'function') await hydrate([message]);
+      if (!['error', 'system'].includes(message?.role) && typeof hydrate === 'function') await hydrate([message]);
     } catch {
       // Un-hydrated is still worth sending.
     }
@@ -1816,16 +1823,16 @@ export async function startHost(initialSource, settings = DEFAULT_HOST_SETTINGS,
       for (const deviceId of sessionSubscribers.get(sessionId) ?? []) void restoreWatchedTurnState(deviceId, sessionId);
       return;
     }
-    const error = turnErrorRow(event, sessionId);
-    const failed = event?.data?.reason?.kind === 'error';
-    if (failed && !error) {
+    const diagnostic = turnDiagnosticRow(event, sessionId);
+    const requiresNotice = diagnostic !== null || ['error', 'interrupted', 'max-tokens', 'aborted', 'blocked'].includes(event?.data?.reason?.kind);
+    if (requiresNotice && !diagnostic) {
       recordHandlerError('turn-error', new Error('Invalid native failed-turn identity; history resynchronization required'));
       pushHistoryViewChanged(sessionId);
       return;
     }
     if (event && Number.isSafeInteger(event.seq)) {
       if ((nativeBoundaries.get(sessionId)?.seq ?? -1) >= event.seq) return;
-      nativeBoundaries.set(sessionId, { seq: event.seq });
+      nativeBoundaries.set(sessionId, { seq: event.seq, turn: event.data?.turn });
     }
     turnVersions.set(sessionId, (turnVersions.get(sessionId) ?? 0) + 1);
     const timer = pendingReconciles.get(sessionId);
@@ -1839,8 +1846,8 @@ export async function startHost(initialSource, settings = DEFAULT_HOST_SETTINGS,
     // tells it first — and the re-link repair depends on that record meaning "it arrived", so a
     // device the relay calls unreachable must not be written into it.
     const watchers = [...(sessionSubscribers.get(sessionId) ?? [])];
-    if (failed) {
-      const payload = turnErrorPayload(error);
+    if (requiresNotice) {
+      const payload = turnDiagnosticPayload(diagnostic);
       for (const deviceId of watchers) sendNativeTerminal(deviceId, sessionId, payload, `end:${event.seq}`);
       // Error detail never goes to list subscribers or unwatched controllers.
       publishRowTurnState(sessionId, false);
@@ -2000,7 +2007,7 @@ export async function startHost(initialSource, settings = DEFAULT_HOST_SETTINGS,
   function announceTurnRunning(sessionId, event) {
     if (event && Number.isSafeInteger(event.seq)) {
       if ((nativeBoundaries.get(sessionId)?.seq ?? -1) >= event.seq) return;
-      nativeBoundaries.set(sessionId, { seq: event.seq });
+      nativeBoundaries.set(sessionId, { seq: event.seq, turn: event.data?.turn });
     }
     turnVersions.set(sessionId, (turnVersions.get(sessionId) ?? 0) + 1);
     setCachedRunning(sessionId, true);
@@ -2845,6 +2852,18 @@ export async function startHost(initialSource, settings = DEFAULT_HOST_SETTINGS,
     /** Push one live session message to the controllers watching that session. */
     pushSessionMessage,
     pushSessionReasoning: reasoningPublisher.noteEvent,
+    // Only explicit native scheduled/started retry events assert ongoing work.
+    // Failed attempts alone never terminate or start a turn.
+    pushSessionDiagnostic: (sessionId, event) => {
+      if (!['llm/retry', 'llm/retry-started'].includes(event?.type)) return;
+      const row = turnDiagnosticRow(event, sessionId);
+      const boundary = nativeBoundaries.get(sessionId);
+      if (!row || (boundary?.seq ?? -1) >= event.seq
+        || (boundary?.turn !== undefined && boundary.turn !== event.data?.turn)) return;
+      turnVersions.set(sessionId, (turnVersions.get(sessionId) ?? 0) + 1);
+      setCachedRunning(sessionId, true);
+      pushSessionUpdate(sessionId, 'maker:event', { sessionId, event: runningStatusEvent(row.content) });
+    },
     /**
      * Announce a real turn boundary to a session's watchers.
      *

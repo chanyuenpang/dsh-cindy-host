@@ -118,9 +118,43 @@ test('non-error native endings remain done, not failed model messages', async ()
       x.runtime.pushTurnRunning('s1', start(seq++));
       const event = { ...fail(seq++), data: { turn: 1, reason: { kind } } };
       x.runtime.pushTurnIdle('s1', event);
-      assert.deepEqual(foldSessionEvent(event, { sessionId: 's1' }), []);
+      assert.ok(foldSessionEvent(event, { sessionId: 's1' }).every(row => row.role !== 'error'));
     }
     assert.deepEqual(terminals(x.socket).map(frame => frame.payload.payload.event.type), ['done', 'done', 'done', 'done']);
+  } finally { await x.runtime.stop(); }
+});
+
+test('reconnect delivers interruption text itself before the terminal, scoped to the session phone', async () => {
+  const interrupted = { ...fail(1), data: { turn: 1, reason: { kind: 'interrupted' } } };
+  const x = await setup([start(0), interrupted]);
+  try {
+    await x.subscribe(['sessions'], 'list-phone'); x.socket.sent.length = 0; await x.subscribe();
+    const created = x.socket.sent.filter(f => f.payload?.channel === 'local-db:messages:created');
+    assert.equal(created.length, 1); assert.equal(created[0].dst, 'phone');
+    assert.match(created[0].payload.payload.message.content, /工具调用结果未知/);
+    const [terminal] = terminals(x.socket); assert.equal(terminal.payload.payload.event.type, 'done');
+    assert.equal(terminal.payload.payload.persistId, created[0].payload.payload.message.clientId);
+    assert.equal(x.socket.sent.indexOf(created[0]) < x.socket.sent.indexOf(terminal), true);
+    x.socket.sent.length = 0; x.state.running = true; x.runtime.pushTurnRunning('s1', { ...start(2), data: { turn: 2 } });
+    await x.subscribe();
+    assert.equal(terminals(x.socket).length, 0, 'an old interruption cannot close a new live turn');
+  } finally { await x.runtime.stop(); }
+});
+
+test('scheduled retry reports safe ongoing status without a terminal or stale-turn cancellation', async () => {
+  const x = await setup();
+  const retry = { type: 'llm/retry', seq: 1, time: 2000, data: { turn: 1, mode: 'normal', retry: 1, maxRetries: 3, delayMs: 2000, failure: { code: 'RATE_LIMIT', message: 'SECRET' } } };
+  try {
+    await x.subscribe(); x.runtime.pushTurnRunning('s1', start(0)); x.socket.sent.length = 0;
+    x.runtime.pushSessionDiagnostic('s1', retry);
+    assert.equal(terminals(x.socket).length, 0); assert.equal(x.runtime.isSessionRunning('s1'), true);
+    assert.ok(x.socket.sent.some(f => f.payload?.payload?.event?.data?.status?.includes('已安排重试')));
+    assert.equal(JSON.stringify(x.socket.sent).includes('SECRET'), false);
+    x.runtime.pushTurnIdle('s1', fail(2)); x.socket.sent.length = 0; x.runtime.pushSessionDiagnostic('s1', retry);
+    assert.equal(x.socket.sent.length, 0);
+    x.runtime.pushTurnRunning('s1', { ...start(3), data: { turn: 2 } }); x.socket.sent.length = 0;
+    x.runtime.pushSessionDiagnostic('s1', { ...retry, seq: 4 });
+    assert.equal(x.socket.sent.length, 0, 'late retry from a different turn cannot overwrite the current status');
   } finally { await x.runtime.stop(); }
 });
 
