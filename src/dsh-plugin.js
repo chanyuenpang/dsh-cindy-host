@@ -3,6 +3,8 @@ import { createRequire } from 'node:module';
 import { homedir } from 'node:os';
 import { join } from 'node:path';
 import { createDshInputDeliveryBackend } from './dsh-input-delivery.js';
+import { diagnosticPreferenceStore } from './diagnostic-presentation.js';
+import { ensureNativeContinuationPlanOff } from './continuation-protocol.js';
 import { DEFAULT_HOST_SETTINGS, SETTINGS_NAMESPACE, validateHostSettings } from './host-settings.js';
 import { DshHostSource } from './dsh-host-source.js';
 import { createSessionControllerSource } from './dsh-session-source.js';
@@ -70,6 +72,7 @@ const HostSettingsSchema = Schema.object({
   deviceId: Schema.string().default(DEFAULT_HOST_SETTINGS.deviceId),
   deviceName: Schema.string().default(DEFAULT_HOST_SETTINGS.deviceName),
   sessionFlags: Schema.dict(SessionFlagSchema).default({}),
+  diagnosticPresentationV1: Schema.dict(Schema.dict(Schema.dict(Schema.dict(Schema.boolean())))).default({}),
 });
 
 /**
@@ -697,8 +700,12 @@ export function buildDshSource(ctx, serviceName, options = {}) {
       getServices: () => ({ ...deliveryServices, fileSystem: ctx.get('fs'), fileUploads: controls.fileUploads }),
       sessionController,
       getSession: (sessionId) => sessionSource.getSession(sessionId),
+      ensurePlanModeOff: ({agent}) => ensureNativeContinuationPlanOff({agent,controller:planModeFor(agent),getService:name=>ctx.get(name)}),
     });
-    const committedRows = (sessionId) => inputDeliveryBackend.available() ? inputDeliveryBackend.readRows(sessionId) : readMessages.all(sessionId);
+    const committedRows = async (sessionId) => {
+      const rows = await (inputDeliveryBackend.available() ? inputDeliveryBackend.readRows(sessionId) : readMessages.all(sessionId));
+      return options.projectMessages?.(rows) ?? rows;
+    };
     const historyView = readMessages === undefined
       ? undefined
       : createHistoryViewController({
@@ -1881,6 +1888,7 @@ export function apply(ctx, config) {
         // Delete/pin and old archive overlays persist here; new archives live in
         // DSH's native workspace registry, not this plugin's settings section.
         persistSessionFlags: sessionFlagsWriter(ctx.settings, settingsNamespace(SETTINGS_NAMESPACE)),
+        diagnosticPreferences: diagnosticPreferenceStore(ctx.settings, settingsNamespace(SETTINGS_NAMESPACE)),
         inputDeliveryDirectory: join(process.env.DSH_PROFILE_DIR || join(process.env.DSH_HOME || join(homedir(), '.dsh'), 'profiles', process.env.DSH_PROFILE || 'desktop'), 'state', 'dsh-cindy-host'),
 
         identityIsCurrent: () => admitted || (!runtimeDisposed && lease()),
@@ -1914,6 +1922,7 @@ export function apply(ctx, config) {
         // Read lazily: the runtime resolves after this seam is built, and the state changes on
         // every turn boundary.
         isSessionRunning: (sessionId) => runtime?.isSessionRunning?.(sessionId) === true,
+        projectMessages: rows => runtime?.projectMessages?.(rows) ?? rows,
         getProjectOrderOwner: () => runtime?.getProjectOrderOwner?.(),
       });
       // The filesystem is a separate service; the controller's file reads are

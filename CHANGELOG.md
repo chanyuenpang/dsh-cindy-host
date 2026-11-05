@@ -1,5 +1,12 @@
 # Changelog
 
+## 0.1.36 — 2026-11-06
+
+- Project proven native interruption identities and timestamp tuples consistently into session list/get, boundaries and reconnect updates. Clear non-pending/hidden/running presentation without fabricating transcript-clear or completion facts.
+- Serve existing interruption acknowledgement and committed-error dismissal calls through authenticated owner-scoped, revisioned native settings. Store hashed display preferences only, verify authoritative readback, guard source/controller/tail races, and overlay history without rewriting source events or receipt evidence.
+- Treat the pinned current Cindy continuation prompt as a new explicit durable human input with planMode:false. Capture and recheck the native tail around proven scoped plan-off, deduplicate continuations for that tail, and reconcile superseded/non-admitted refusals as removed receipts instead of retrying automatically. Legacy non-durable fallback refuses this control contract.
+- Extend Host/ledger/native-input regressions and opt-in read-only Cindy consumer contracts. Existing wire limitations remain explicit: no atomic CAS against unrelated desktop writers, screen-generation token in acknowledgement, immediate client rollback of failed ignores, or automatic replay of unknown tool outcomes.
+
 ## 0.1.35 — 2026-11-05
 
 - Show distinct native interruption, cancellation, sign-out, output-limit and blocked-turn notices without inventing model failures. Keep explicit native scheduled/started retries nonterminal, with safe known-code/count/delay details and stable live/history identities.

@@ -126,6 +126,7 @@ export function toCindySessionListRow(item, { now = () => new Date(), device, de
     // Not part of the stored row's contract, but harmless and honest: the
     // controller reads running state from `maker:list-active`, not from here.
     running: item.running === true,
+    ...(Object.hasOwn(item, 'activeTurnStartedAt') ? { activeTurnStartedAt: item.activeTurnStartedAt, interruptedTurnStartedAt: item.interruptedTurnStartedAt, lastTurnEndedAt: item.lastTurnEndedAt, clearedAt: item.clearedAt ?? null } : {}),
     // Which device this row came from. The controller's home aggregates sessions
     // from every linked computer and filters with
     // `canonicalDeviceId ?? deviceLinkDeviceId === selectedDeviceId`

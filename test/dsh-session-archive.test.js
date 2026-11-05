@@ -1,4 +1,5 @@
 import test from 'node:test';
+import { EventEmitter } from 'node:events';
 import assert from 'node:assert/strict';
 import { createDshSessionArchive, NATIVE_PIN_MEMBERSHIP_AT } from '../src/dsh-session-archive.js';
 import { buildDshSource, capabilityProvider } from '../src/dsh-plugin.js';
@@ -224,13 +225,17 @@ test('a source replacement cannot turn a queued native archive into a local-only
 
 test('committed desktop archive updates are multicast only to linked row watchers', async () => {
   const f = fixture(); const sent = [];
-  const socket = { readyState: 1, on() {}, send(value) { sent.push(JSON.parse(value)); }, close() {} };
-  const host = await startHost(f.source, { ...OFF, transportEnabled: true, remoteControlEnabled: true }, {
+  const socket = Object.assign(new EventEmitter(), { readyState: 1, send(value) { sent.push(JSON.parse(value)); }, close() {} });
+  const host = await startHost(f.source, { ...OFF, transportEnabled: true, remoteControlEnabled: true, controllers: { phone: {state:'authorized'}, 'desktop-controller': {state:'authorized'} } }, {
     resolveSession: async () => ({ ok: true, session: { deviceId: 'host' } }),
     openSocket: () => socket, heartbeatMs: 0, listDevices: async () => ({ devices: [] }),
   });
   try {
-    host.subscribers.add('phone'); host.subscribers.add('desktop-controller');
+    socket.emit('message', JSON.stringify({v:1,kind:'hello-ack',payload:{deviceId:'host',userId:'u',serverProtocolVersion:1}}));
+    for (const peer of ['phone','desktop-controller']) {
+      socket.emit('message', JSON.stringify({v:1,kind:'invoke',id:`subscribe-${peer}`,src:peer,payload:{channel:'device-link:subscribe',args:[{topics:['sessions']}]}}));
+    }
+    await tick();
     f.external(['one']); await tick();
     const patches = sent.filter(frame => frame.kind === 'push' && frame.payload.channel === 'local-db:sessions:patched');
     assert.deepEqual(patches.map(frame => frame.dst).sort(), ['desktop-controller', 'phone']);

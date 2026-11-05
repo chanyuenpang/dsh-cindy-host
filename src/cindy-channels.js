@@ -21,6 +21,7 @@ import { toGoalStatusPayload } from './host-goals.js';
 import { hostAttachmentsOf } from './host-attachments.js';
 import { historyLocateOptions, locateCommittedMessages, capReferenceRows } from './host-history-locate.js';
 import { assertNoStructuredSessionReferences } from './session-reference-boundary.js';
+import { continuationKind } from './continuation-protocol.js';
 
 async function deliveryReply(request, operation) {
   try { return invokeResult(request, await operation()); }
@@ -217,6 +218,8 @@ export const SUPPORTED_CHANNELS = Object.freeze([
   'local-db:sessions:list',
   'local-db:sessions:get',
   'local-db:messages:list',
+  'local-db:messages:dismiss-error',
+  'local-db:sessions:ack-interrupted',
   'local-db:messages:around',
   'local-db:messages:around-client-id',
   'local-db:sessions:patch-meta',
@@ -646,6 +649,14 @@ export function createChannelRouter({
 
     if (channel === 'local-db:sessions:list') {
       return invokeResult(request, sessionListPage(await sessionRows(), args));
+    }
+
+    if (channel === 'local-db:sessions:ack-interrupted' || channel === 'local-db:messages:dismiss-error') {
+      const sid = args[0]; const cid = args[1]; const caps = capabilitiesNow();
+      if (typeof sid !== 'string' || !sid || args.length !== (channel === 'local-db:sessions:ack-interrupted' ? 1 : 2) || (channel === 'local-db:messages:dismiss-error' && (typeof cid !== 'string' || !cid))) return invokeError(request, 'INVALID_PARAMS', 'Session and message identities are required');
+      const action = channel === 'local-db:sessions:ack-interrupted' ? caps.ackInterrupted : caps.dismissError;
+      if (typeof action !== 'function') return invokeError(request, 'NOT_AVAILABLE', 'Diagnostic presentation actions are unavailable');
+      return deliveryReply(request, () => channel === 'local-db:sessions:ack-interrupted' ? action(sid, request.src) : action(sid, cid, request.src));
     }
 
     if (channel === 'local-db:sessions:get') {
@@ -1163,6 +1174,8 @@ export function createChannelRouter({
         try { delivery = capabilities.inputDelivery(); } catch (error) { return deliveryReply(request, () => { throw error; }); }
         if (delivery) return deliveryReply(request, () => channel === 'maker:input:steer' ? delivery.steer(sessionId, args[1], args[2] ?? {}) : delivery.accept(sessionId, args[1], args[2] ?? {}));
       }
+
+      if (continuationKind(extractSendText(args[1]))) return invokeError(request, 'NOT_AVAILABLE', 'Safe manual continuation requires native durable input delivery');
 
       // A `steer` naming an item DSH already holds is a **promotion** of that
       // queued item, not a new message: the controller sends the queued row back

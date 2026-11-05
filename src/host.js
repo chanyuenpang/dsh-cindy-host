@@ -37,6 +37,7 @@ import { ProjectionReadModelSink } from './projection-read-model-sink.js';
 import { publishLifecycle, runningStatusEvent, turnEventFor } from './session-publisher.js';
 import { createReasoningPublisher } from './reasoning-publisher.js';
 import { turnDiagnosticRow, turnDiagnosticPayload } from './turn-error.js';
+import { advanceInterruptionMetadata, diagnosticOwner, interruptionFields, projectDismissedErrors } from './diagnostic-presentation.js';
 import { acceptLink } from './host-authorization.js';
 import { AuthorizationPolicy } from './authorization-policy.js';
 import { HostStatus } from './host-status.js';
@@ -374,6 +375,69 @@ export async function startHost(initialSource, settings = DEFAULT_HOST_SETTINGS,
   let reminderObserverSource;
   let reminderObserverPort;
   const sessionMetaWrites = new Map();
+  const interruptionStates = new Map();
+  const nativePresentationMetadata = new Map();
+  const presentationData = () => options.diagnosticPreferences?.snapshot?.() ?? {};
+  const presentationOwner = () => diagnosticOwner(deliveryNamespace, options.inputDeliveryDirectory ?? '');
+  const presentationFields = (sid, running = false, candidate = interruptionStates.get(sid)) => interruptionFields(candidate, running, sessionIsHidden(sid), presentationData(), presentationOwner(), sid);
+  const projectMessages = rows => projectDismissedErrors(rows, presentationData(), presentationOwner());
+
+  async function refreshInterruption(sid, row) {
+    const owner = source; const revision = sourceRevision; const version = turnVersions.get(sid); const connection = generation;
+    const reader = options.resolveCapabilities?.()?.readMessages;
+    if (typeof reader?.turnState !== 'function') return;
+    const state = await reader.turnState(sid);
+    if (stopped || generation !== connection || source !== owner || sourceRevision !== revision || turnVersions.get(sid) !== version || options.resolveCapabilities?.()?.readMessages !== reader) throw Object.assign(new Error('Native session changed; synchronize again'), { code: 'NOT_AVAILABLE' });
+    let live = row;
+    if (typeof owner?.listSessionStates === 'function') {
+      const rows = await owner.listSessionStates(sid); live = rows.find(item => String(item.id) === sid);
+    }
+    if (stopped || generation !== connection || source !== owner || sourceRevision !== revision || turnVersions.get(sid) !== version || options.resolveCapabilities?.()?.readMessages !== reader || !live || typeof live.running !== 'boolean' || (nativeBoundaries.get(sid)?.seq ?? -1) > (state?.seq ?? -1)) throw Object.assign(new Error('Native session state is unavailable'), { code: 'NOT_AVAILABLE' });
+    if (Number.isSafeInteger(state?.boundarySeq)) nativeBoundaries.set(sid, { seq: state.boundarySeq, turn: state.nativeMetadata?.start?.data?.turn });
+    interruptionStates.set(sid, live.running || state?.running ? null : state?.interruption ?? null);
+    if (state?.nativeMetadata) nativePresentationMetadata.set(sid, state.nativeMetadata);
+  }
+
+  async function diagnosticAction(sid, peer, clientId) {
+    const scopeOwner = source; const revision = sourceRevision; const owner = presentationOwner(); const connection = generation;
+    const grant = current?.controllers?.[peer]?.grantRevision;
+    const valid = () => !stopped && active && owner && presentationOwner() === owner && source === scopeOwner && sourceRevision === revision
+      && generation === connection && acceptedControllers.has(peer) && policy.canAccept(peer) && !sessionIsHidden(sid)
+      && current?.controllers?.[peer]?.grantRevision === grant;
+    const requireCurrent = () => { if (!valid()) throw Object.assign(new Error('Diagnostic action scope is unavailable'), { code: 'NOT_AVAILABLE' }); };
+    requireCurrent();
+    const row = await (typeof source.getSession === 'function' ? source.getSession(sid) : source.listSessions().then(rows => rows.find(row => String(row.id) === sid)));
+    requireCurrent(); if (!row) throw Object.assign(new Error('Session does not exist'), { code: 'NOT_FOUND' });
+    const preferences = options.diagnosticPreferences;
+    if (typeof preferences?.commit !== 'function') throw Object.assign(new Error('Durable diagnostic preferences are unavailable'), { code: 'NOT_AVAILABLE' });
+    if (clientId === undefined) {
+      await refreshInterruption(sid, row); requireCurrent();
+      const candidate = interruptionStates.get(sid);
+      if (!candidate) return { ok: true };
+      await preferences.commit({ owner, sessionId: sid, kind: 'interruptions', id: candidate.id }, valid);
+      requireCurrent();
+      // Re-read after persistence; an in-flight old acknowledgement never clears a new interruption.
+      await refreshInterruption(sid, row); requireCurrent();
+      publishRowPatch(sid, presentationFields(sid, isSessionRunningNow(sid)));
+      routeInvoke.invalidateSessionRows();
+      return { ok: true };
+    }
+    const reader = options.resolveCapabilities?.()?.readAllMessages;
+    if (typeof reader !== 'function') throw Object.assign(new Error('Committed message history is unavailable'), { code: 'NOT_AVAILABLE' });
+    const rows = await reader(sid); requireCurrent();
+    const prefix = `${sid}:turn-error:`;
+    const message = rows.find(item => {
+      if (item.sessionId !== sid || item.clientId !== clientId || item.id !== clientId || item.role !== 'error' || typeof item.id !== 'string' || !item.id.startsWith(prefix)) return false;
+      const seq = Number(item.id.slice(prefix.length));
+      return Number.isSafeInteger(seq) && seq >= 0 && item.id === `${prefix}${seq}`;
+    });
+    if (!message) throw Object.assign(new Error('Host error message does not exist'), { code: 'NOT_FOUND' });
+    await preferences.commit({ owner, sessionId: sid, kind: 'errors', id: clientId }, valid); requireCurrent();
+    const [effective] = projectMessages([message]);
+    pushSessionUpdate(sid, 'local-db:messages:created', { sessionId: sid, message: effective });
+    pushHistoryViewChanged(sid);
+    return effective;
+  }
   function serializeSessionMeta(sessionId, operation) {
     const pending = (sessionMetaWrites.get(sessionId) ?? Promise.resolve()).then(operation);
     const settled = pending.then(() => {}, () => {});
@@ -384,7 +448,14 @@ export async function startHost(initialSource, settings = DEFAULT_HOST_SETTINGS,
   function projectSessionRows(rows) {
     const archived = source?.archive?.snapshot(); // Read the native set once per page, not once per row.
     const pinned = source?.archive?.pinSnapshot?.();
-    return sessionFlags.projectAll(rows).map(row => {
+    // Native settings describe can traverse every plugin: read once per page.
+    const data = presentationData(); const owner = presentationOwner();
+    const nativeReader = typeof options.resolveCapabilities?.()?.readMessages?.turnState === 'function';
+    return sessionFlags.projectAll(rows).map(original => {
+      const sid = String(original.id);
+      const native = nativeReader || Object.hasOwn(original, 'interruption');
+      const candidate = interruptionStates.has(sid) ? interruptionStates.get(sid) : original.interruption;
+      const row = native ? { ...original, ...interruptionFields(candidate, original.running === true || isSessionRunningNow(sid), sessionIsHidden(sid), data, owner, sid) } : original;
       if (archived?.has(String(row.id)) === true) {
         return { ...row, status: row.status === 'deleted' ? 'deleted' : 'archived', pinnedAt: null };
       }
@@ -761,6 +832,8 @@ export async function startHost(initialSource, settings = DEFAULT_HOST_SETTINGS,
     if (source !== next) {
       sourceRevision++;
       nativeBoundaries.clear();
+      interruptionStates.clear();
+      nativePresentationMetadata.clear();
       turnVersions.clear();
       terminalIdentities.clear();
       source?.manualCompact?.cancelAll('DSH source replaced');
@@ -982,6 +1055,9 @@ export async function startHost(initialSource, settings = DEFAULT_HOST_SETTINGS,
         live = Array.isArray(rows) ? rows.find(row => String(row?.id) === sessionId) : null;
       } else if (typeof owner?.getSession === 'function') live = await owner.getSession(sessionId);
       if (!valid() || !live || typeof live.running !== 'boolean') return;
+      interruptionStates.set(sessionId, live.running || state.running ? null : state.interruption ?? null);
+      if (state.nativeMetadata) nativePresentationMetadata.set(sessionId, state.nativeMetadata);
+      publishRowPatch(sessionId, presentationFields(sessionId, live.running));
       if (live.running) {
         setCachedRunning(sessionId, true);
         const payload = { sessionId, event: runningStatusEvent(state.retryNotice?.content ?? 'running') };
@@ -994,8 +1070,9 @@ export async function startHost(initialSource, settings = DEFAULT_HOST_SETTINGS,
       // No await after the final guard: a new boundary cannot interleave with send.
       setCachedRunning(sessionId, false);
       const diagnostic = state.error ?? state.notice;
-      const payload = diagnostic ? turnDiagnosticPayload(diagnostic) : { sessionId, event: { type: 'done' } };
-      sendNativeTerminal(deviceId, sessionId, payload, `end:${state.boundarySeq}`, diagnostic);
+      const [effective] = diagnostic ? projectMessages([diagnostic]) : [];
+      const payload = effective ? turnDiagnosticPayload(effective) : { sessionId, event: { type: 'done' } };
+      sendNativeTerminal(deviceId, sessionId, payload, `end:${state.boundarySeq}`, effective);
     } catch {
       if (!valid()) return;
       // Never reflect arbitrary upstream exception prose into remote diagnostics.
@@ -1444,6 +1521,7 @@ export async function startHost(initialSource, settings = DEFAULT_HOST_SETTINGS,
    * chip instead of the picture.
    */
   async function pushSessionMessage(sessionId, message) {
+    [message] = projectMessages([message]);
     if (message?.role === 'user' && activeDelivery?.owns(sessionId, message.clientId)) {
       await new Promise(resolve => queueMicrotask(resolve));
       const proof = await activeDelivery.projection(sessionId, { deliveryClientIds: [message.clientId] });
@@ -1546,6 +1624,7 @@ export async function startHost(initialSource, settings = DEFAULT_HOST_SETTINGS,
         ? await source.getSession(sessionId)
         : (await source.listSessions()).find((candidate) => String(candidate.id) === sessionId);
       if (row == null) return undefined;
+      await refreshInterruption(sessionId, row);
       const [flagged] = projectSessionRows([row]);
       if (flagged !== undefined) sessionRowCache.set(String(flagged.id), flagged);
       return flagged;
@@ -1692,6 +1771,10 @@ export async function startHost(initialSource, settings = DEFAULT_HOST_SETTINGS,
       // the phone reaches any other screen watching the same session.
       pushGoalStatus: (sessionId, status) => pushSessionUpdate(sessionId, 'maker:goal:status-changed', { sessionId, goal: status }),
       ...provided,
+      ackInterrupted: (sid, peer) => diagnosticAction(sid, peer),
+      dismissError: (sid, cid, peer) => diagnosticAction(sid, peer, cid),
+      ...(typeof provided.readMessages === 'function' ? { readMessages: async (...args) => projectMessages(await provided.readMessages(...args)) } : {}),
+      ...(typeof provided.readAllMessages === 'function' ? { readAllMessages: async (...args) => projectMessages(await provided.readAllMessages(...args)) } : {}),
       /**
        * The plugin's send seam, carrying this Host's media access.
        *
@@ -1823,7 +1906,8 @@ export async function startHost(initialSource, settings = DEFAULT_HOST_SETTINGS,
       for (const deviceId of sessionSubscribers.get(sessionId) ?? []) void restoreWatchedTurnState(deviceId, sessionId);
       return;
     }
-    const diagnostic = turnDiagnosticRow(event, sessionId);
+    const rawDiagnostic = turnDiagnosticRow(event, sessionId);
+    const diagnostic = rawDiagnostic ? projectMessages([rawDiagnostic])[0] : null;
     const requiresNotice = diagnostic !== null || ['error', 'interrupted', 'max-tokens', 'aborted', 'blocked'].includes(event?.data?.reason?.kind);
     if (requiresNotice && !diagnostic) {
       recordHandlerError('turn-error', new Error('Invalid native failed-turn identity; history resynchronization required'));
@@ -1835,6 +1919,15 @@ export async function startHost(initialSource, settings = DEFAULT_HOST_SETTINGS,
       nativeBoundaries.set(sessionId, { seq: event.seq, turn: event.data?.turn });
     }
     turnVersions.set(sessionId, (turnVersions.get(sessionId) ?? 0) + 1);
+    if (event) {
+      const meta = advanceInterruptionMetadata(nativePresentationMetadata.get(sessionId), event, sessionId);
+      nativePresentationMetadata.set(sessionId, meta); interruptionStates.set(sessionId, meta.interruption);
+      if (event.data?.reason?.kind === 'interrupted' && !meta.start) {
+        interruptionStates.delete(sessionId);
+        void refreshInterruption(sessionId, sessionRowFor(sessionId)).then(() => publishRowPatch(sessionId, presentationFields(sessionId, isSessionRunningNow(sessionId))))
+          .catch(error => recordHandlerError('interruption-metadata', error));
+      }
+    }
     const timer = pendingReconciles.get(sessionId);
     if (timer !== undefined) {
       pendingReconciles.delete(sessionId);
@@ -1912,7 +2005,7 @@ export async function startHost(initialSource, settings = DEFAULT_HOST_SETTINGS,
    * @param running - the turn state DSH just reported.
    */
   function publishRowTurnState(sessionId, running) {
-    publishRowPatch(sessionId, { running, updatedAt: now().toISOString() });
+    publishRowPatch(sessionId, { running, ...presentationFields(sessionId, running), updatedAt: now().toISOString() });
   }
 
   /**
@@ -1931,7 +2024,7 @@ export async function startHost(initialSource, settings = DEFAULT_HOST_SETTINGS,
     for (const deviceId of sessionSubscribers.get(sessionId) ?? []) devices.add(deviceId);
     recordPush(sessionId, 'local-db:sessions:patched', devices.size, payload);
     if (devices.size === 0) return;
-    for (const dst of devices) send({ v: PROTOCOL_VERSION, kind: 'push', dst, payload: { channel: 'local-db:sessions:patched', payload } });
+    for (const dst of devices) if (acceptedControllers.has(dst) && policy.canAccept(dst)) send({ v: PROTOCOL_VERSION, kind: 'push', dst, payload: { channel: 'local-db:sessions:patched', payload } });
   }
 
   /**
@@ -2010,6 +2103,8 @@ export async function startHost(initialSource, settings = DEFAULT_HOST_SETTINGS,
       nativeBoundaries.set(sessionId, { seq: event.seq, turn: event.data?.turn });
     }
     turnVersions.set(sessionId, (turnVersions.get(sessionId) ?? 0) + 1);
+    interruptionStates.set(sessionId, null);
+    if (event) nativePresentationMetadata.set(sessionId, advanceInterruptionMetadata(nativePresentationMetadata.get(sessionId), event, sessionId));
     setCachedRunning(sessionId, true);
     pushSessionUpdate(sessionId, 'maker:event', { sessionId, event: runningStatusEvent() });
     publishRowTurnState(sessionId, true);
@@ -2651,6 +2746,8 @@ export async function startHost(initialSource, settings = DEFAULT_HOST_SETTINGS,
     sessionSubscribers.clear();
     liveTurnState.clear();
     nativeBoundaries.clear();
+    interruptionStates.clear();
+    nativePresentationMetadata.clear();
     turnVersions.clear();
     terminalIdentities.clear();
     subscriptionLeases.clear();
@@ -2851,6 +2948,7 @@ export async function startHost(initialSource, settings = DEFAULT_HOST_SETTINGS,
     }),
     /** Push one live session message to the controllers watching that session. */
     pushSessionMessage,
+    projectMessages,
     pushSessionReasoning: reasoningPublisher.noteEvent,
     // Only explicit native scheduled/started retry events assert ongoing work.
     // Failed attempts alone never terminate or start a turn.

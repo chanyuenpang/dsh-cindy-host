@@ -17,6 +17,36 @@ function setup(t,{epoch='process-A',file,proof,prepare,dispatch,remove,recoverCo
   async function close(){if(closed)return;closed=true;await co.close();}cleanups.get(t).closers.push(close);
   return{co,store,state,file,close,errors,get calls(){return calls;},get prepares(){return prepares;}};
 }
+
+
+test('a changed clientId body rejected as stale continuation cannot overwrite an already consumed input',async t=>{
+ const h=setup(t,{prepare:async(sid,row)=>{if(row.text==='stale continuation')throw Object.assign(Error('stale'),{code:'CONTINUATION_SUPERSEDED'});return{payload:{text:row.text},queued:row};}});
+ await h.co.accept('s',item('c','original'),boundary);await h.co.drain();h.state.inbox=[];h.state.users.push({clientId:'c',seq:7});await h.co.projection('s',{deliveryClientIds:['c']});
+ await assert.rejects(h.co.accept('s',item('c','stale continuation'),boundary),e=>e.code==='INPUT_DELIVERY_CONFLICT');
+ assert.equal(h.store.get('s','c').phase,'accepted');assert.equal((await h.co.projection('s',{deliveryClientIds:['c']})).deliveryReceipts[0].state,'accepted');assert.equal(h.calls,1);
+});
+test('fresh native inbox evidence wins over a plan refusal without permitting another admission',async t=>{
+ const h=setup(t,{prepare:async(sid,row)=>({payload:{text:row.text,continuation:{kind:'interrupted',tailId:'I'}},queued:row}),dispatch:async(e,state)=>{state.inbox.push({id:'native-existing',clientId:e.clientId});throw Object.assign(Error('not admitted by this attempt'),{code:'PLAN_MODE_UNAVAILABLE',deliveryNotAdmitted:true});}});
+ await h.co.accept('s',item(),boundary);await h.co.drain();assert.equal(h.store.get('s','c').phase,'DSH-pending');
+ assert.equal((await h.co.projection('s',{deliveryClientIds:['c']})).deliveryReceipts[0].state,'pending');await h.co.drain();assert.equal(h.calls,1);
+});
+
+test('same interruption cannot create two manual native admissions; a removed receipt is not acceptance',async t=>{
+ const h=setup(t,{prepare:async(sid,row)=>({payload:{text:row.text,continuation:{kind:'interrupted',tailId:'I'}},queued:row})});
+ await h.co.accept('s',item('a'),boundary);const duplicate=await h.co.accept('s',item('b'),boundary);
+ assert.equal(duplicate.deliveryReceipts[0].state,'removed');assert.equal(duplicate.deliveryReceipts[0].reason,'continuation-already-submitted');
+ await h.co.drain();assert.equal(h.calls,1);await h.co.accept('s',item('a'),boundary);await h.co.drain();assert.equal(h.calls,1);
+});
+test('a superseded tail before durable preparation seals a non-admission receipt instead of leaving mobile confirming',async t=>{
+ const h=setup(t,{prepare:async()=>{throw Object.assign(Error('new turn'),{code:'CONTINUATION_SUPERSEDED'});}});
+ const result=await h.co.accept('s',item(),boundary);assert.equal(result.deliveryReceipts[0].state,'removed');await h.co.drain();assert.equal(h.calls,0);
+});
+test('known pre-admission plan refusal settles the queued intent without auto-retry or a fake user receipt',async t=>{
+ const h=setup(t,{prepare:async(sid,row)=>({payload:{text:row.text,continuation:{kind:'interrupted',tailId:'I'}},queued:row}),dispatch:async()=>{throw Object.assign(Error('plan off not committed'),{code:'PLAN_MODE_UNAVAILABLE',deliveryNotAdmitted:true});}});
+ await h.co.accept('s',item(),boundary);await h.co.drain();const projection=await h.co.projection('s',{deliveryClientIds:['c']});
+ assert.equal(projection.deliveryReceipts[0].state,'removed');assert.equal(projection.deliveryReceipts[0].reason,'continuation-plan-mode-unavailable');assert.equal(projection.pendingQueue.length,0);await h.co.drain();assert.equal(h.calls,1);assert.equal(h.state.users.length,0);
+});
+
 test('v1 pending ACK follows durable complete payload and precedes DSH dispatch',async t=>{
   const h=setup(t);const ack=await h.co.accept('s',item(),boundary);assert.equal(ack.inputDeliveryVersion,1);assert.deepEqual(ack.deliveryReceipts,[{clientId:'c',state:'pending'}]);assert.equal(h.store.get('s','c').payload.text,'hello');assert.equal(h.calls,0);await h.co.drain();assert.equal(h.calls,1);
 });

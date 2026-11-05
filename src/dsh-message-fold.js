@@ -18,6 +18,7 @@
 import { deriveEventMessage, isAppendSurfaceEvent } from '@deepseek-ai/dsh-session/surface';
 import { createReasoningStream } from './reasoning-stream.js';
 import { turnDiagnosticRow, turnStateFromEvents } from './turn-error.js';
+import { advanceInterruptionMetadata } from './diagnostic-presentation.js';
 import { toCindyMessageRows, toCindyMessages, hydrateImageAttachments } from './cindy-message-row.js';
 
 /** Default page size when the controller does not ask for one. */
@@ -383,12 +384,16 @@ export function createMessageReader({
     const entries = [];
     const reasoning = createReasoningStream(sessionId);
     let lastSeq = null;
+    let nativeMetadata = null;
+    let nativeValid = true;
     for (const event of events) {
       if (event === null || typeof event !== 'object') continue;
       // Every event's seq counts, not only the ones that render: contiguity is a
       // property of the log, and a caller comparing against renders would read a
       // gap as "nothing happened here".
+      if (!Number.isSafeInteger(event.seq) || event.seq < 0 || (lastSeq !== null && event.seq !== lastSeq + 1)) nativeValid = false;
       if (Number.isFinite(event.seq)) lastSeq = event.seq;
+      nativeMetadata = advanceInterruptionMetadata(nativeMetadata, event, sessionId);
       reasoning.consume(event);
       const diagnostic = turnDiagnosticRow(event, sessionId);
       if (diagnostic) {
@@ -418,7 +423,7 @@ export function createMessageReader({
         promptClientId: promptRpcIdOf(event),
       });
     }
-    return { entries, lastSeq, reasoning };
+    return { entries, lastSeq, reasoning, nativeValid, nativeMetadata: nativeValid ? nativeMetadata : null };
   }
 
   /** Drop the least recently used transcripts, keeping the window bounded. */
@@ -498,9 +503,9 @@ export function createMessageReader({
         // invalidation also detaches this flight so a post-invalidation read starts
         // fresh; an older completion must never overwrite that newer generation.
         if (seeding.get(sessionId) === flight && !flight.dirty) {
-          touch(sessionId, { rows, reasoning: read.reasoning, seq: read.lastSeq, at: clock });
+          touch(sessionId, { rows, reasoning: read.reasoning, seq: read.lastSeq, at: clock, nativeValid: read.nativeValid, nativeMetadata: read.nativeMetadata });
         }
-        return transcripts.get(sessionId) ?? { rows, reasoning: read.reasoning };
+        return transcripts.get(sessionId) ?? { rows, reasoning: read.reasoning, nativeMetadata: read.nativeMetadata };
       } finally {
         // Failure is not an authoritative empty transcript. Release this flight
         // on success or rejection, without deleting a newer read's ownership.
@@ -552,6 +557,7 @@ export function createMessageReader({
       transcripts.delete(sessionId);
       return false;
     }
+    if (entry.nativeValid !== false) entry.nativeMetadata = advanceInterruptionMetadata(entry.nativeMetadata, event, sessionId);
     entry.seq = seq;
     entry.at = ++clock;
     entry.reasoning.consume(event);
@@ -590,7 +596,7 @@ export function createMessageReader({
   readMessages.count = countRows;
   /** Exact project-grouping evidence derived from the same folded transcript. */
   readMessages.activity = async (sessionId) => {
-    const { rows } = await ensureTranscript(sessionId);
+    const { rows, nativeMetadata } = await ensureTranscript(sessionId);
     let userSendAt = null;
     for (let index = rows.length - 1; index >= 0; index -= 1) {
       const row = rows[index];
@@ -599,7 +605,7 @@ export function createMessageReader({
         break;
       }
     }
-    return { messageCount: rows.length, userSendAt };
+    return { messageCount: rows.length, userSendAt, ...(nativeMetadata ? { interruption: nativeMetadata.interruption } : {}) };
   };
   /**
    * The whole cached transcript, newest first.

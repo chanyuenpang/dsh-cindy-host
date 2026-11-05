@@ -5,5 +5,5 @@ if (!process.env.CINDY_SOURCE_ROOT) throw new Error('Set CINDY_SOURCE_ROOT to an
 const cindy = resolve(process.env.CINDY_SOURCE_ROOT);
 const { default: upstream } = await import(pathToFileURL(join(cindy, 'apps/mobile/vitest.config.ts')).href);
 export default { ...upstream, root: fileURLToPath(new URL('../../', import.meta.url)),
-  resolve: { ...upstream.resolve, alias: { ...upstream.resolve.alias, vitest: join(cindy, 'node_modules/vitest/dist/index.js') } },
-  test: { ...upstream.test, include: ['tools/contracts/error-mobile.contract.ts'] } };
+  resolve: { ...upstream.resolve, alias: { ...upstream.resolve.alias, vitest: join(cindy, 'node_modules/vitest/dist/index.js'), 'cindy-trigger-protocol': join(cindy, 'packages/maker-shared/src/syntheticTrigger.ts') } },
+  test: { ...upstream.test, include: ['tools/contracts/*.contract.ts'] } };

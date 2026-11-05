@@ -35,7 +35,7 @@ export function createInputDeliveryCoordinator({store,backend,baseProjection=()=
       if((e.phase==='stored'||e.phase==='DSH-pending')&&e.queued){const at=pending.findIndex(p=>p.clientId===e.clientId);if(at<0)pending.push(e.queued);else pending[at]=e.queued;}
     }
     const running=runningBySession.get(sid)??base.turnInProgress;
-    return {...base,...(typeof running==='boolean'?{turnInProgress:running}:{}),sessionId:sid,pendingQueue:pending,steeringQueueClientIds:[...steering],inputDeliveryVersion:1,clearBoundaryMs:store.boundary(sid),deliveryReceipts:ids.map(clientId=>{const e=store.get(sid,clientId);return{clientId,state:e?e.phase==='removed'?'removed':e.phase==='accepted'?'accepted':e.payload===undefined?'unknown':'pending':'unknown'};})};
+    return {...base,...(typeof running==='boolean'?{turnInProgress:running}:{}),sessionId:sid,pendingQueue:pending,steeringQueueClientIds:[...steering],inputDeliveryVersion:1,clearBoundaryMs:store.boundary(sid),deliveryReceipts:ids.map(clientId=>{const e=store.get(sid,clientId);return{clientId,state:e?e.phase==='removed'?'removed':e.phase==='accepted'?'accepted':e.payload===undefined?'unknown':'pending':'unknown',...(e?.removalReason?{reason:e.removalReason}:{})};})};
   }
   async function evidence(sid){
     const proof=await backend.evidence(sid);
@@ -85,7 +85,16 @@ export function createInputDeliveryCoordinator({store,backend,baseProjection=()=
         proof=await evidence(sid);
         const settled=store.get(sid,current.clientId);
         if(!terminal(settled.phase))save({...settled,phase:proof.inbox.some(item=>item.clientId===current.clientId)?'DSH-pending':'claimed',error:null});
-      }catch(error){const e=store.get(sid,current.clientId);if(!terminal(e.phase))save({...e,...(error.deliveryNotAdmitted?{phase:'stored',...(error.deliveryRetryMode?{payload:{...e.payload,mode:error.deliveryRetryMode}}:{}),nextAttemptAt:now()+Math.min(30000,1000*2**Math.min(e.attemptNo??1,5))}:{}),error:String(error?.code??'DELIVERY_ADMISSION_UNCERTAIN')});onError(error);if(error.deliveryNotAdmitted){notify(sid);break;}}
+      }catch(error){const e=store.get(sid,current.clientId);
+        if(error.deliverySuperseded||(error.deliveryNotAdmitted&&error.code==='PLAN_MODE_UNAVAILABLE')){
+          const checked=await evidence(sid);const latest=store.get(sid,current.clientId);
+          if(latest.phase==='accepted')continue;
+          // Fresh native ownership wins over this attempt's early refusal. Never
+          // roll DSH-pending back to stored and accidentally permit re-admission.
+          if(checked.inbox.some(item=>item.clientId===current.clientId)){notify(sid);onError(error);break;}
+          save({...latest,phase:'removed',payload:null,error:error.code,removalReason:error.deliverySuperseded?'continuation-superseded':'continuation-plan-mode-unavailable'});notify(sid);continue;
+        }
+        if(!terminal(e.phase))save({...e,...(error.deliveryNotAdmitted?{phase:'stored',...(error.deliveryRetryMode?{payload:{...e.payload,mode:error.deliveryRetryMode}}:{}),nextAttemptAt:now()+Math.min(30000,1000*2**Math.min(e.attemptNo??1,5))}:{}),error:String(error?.code??'DELIVERY_ADMISSION_UNCERTAIN')});onError(error);if(error.deliveryNotAdmitted){notify(sid);break;}}
       notify(sid);
     }
   }
@@ -115,14 +124,24 @@ export function createInputDeliveryCoordinator({store,backend,baseProjection=()=
         if(row.durableDelivery===true && !hasBoundary)throw deliveryError('INVALID_PARAMS','Durable input requires expectedClearBoundaryMs, including explicit null');
         const expectedBoundary=hasBoundary?options.expectedClearBoundaryMs:store.boundary(sid);
         if(!e && expectedBoundary!==store.boundary(sid))throw deliveryError('REMOTE_OPTIMISTIC_INPUT_CLEARED','REMOTE_OPTIMISTIC_INPUT_CLEARED: input clear boundary changed');
-        const prepared=await backend.prepare(sid,row,options);
+        const refuseContinuation = reason => {
+          const existing=store.get(sid,row.clientId);
+          if(existing?.phase==='removed')return view(sid,[row.clientId]);
+          if(existing)throw deliveryError('INPUT_DELIVERY_CONFLICT','clientId already belongs to an existing input');
+          save({sessionId:sid,clientId:row.clientId,phase:'removed',request:requestShape(row),rawFingerprint:raw,payload:null,queued:null,clearBoundaryMs:store.boundary(sid),createdAt:now(),attemptNo:0,cancelRequested:true,removalReason:reason});
+          notify(sid);return view(sid,[row.clientId]);
+        };
+        let prepared;
+        try{prepared=await backend.prepare(sid,row,options);}catch(error){if(error.code==='CONTINUATION_SUPERSEDED')return refuseContinuation('continuation-superseded');throw error;}
         if(!prepared || prepared.payload===undefined || !prepared.queued)throw deliveryError('DELIVERY_PREPARATION_FAILED','Host did not obtain complete replayable input');
         const {consumed: _transit,mode: _mode,...semanticPayload}=prepared.payload;const fingerprint=inputFingerprint(semanticPayload);e=store.get(sid,row.clientId);
         if(e){if(e.phase==='removed')return view(sid,[row.clientId]);if(e.fingerprint!==fingerprint)throw deliveryError('INPUT_DELIVERY_CONFLICT','clientId already belongs to a different input');return view(sid,[row.clientId]);}
         if(expectedBoundary!==store.boundary(sid))throw deliveryError('REMOTE_OPTIMISTIC_INPUT_CLEARED','REMOTE_OPTIMISTIC_INPUT_CLEARED: input was cleared during preparation');
+        const origin=prepared.payload.continuation;
+        if(origin&&store.list(sid).some(other=>other.clientId!==row.clientId&&other.phase!=='removed'&&other.continuation?.tailId===origin.tailId))return refuseContinuation('continuation-already-submitted');
         const preview=view(sid,[row.clientId]);preview.pendingQueue=[...preview.pendingQueue,prepared.queued];preview.deliveryReceipts=[{clientId:row.clientId,state:'pending'}];
         if(!validateProjection(preview))throw deliveryError('DELIVERY_TOO_LARGE','Input queue projection cannot fit the negotiated transport budget');
-        save({sessionId:sid,clientId:row.clientId,phase:'stored',request:requestShape(row),rawFingerprint:raw,fingerprint,payload:prepared.payload,queued:prepared.queued,clearBoundaryMs:store.boundary(sid),sendAtMs:options.sendAtMs??null,createdAt:now(),attemptNo:0,cancelRequested:false});
+        save({sessionId:sid,clientId:row.clientId,phase:'stored',request:requestShape(row),rawFingerprint:raw,fingerprint,payload:prepared.payload,...(origin?{continuation:origin}:{}),queued:prepared.queued,clearBoundaryMs:store.boundary(sid),sendAtMs:options.sendAtMs??null,createdAt:now(),attemptNo:0,cancelRequested:false});
         notify(sid);schedule(sid);return view(sid,[row.clientId]);
       });
     },

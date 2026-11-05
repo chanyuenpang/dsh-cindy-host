@@ -5,7 +5,7 @@ export const SETTINGS_NAMESPACE = 'dsh-cindy-host';
 // Controller-only delete/pin metadata and legacy archive flags survive restart.
 // New archive/unarchive operations persist in DSH's native workspace registry;
 // legacy archived flags are retained until explicitly retired (see `session-flags.js`).
-export const DEFAULT_HOST_SETTINGS = Object.freeze({ transportEnabled: false, remoteControlEnabled: false, controllers: {}, deviceId: '', deviceName: '', sessionFlags: {} });
+export const DEFAULT_HOST_SETTINGS = Object.freeze({ transportEnabled: false, remoteControlEnabled: false, controllers: {}, deviceId: '', deviceName: '', sessionFlags: {}, diagnosticPresentationV1: {} });
 
 /**
  * The Host's own relay identity, when it has one.
@@ -46,6 +46,20 @@ export function validateHostSettings(value) {
   }
   // An absent section is valid — every settings file written before this field
   // existed has none, and rejecting it would fail the load instead of the flag.
+  if (value.diagnosticPresentationV1 !== undefined) {
+    const record = entry => entry !== null && typeof entry === 'object' && !Array.isArray(entry);
+    const data=value.diagnosticPresentationV1;
+    if(!record(data))throw new Error('Invalid diagnostic presentation preferences');
+    for(const sessions of Object.values(data)){
+      if(!record(sessions))throw new Error('Invalid diagnostic owner preferences');
+      for(const kinds of Object.values(sessions)){
+        if(!record(kinds))throw new Error('Invalid diagnostic session preferences');
+        for(const [kind,ids] of Object.entries(kinds)){
+          if(!['errors','interruptions'].includes(kind)||!record(ids)||Object.values(ids).some(flag=>typeof flag!=='boolean'))throw new Error('Invalid diagnostic dismissal preferences');
+        }
+      }
+    }
+  }
   if (value.sessionFlags !== undefined) {
     if (value.sessionFlags === null || typeof value.sessionFlags !== 'object') throw new Error('Invalid session flags');
     for (const [sessionId, flags] of Object.entries(value.sessionFlags)) {

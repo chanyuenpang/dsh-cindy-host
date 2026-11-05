@@ -79,12 +79,11 @@ const DECLINED = [
     // Ahead of the general `local-db:sessions:` rule because this one is not a read:
     // both clients call it when the user dismisses an "this session was interrupted"
     // banner, and the reason for refusing is about *state this Host does not track*.
-    match: (channel) => channel.startsWith('local-db:sessions:interrupted-pending') || channel.startsWith('local-db:sessions:ack-interrupted'),
+    match: (channel) => channel.startsWith('local-db:sessions:interrupted-pending'),
     why: 'the interrupted-turn attention flag and its acknowledgement — this Host tracks no such flag: DSH repairs an interrupted turn itself on resume (writing the turn/end and the synthetic tool result, both already visible in the transcript), so there is nothing here to acknowledge',
   },
   { match: (channel) => channel.startsWith('local-db:sessions:'), why: 'only list/get/patch-meta are implemented; other session reads are not' },
   { match: (channel) => channel.startsWith('local-db:messages:work-details'), why: 'the history view\'s detail read; refusing it keeps the phone on the paged transcript this Host does serve' },
-  { match: (channel) => channel.startsWith('local-db:messages:dismiss-error'), why: 'a client-side error affordance with no DSH counterpart' },
   { match: (channel) => channel.startsWith('maker:goal:') && !['maker:goal:get-status', 'maker:goal:set', 'maker:goal:pause', 'maker:goal:resume', 'maker:goal:clear', 'maker:goal:update'].includes(channel), why: 'goal reads/writes beyond the implemented set' },
   { match: (channel) => channel.startsWith('maker:rewind') || channel.startsWith('maker:fork'), why: 'in-place rewind and strip-encrypted fork are not the ordinary native prefix-fork subset' },
   { match: (channel) => channel.startsWith('maker:subagent') || channel.startsWith('maker:get-session-tree') || channel.startsWith('maker:navigate-session-tree'), why: 'subagent/session-tree family — plan rule' },
@@ -99,7 +98,7 @@ const DECLINED = [
     // retry/dismiss affordances cannot appear at all. DSH's own turn/end reasons observed
     // across this deployment's session logs are completed/interrupted/aborted/blocked;
     // there is no failure reason to translate yet.
-    match: (channel) => channel.startsWith('maker:input:retry-last-error') || channel.startsWith('maker:input:clear-error') || channel.startsWith('local-db:messages:dismiss-error'),
+    match: (channel) => channel.startsWith('maker:input:retry-last-error') || channel.startsWith('maker:input:clear-error'),
     why: 'native turn errors exist and source history exposes a safe terminal hint, but Cindy trailing-error-row retry/dismiss semantics have no verified native adapter; never infer absence of failures',
     candidate: 'would need two halves: map a failed turn to a trailing `role: \'error\'` row, and serve retry as a re-send of the last user prompt (or the shared continue prompt when the failed turn already produced output)',
   },

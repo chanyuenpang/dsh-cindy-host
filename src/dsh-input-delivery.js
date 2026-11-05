@@ -1,6 +1,8 @@
 import { createAttachmentMaterializer, hostAttachmentsOf } from './host-attachments.js';
 import { foldSessionEvent } from './dsh-message-fold.js';
 import { interruptedTurnClosers } from '@deepseek-ai/dsh-session';
+import { turnStateFromEvents } from './turn-error.js';
+import { continuationKind } from './continuation-protocol.js';
 import { queuedRowFromController } from './host-input-queue.js';
 import { deliveryError } from './host-input-delivery-store.js';
 import { assertNoStructuredSessionReferences } from './session-reference-boundary.js';
@@ -23,7 +25,7 @@ export function durableInputEvidence(events,sessionId) {
   const inbox=Object.entries(queues).flatMap(([placement,items])=>items.map(message=>({id:message.id,clientId:message.source?.kind==='user'&&typeof message.source.rpcId==='string'?message.source.rpcId:message.id,placement,message,foreign:message.source?.kind!=='user'})));
   return {sessionId,users,inbox,throughSeq:events.length-1};
 }
-export function createDshInputDeliveryBackend({getServices,sessionController,getSession}){
+export function createDshInputDeliveryBackend({getServices,sessionController,getSession,ensurePlanModeOff}){
   let active=true;
   function services(){if(!active)throw deliveryError('DELIVERY_BACKEND_STOPPED','Input delivery service was detached');const s=getServices();if(!s.sessions||typeof s.sessions.flush!=='function'||!s.persistence||typeof s.persistence.open!=='function')throw deliveryError('DELIVERY_NOT_AVAILABLE','Durable DSH session services are not mounted');return s;}
   async function readLog(sid){
@@ -34,6 +36,17 @@ export function createDshInputDeliveryBackend({getServices,sessionController,get
   }
   async function agentFor(sid){const resolved=await sessionController.resolveAgent(sid);if(resolved?.error)throw resolved.error;if(!resolved?.agent)throw deliveryError('DELIVERY_AGENT_UNAVAILABLE','DSH did not resolve an agent');return resolved.agent;}
   async function flush(sid){const s=services();const session=s.sessions.get(sid);if(!session||!await s.sessions.flush(session))throw deliveryError('DELIVERY_DURABILITY_UNAVAILABLE','Cannot verify the DSH mutation durability');}
+  async function continuationTail(sid,kind,clientId) {
+    const persisted=await readLog(sid); const s=services();
+    const agent=s.agents?.get(sid);
+    if(agent?.status==='running')throw deliveryError('CONTINUATION_SUPERSEDED','The session has already started another turn');
+    const events=!s.sessions.get(sid)&&!agent?[...persisted,...interruptedTurnClosers(persisted)]:persisted;
+    const state=turnStateFromEvents(events,sid);
+    const id=kind==='interrupted'?state?.interruption?.id:state?.error?.clientId;
+    if(!id||state.running||events.some(event=>event.seq>state.boundarySeq&&event.type==='user/message'&&event.data?.source?.kind==='user'&&event.data.source.rpcId!==clientId)
+      ||durableInputEvidence(persisted,sid).inbox.some(item=>item.clientId!==clientId))throw deliveryError('CONTINUATION_SUPERSEDED','The original continuation tail is no longer current');
+    return id;
+  }
   const backend={
     available(){try{services();return true;}catch{return false;}},
     stop(){active=false;},
@@ -54,13 +67,26 @@ export function createDshInputDeliveryBackend({getServices,sessionController,get
       const materializer=createAttachmentMaterializer({fileSystem:getServices().fileSystem,resolveAttachmentRef,captureOnly:true});
       const owned=await materializer.materialize({attachments:incoming,signal:AbortSignal.timeout(30000)});
       if(owned.dropped.length)throw deliveryError('ATTACHMENT_UNAVAILABLE','Cannot durably receive all attachments: '+owned.dropped.map(x=>x.reason).join(', '));
+      const kind=continuationKind(text);
+      const continuation=kind?{kind,tailId:await continuationTail(sid,kind,row.clientId)}:null;
+      if(continuation&&row.createOpts?.planMode!==false)throw deliveryError('INVALID_PARAMS','Manual continuation requires explicit planMode:false');
       const queued=queuedRowFromController({clientId:row.clientId,text,session});if(!queued)throw deliveryError('DELIVERY_SESSION_UNAVAILABLE','Session working directory is unavailable');
-      return {payload:{text,assets:owned.parts,consumed:owned.consumed,mode},queued:{...queued,files:incoming,chatMessage:{...queued.chatMessage,...(row.chatMessage?.images?{images:row.chatMessage.images}:{})}}};
+      return {payload:{text,assets:owned.parts,consumed:owned.consumed,mode,...(continuation?{continuation}: {})},queued:{...queued,...(continuation?{createOpts:{...queued.createOpts,planMode:false}}:{}),files:incoming,chatMessage:{...queued.chatMessage,...(row.chatMessage?.images?{images:row.chatMessage.images}:{})}}};
     },
     async dispatch(entry,{releaseAttachmentRef}={}){
       assertNoStructuredSessionReferences(entry.request,entry.payload);
       let agent;
       try{agent=await agentFor(entry.sessionId);}catch(error){error.deliveryNotAdmitted=true;throw error;}
+      if(entry.payload.continuation) {
+        try {
+          const origin=entry.payload.continuation;
+          if(await continuationTail(entry.sessionId,origin.kind,entry.clientId)!==origin.tailId)throw deliveryError('CONTINUATION_SUPERSEDED','A newer task superseded this manual continuation');
+          if(typeof ensurePlanModeOff!=='function')throw deliveryError('PLAN_MODE_UNAVAILABLE','Cannot verify native plan mode is off');
+          await ensurePlanModeOff({sessionId:entry.sessionId,agent});
+          if(await continuationTail(entry.sessionId,origin.kind,entry.clientId)!==origin.tailId)throw deliveryError('CONTINUATION_SUPERSEDED','A newer task superseded this manual continuation');
+          services();
+        } catch(error) { error.deliveryNotAdmitted=true; if(error.code==='CONTINUATION_SUPERSEDED')error.deliverySuperseded=true; throw error; }
+      }
       const content=entry.payload.text?[{type:'text',text:entry.payload.text}]:[];
       for(const asset of entry.payload.assets??[]){
         if(asset.mediaType)content.push({type:'image',mediaType:asset.mediaType,data:asset.data,name:asset.name});

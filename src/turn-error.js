@@ -1,4 +1,5 @@
 /** Display-only native turn diagnostics. DSH owns failure, recovery and retry policy. */
+import { advanceInterruptionMetadata } from './diagnostic-presentation.js';
 const SAFE_MESSAGES = new Map([
   ['AUTH', 'Model authentication failed. Check the provider configuration.'],
   ['ACCOUNT_SIGNED_OUT', '任务已因退出 DeepSeek 登录而停止。'],
@@ -92,6 +93,7 @@ export function turnDiagnosticRow(event, sessionId) {
 
 /** Notices close the running flag without pretending cancellation is a model failure. */
 export function turnDiagnosticPayload(row) {
+  if (row.role === 'error' && row.content?.dismissed === true) return { sessionId: row.sessionId, persistId: row.clientId, event: { type: 'done', data: { reason: 'dsh-dismissed-error' } } };
   return row.role === 'error' ? turnErrorPayload(row) : { sessionId: row.sessionId, persistId: row.clientId,
     event: { type: 'done', data: { message: row.content, reason: 'dsh-turn-notice' } } };
 }
@@ -100,6 +102,7 @@ export function turnDiagnosticPayload(row) {
 export function turnStateFromEvents(events, sessionId) {
   if (!Array.isArray(events)) throw new TypeError('Native turn recovery requires a session event snapshot');
   let boundary = null;
+  let nativeMetadata = null;
   let retryNotice = null;
   let seq = -1;
   for (const event of events) {
@@ -108,17 +111,18 @@ export function turnStateFromEvents(events, sessionId) {
       throw new TypeError('Native turn recovery requires ordered unique event sequences');
     }
     seq = event.seq;
+    nativeMetadata = advanceInterruptionMetadata(nativeMetadata, event, sessionId);
     if (event.type === 'turn/start' || event.type === 'turn/end') { boundary = event; retryNotice = null; }
     else if (['step/start', 'assistant/message'].includes(event.type)) retryNotice = null;
     else if (boundary?.type === 'turn/start' && boundary.data?.turn === event.data?.turn
       && ['llm/retry', 'llm/retry-started'].includes(event.type)) retryNotice = turnDiagnosticRow(event, sessionId);
   }
   if (!boundary) return null;
-  if (boundary.type === 'turn/start') return { seq, boundarySeq: boundary.seq, running: true, error: null, ...(retryNotice ? { retryNotice } : {}) };
+  if (boundary.type === 'turn/start') return { seq, boundarySeq: boundary.seq, running: true, error: null, nativeMetadata, ...(retryNotice ? { retryNotice } : {}) };
   const diagnostic = turnDiagnosticRow(boundary, sessionId);
   const error = diagnostic?.role === 'error' ? diagnostic : null;
   // A malformed failure is not evidence of a successful ending.
   if (boundary.data?.reason?.kind === 'error' && !error) throw new TypeError('Invalid native failed-turn identity');
   if (['interrupted', 'max-tokens', 'blocked', 'aborted'].includes(boundary.data?.reason?.kind) && !diagnostic) throw new TypeError('Invalid native turn-notice identity');
-  return { seq, boundarySeq: boundary.seq, running: false, error, ...(diagnostic?.role === 'system' ? { notice: diagnostic } : {}) };
+  return { seq, boundarySeq: boundary.seq, running: false, error, nativeMetadata, interruption: nativeMetadata?.interruption ?? null, ...(diagnostic?.role === 'system' ? { notice: diagnostic } : {}) };
 }

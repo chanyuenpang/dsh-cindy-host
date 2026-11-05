@@ -4,15 +4,19 @@ A Host-side adapter connecting current Cindy clients to DeepSeek Harness.
 
 ## Requirements and installation
 
-Version **0.1.35** adds native interruption, cancellation, output-limit and retry notices, cold-session diagnostic recovery and canonical tool-result pairing. It retains 0.1.34's question synchronization and safe model-failure display, plus the earlier regional authentication, reasoning streaming and native capability subsets.
+Version **0.1.36** adds native interruption banner/status metadata, owner-scoped interruption acknowledgement and error dismissal, and guarded manual continuation with verified native plan-mode off. It retains the earlier safe diagnostics, question synchronization, authentication, reasoning streaming and native capability subsets.
 
 It supports the exact **DSH 0.2.2-alpha.2** carrier, while retaining `0.2.1-rc.3`, `0.2.1-rc.4` and `0.2.1-rc.5`. Alpha requires **Node.js >=24.9** (tested with 24.12); the older carriers retain this plugin's Node.js >=22.16 minimum. Agent/session/settings peers and alpha Schemastery are explicitly allowed, not a blanket promise for future prereleases. The full Web installation gate uses DSH **0.2.1-rc.5**; alpha core-contract checks do not establish alpha Web/relay/handset acceptance. Install through the Desktop DSH plugin manager. CLI-managed profiles can use:
 
 ```sh
-dsh plugin --profile <profile> add dsh-cindy-host@0.1.35
+dsh plugin --profile <profile> add dsh-cindy-host@0.1.36
 ```
 
 Reload the Host plugin after installation. A full DSH restart is separate. Keep existing Cindy sign-in, device identity and settings; do not run two Host processes with the same identity.
+
+## 0.1.36: interruption controls
+
+The existing Cindy acknowledgement/dismissal actions update owner-scoped display preferences, not failure or completion facts. Manual continuation is a new human input; it verifies the current native tail and effective plan-mode off rather than retrying old tool calls. These changes are Host-only: Cindy is a read-only protocol/test dependency. See the [diagnostic protocol and limitations](<doc/model-errors.md>) for persistence, concurrency and current-client boundaries. Source contracts do not establish live-handset acceptance.
 
 ## 0.1.32: credentials without keytar
 

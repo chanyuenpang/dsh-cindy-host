@@ -207,7 +207,7 @@ export function createSessionControllerSource({
       const value = result.value;
       if (!Number.isFinite(value?.messageCount) || value.messageCount < 0) return;
       if (value.userSendAt !== null && typeof value.userSendAt !== 'string') return;
-      const evidence = { messageCount: Math.floor(value.messageCount), userSendAt: value.userSendAt };
+      const evidence = { messageCount: Math.floor(value.messageCount), userSendAt: value.userSendAt, ...(Object.hasOwn(value, 'interruption') ? { interruption: value.interruption } : {}) };
       activityEvidenceCache.set(ids[index], evidence);
       out?.set(ids[index], evidence);
     });
@@ -359,7 +359,7 @@ export function createSessionControllerSource({
           ...(typeof selectedProvider === 'string' && selectedProvider !== '' ? { providerId: selectedProvider } : {}),
           ...(typeof selectedEffort === 'string' && selectedEffort !== '' ? { effort: selectedEffort } : {}),
           ...(currentPermission === undefined ? {} : { permissionMode: currentPermission }),
-          ...(activity === undefined ? {} : { messageCount: activity.messageCount, userSendAt: activity.userSendAt }),
+          ...(activity === undefined ? {} : { messageCount: activity.messageCount, userSendAt: activity.userSendAt, ...(Object.hasOwn(activity, 'interruption') ? { interruption: activity.interruption } : {}) }),
           blank: item.blank === true,
         };
       });

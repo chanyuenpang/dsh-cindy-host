@@ -232,6 +232,7 @@ test('activity evidence uses the folded rows and first durable user timestamp', 
   assert.deepEqual(await reader.activity('s1'), {
     messageCount: 2,
     userSendAt: new Date(1_000).toISOString(),
+    interruption: null,
   });
   assert.equal(await reader.count('s1'), 2);
   assert.equal(reads, 1, 'activity and count reuse one transcript fold');

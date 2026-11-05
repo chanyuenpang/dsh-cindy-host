@@ -4,9 +4,11 @@ import { startHost } from '../src/host.js';
 import { FixtureDshSource } from '../src/fixture-source.js';
 import { createMessageReader, foldSessionEvent } from '../src/dsh-message-fold.js';
 import { turnStateFromEvents } from '../src/turn-error.js';
+import { diagnosticSettings } from './support/diagnostic-settings.js';
 
 const ON = { transportEnabled: true, remoteControlEnabled: true, controllers: {} };
 const tick = () => new Promise(resolve => setImmediate(resolve));
+function deferred() { let resolve; const promise=new Promise(r=>{resolve=r;}); return {promise,resolve}; }
 const start = seq => ({ type: 'turn/start', seq, time: 1000 + seq * 1000, data: { turn: 1 } });
 const fail = seq => ({ type: 'turn/end', seq, time: 1000 + seq * 1000, data: { turn: 1, reason: { kind: 'error',
   error: { message: 'SECRET credential and provider prose', code: 'RATE_LIMIT', status: 429, requestId: 'SECRET' } } } });
@@ -18,7 +20,7 @@ class Socket {
   send(data) { this.sent.push(JSON.parse(data)); }
   close() {}
 }
-async function setup(events = [], customize = () => {}) {
+async function setup(events = [], customize = () => {}, ports = {}) {
   const socket = new Socket(); const source = new FixtureDshSource();
   const state = { running: false };
   source.listSessionStates = async id => [{ id: id ?? 's1', running: state.running }];
@@ -28,20 +30,105 @@ async function setup(events = [], customize = () => {}) {
   const runtime = await startHost(source, ON, {
     resolveSession: async () => ({ ok: true, session: { deviceId: 'host' } }),
     openSocket: () => socket, heartbeatMs: 0, listDevices: async () => ({ devices: [] }),
-    resolveCapabilities: () => ({ readMessages: reader }),
+    resolveCapabilities: () => ({ readMessages: reader, readAllMessages: sid => reader.all(sid) }),
+    ...ports,
   });
   socket.emit('open');
   socket.frame({ v: 1, kind: 'hello-ack', payload: { serverProtocolVersion: 1, deviceId: 'host', userId: 'account' } });
   let id = 0;
   const invoke = async (channel, args, src = 'phone') => {
-    socket.frame({ v: 1, kind: 'invoke', id: `req-${++id}`, src, payload: { channel, args } });
+    const requestId = `req-${++id}`;
+    socket.frame({ v: 1, kind: 'invoke', id: requestId, src, payload: { channel, args } });
     await tick();
+    return socket.sent.find(frame => frame.kind === 'invoke-result' && frame.id === requestId)?.payload;
   };
   const subscribe = (topics = ['session:s1'], src = 'phone') => invoke('device-link:subscribe', [{ topics }], src);
   return { runtime, socket, source, reader, state, invoke, subscribe };
 }
+const pushes = (socket, channel) => socket.sent.filter(frame => frame.kind === 'push' && frame.payload.channel === channel);
 const terminals = socket => socket.sent.filter(frame => frame.kind === 'push' && frame.payload.channel === 'maker:event'
   && ['done', 'error'].includes(frame.payload.payload.event.type));
+
+test('listing reads diagnostic settings once per page, not once per session',async()=>{
+ let reads=0;const x=await setup([], (reader,source)=>{source.listSessions=async()=>Array.from({length:100},(_,n)=>({id:`s${n}`,cwd:'/repo',running:false,interruption:null}));},
+ {diagnosticPreferences:{snapshot:()=>{reads++;return{};}}});
+ try{reads=0;const reply=await x.invoke('local-db:sessions:list',[]);assert.equal(reply.ok,true);assert.ok(reads<=3,`unexpected per-row settings traversal: ${reads}`);}finally{await x.runtime.stop();}
+});
+
+test('a cold first listing carries native interruption evidence without a detail subscription', async()=>{
+ const events=[start(0),{...fail(1),data:{turn:1,reason:{kind:'interrupted'}}}];
+ const x=await setup(events,(reader,source)=>{source.listSessions=async()=>[{id:'s1',cwd:'/work',running:false,...await reader.activity('s1')}];});
+ try{const reply=await x.invoke('local-db:sessions:list',[]);assert.equal(reply.ok,true);assert.equal(reply.result.find(row=>row.id==='s1').interruptedTurnStartedAt,1000);}finally{await x.runtime.stop();}
+});
+
+test('a persisted interruption observed without its old start refreshes metadata for list-only watchers',async()=>{
+ const events=[start(0),{...fail(1),data:{turn:1,reason:{kind:'interrupted'}}}];const x=await setup(events);
+ try{await x.invoke('device-link:subscribe',[{topics:['sessions']}]);x.runtime.pushTurnIdle('s1',events[1]);await tick();await tick();
+  const last=pushes(x.socket,'local-db:sessions:patched').at(-1);assert.equal(last.payload.payload.patch.interruptedTurnStartedAt,1000);
+ }finally{await x.runtime.stop();}
+});
+
+test('native interruption get/list metadata and durable ignore RPC share one pending identity', async () => {
+ const pref=diagnosticSettings();const events=[start(0),{...fail(1),data:{turn:1,reason:{kind:'interrupted'}}}];
+ const x=await setup(events,()=>{}, {diagnosticPreferences:pref.preferences});
+ try{
+  await x.subscribe();let reply=await x.invoke('local-db:sessions:get',['s1']);
+  assert.equal(reply.ok,true);assert.equal(reply.result.activeTurnStartedAt,1000);assert.equal(reply.result.interruptedTurnStartedAt,1000);
+  const ack=await x.invoke('local-db:sessions:ack-interrupted',['s1']);assert.equal(ack.ok,true);
+  reply=await x.invoke('local-db:sessions:get',['s1']);assert.equal(reply.result.activeTurnStartedAt,null);
+  assert.equal(pref.state.writes,1);
+  assert.equal((await x.reader.all('s1')).filter(row=>row.role==='system').length,1,'ignore does not rewrite diagnostic history');
+  events.push({...start(2),data:{turn:2}},{...fail(3),data:{turn:2,reason:{kind:'interrupted'}}});
+  x.reader.invalidate('s1');reply=await x.invoke('local-db:sessions:get',['s1']);assert.equal(reply.result.activeTurnStartedAt,3000);
+ }finally{await x.runtime.stop();}
+});
+
+test('error dismissal is durable and projects message flags; unavailable storage is not acknowledged', async()=>{
+ const pref=diagnosticSettings();const x=await setup([start(0),fail(1)],()=>{}, {diagnosticPreferences:pref.preferences});
+ try{
+  await x.subscribe();let reply=await x.invoke('local-db:messages:dismiss-error',['s1','s1:turn-error:1']);assert.equal(reply.ok,true);
+  reply=await x.invoke('local-db:messages:list',['s1']);assert.equal(reply.result[0].content.dismissed,true);
+  assert.equal((await x.reader.all('s1'))[0].content.dismissed,undefined);
+  x.socket.sent.length=0;await x.invoke('device-link:unsubscribe',[{topics:['session:s1']}]);await x.subscribe();
+  assert.equal(terminals(x.socket).filter(frame=>frame.payload.payload.event.type==='error').length,0,'ignored errors do not re-open a live error banner on reconnect');
+  reply=await x.invoke('local-db:messages:dismiss-error',['s1','missing']);assert.equal(reply.ok,false);
+ }finally{await x.runtime.stop();}
+ const unavailable=await setup([start(0),{...fail(1),data:{turn:1,reason:{kind:'interrupted'}}}]);
+ try{await unavailable.subscribe();assert.equal((await unavailable.invoke('local-db:sessions:ack-interrupted',['s1'])).ok,false);}finally{await unavailable.runtime.stop();}
+});
+
+
+test('an old interruption confirmation settling after a new interrupted turn cannot dismiss the new identity', async()=>{
+ const pref=diagnosticSettings();const gate=deferred();pref.state.beforeWrite=()=>gate.promise;
+ const events=[start(0),{...fail(1),data:{turn:1,reason:{kind:'interrupted'}}}];
+ const x=await setup(events,()=>{}, {diagnosticPreferences:pref.preferences});
+ try{
+  await x.subscribe();await x.invoke('local-db:sessions:ack-interrupted',['s1']);
+  const nextStart={...start(2),data:{turn:2}},nextEnd={...fail(3),data:{turn:2,reason:{kind:'interrupted'}}};
+  events.push(nextStart,nextEnd);x.reader.invalidate('s1');x.runtime.pushTurnRunning('s1',nextStart);x.runtime.pushTurnIdle('s1',nextEnd);
+  gate.resolve();await tick();await tick();
+  const reply=await x.invoke('local-db:sessions:get',['s1']);assert.equal(reply.ok,true);assert.equal(reply.result.activeTurnStartedAt,3000);
+  const last=pushes(x.socket,'local-db:sessions:patched').at(-1)?.payload.payload.patch;assert.equal(last.activeTurnStartedAt,3000);
+ }finally{gate.resolve();await x.runtime.stop();}
+});
+
+for (const transition of ['revoke','replace-source','stop']) test(`diagnostic confirmation does not publish into an expired ${transition} scope`, async()=>{
+ const pref=diagnosticSettings();const gate=deferred();pref.state.beforeWrite=()=>gate.promise;
+ const x=await setup([start(0),{...fail(1),data:{turn:1,reason:{kind:'interrupted'}}}],()=>{}, {diagnosticPreferences:pref.preferences});
+ try{
+  await x.subscribe();await x.invoke('local-db:sessions:ack-interrupted',['s1']);
+  if(transition==='revoke')await x.runtime.updateSettings({...ON,controllers:{phone:{state:'revoked'}}});
+  else if(transition==='replace-source')await x.runtime.setSource(new FixtureDshSource());
+  else await x.runtime.stop();
+  const before=pushes(x.socket,'local-db:sessions:patched').length;gate.resolve();await tick();await tick();
+  assert.equal(pushes(x.socket,'local-db:sessions:patched').length,before);
+ }finally{gate.resolve();await x.runtime.stop();}
+});
+
+test('failed diagnostic settings write leaves the original interruption pending after fresh synchronization',async()=>{
+ const pref=diagnosticSettings();pref.state.fail=true;const x=await setup([start(0),{...fail(1),data:{turn:1,reason:{kind:'interrupted'}}}],()=>{}, {diagnosticPreferences:pref.preferences});
+ try{await x.subscribe();assert.equal((await x.invoke('local-db:sessions:ack-interrupted',['s1'])).ok,false);const row=(await x.invoke('local-db:sessions:get',['s1'])).result;assert.equal(row.activeTurnStartedAt,1000);assert.deepEqual(pref.state.value,{});}finally{await x.runtime.stop();}
+});
 
 test('live failure emits the stable terminal error once, never done or unwatched detail', async () => {
   const x = await setup();
