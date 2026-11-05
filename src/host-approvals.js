@@ -15,7 +15,9 @@
  *
  * Outcomes are DSH's own vocabulary (`'allowed-once' | 'rejected' | 'cancelled' |
  * 'unavailable'`), not the controller's: `'allowed-once'` is the only grant DSH
- * defines, so every non-allow answer maps to `'rejected'`.
+ * defines, so every non-allow answer maps to `'rejected'`. Structured questions
+ * are registered independently of watching and have no Host timeout; their
+ * caller's cancellation is propagated as a question failure.
  */
 
 /** The controller's interaction kind for a permission question. */
@@ -145,17 +147,20 @@ export function createApprovalRegistry({
   /**
    * Register one pending interaction and hand back its lifetime controls.
    *
-   * Both seams go through here so their timeouts, aborts and dismissals behave
-   * identically — a question that can hang a turn deserves the same care as an
-   * approval that can.
+   * Both seams share single settlement and dismissal. Permission waits have a
+   * deadline; structured questions follow the calling task's lifetime only.
    */
-  function register({ sessionId, request, prefix, signal, answerOf }) {
+  function register({ sessionId, request, signal, answerOf, waitMs = timeoutMs }) {
     let settle;
-    const answered = new Promise((resolve) => {
+    let reject;
+    const answered = new Promise((resolve, fail) => {
       settle = resolve;
+      reject = fail;
     });
+    // The upstream signal may already be aborted before the async caller attaches.
+    void answered.catch(() => {});
 
-    const finish = (outcome) => {
+    const finish = (outcome, error) => {
       const entry = pending.get(request.requestId);
       if (entry === undefined) return;
       pending.delete(request.requestId);
@@ -180,22 +185,31 @@ export function createApprovalRegistry({
           kind: request.kind,
         });
       }
-      settle(outcome);
+      if (error !== undefined) reject(error);
+      else settle(outcome);
+    };
+    const cancel = (reason) => {
+      if (request.kind !== QUESTION_KIND) return finish(answerOf.cancelled);
+      const error = reason?.name === 'UserQuestionError' ? reason : Object.assign(
+        new Error('ask_user_question was cancelled', { cause: reason }),
+        { name: 'UserQuestionError', code: 'ASK_ABORTED' },
+      );
+      finish(undefined, error);
     };
 
-    // The asker withdrawing the question settles it immediately, and a late
-    // answer from the controller is then discarded by `finish`'s guard.
-    const onAbort = signal === undefined ? null : () => finish(answerOf.cancelled);
+    // Withdrawals end the wait, but are never an empty successful answer.
+    const onAbort = signal === undefined ? null : () => cancel(signal.reason);
     if (onAbort !== null) signal.addEventListener('abort', onAbort, { once: true });
 
-    const timer = timeoutMs > 0
-      ? setTimer(() => finish(answerOf.cancelled), timeoutMs)
+    const timer = waitMs > 0
+      ? setTimer(() => cancel(), waitMs)
       : null;
     if (typeof timer?.unref === 'function') timer.unref();
 
-    pending.set(request.requestId, { sessionId, request, settle: finish, timer, onAbort, answerOf });
-    if (request.kind === QUESTION_KIND) notifyQuestionObservers(questionRequestEvent(request));
-    return { requestId: request.requestId, request, answered };
+    pending.set(request.requestId, { sessionId, request, settle: finish, cancel, timer, onAbort, answerOf });
+    if (signal?.aborted) cancel(signal.reason);
+    else if (request.kind === QUESTION_KIND) notifyQuestionObservers(questionRequestEvent(request));
+    return { requestId: request.requestId, request, answered, cancel };
   }
 
   /**
@@ -234,7 +248,7 @@ export function createApprovalRegistry({
    * sees the card cannot answer it, and the conversation stops there.
    *
    * @param options - the questions, the asking session, and the caller's abort signal.
-   * @returns DSH's `AskUserQuestionAnswer`; a cancellation answers every question with nothing.
+   * @returns A pending handle; cancellation rejects with DSH's question error vocabulary.
    */
   async function askUser({ sessionId, questions, signal }) {
     const items = Array.isArray(questions) ? questions : [];
@@ -247,13 +261,12 @@ export function createApprovalRegistry({
       questions: items.map((question) => ({ ...question })),
       createdAt: now().toISOString(),
     };
-    const cancelled = { answers: items.map((question) => ({ id: String(question?.id ?? ''), selected: [] })) };
     return register({
       sessionId,
       request,
       signal,
+      waitMs: 0, // Like Cindy ask/plan, only the caller's lifecycle ends this wait.
       answerOf: {
-        cancelled,
         from: (decision) => questionAnswerOf(items, decision),
       },
     });
@@ -318,10 +331,11 @@ export function createApprovalRegistry({
     return { accepted: true };
   }
 
-  /** Forget every open question (the switch going off). */
-  function clear() {
-    for (const requestId of [...pending.keys()]) {
-      pending.get(requestId).settle(pending.get(requestId).answerOf.cancelled);
+  /** A relay retry preserves questions; explicit shutdown cancels all waits. */
+  function clear({ preserveQuestions = false } = {}) {
+    for (const entry of [...pending.values()]) {
+      if (preserveQuestions && entry.request.kind === QUESTION_KIND) continue;
+      entry.cancel();
     }
   }
 

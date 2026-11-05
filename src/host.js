@@ -36,6 +36,7 @@ import { SessionReadModel } from './session-read-model.js';
 import { ProjectionReadModelSink } from './projection-read-model-sink.js';
 import { publishLifecycle, runningStatusEvent, turnEventFor } from './session-publisher.js';
 import { createReasoningPublisher } from './reasoning-publisher.js';
+import { turnErrorRow, turnErrorPayload } from './turn-error.js';
 import { acceptLink } from './host-authorization.js';
 import { AuthorizationPolicy } from './authorization-policy.js';
 import { HostStatus } from './host-status.js';
@@ -338,14 +339,8 @@ export async function startHost(initialSource, settings = DEFAULT_HOST_SETTINGS,
   /** Questions DSH is waiting on, answered by whichever controller is watching. */
   const approvals = createApprovalRegistry({
     now,
-    // How long a controller has to answer a card before the asker is released with
-    // "cancelled". Two minutes was the default and it is the wrong budget for the
-    // surface this Host serves: the phone's card has no countdown, the user may be
-    // away from it, and the path this replaces (the Web bundle's remote forwarder)
-    // waits indefinitely — so a short Host timeout is strictly worse than the
-    // reference. Half an hour with cancellation as the escape hatch
-    // (`maker:input:stop` settles the card immediately) mirrors the reference while
-    // still bounding a forgotten turn.
+    // Permission cards keep their existing deadline. Questions have no Host
+    // timeout: only an answer or the caller's stop/cancel lifecycle ends them.
     timeoutMs: 30 * 60_000,
     // Push the dismissal to every watcher, not just the controller that
     // answered: the card is gone for all of them.
@@ -703,7 +698,11 @@ export async function startHost(initialSource, settings = DEFAULT_HOST_SETTINGS,
       // ones: a running badge on the session list depends on them, so they must
       // be answerable from diagnostics too.
       const record = (channel, watchers, payload) => recordPush(null, channel, watchers, payload);
-      if (ws !== null) publishLifecycle(ws, subscribers, item, record);
+      // A summary-level error is only an invalidation hint; it must not
+      // terminate a newer turn on list-only phones either.
+      const nativeRecovery = typeof options.resolveCapabilities?.()?.readMessages?.turnState === 'function';
+      const lifecycle = item.phase === 'error' && nativeRecovery ? { ...item, phase: 'active' } : item;
+      if (ws !== null) publishLifecycle(ws, subscribers, lifecycle, record);
       publishTurnEvent(item);
     }));
     await projection.start(source);
@@ -721,6 +720,18 @@ export async function startHost(initialSource, settings = DEFAULT_HOST_SETTINGS,
    * @param item - one lifecycle item from the projection sink.
    */
   function publishTurnEvent(item) {
+    // The summary error signal has no durable identity and can arrive late.
+    // Recover from native boundaries instead of inventing a successful done.
+    if (item?.phase === 'error') {
+      if (typeof options.resolveCapabilities?.()?.readMessages?.turnState !== 'function') {
+        announceTurnIdle(item.sessionId); // Legacy source: keep its status-only correction.
+        return;
+      }
+      for (const deviceId of sessionSubscribers.get(item.sessionId) ?? []) {
+        void restoreWatchedTurnState(deviceId, item.sessionId);
+      }
+      return;
+    }
     // Keep the cached row's turn state in step with the lifecycle itself.
     //
     // The cache is refreshed by a **list read**, and a controller sitting inside
@@ -749,6 +760,9 @@ export async function startHost(initialSource, settings = DEFAULT_HOST_SETTINGS,
   async function setSource(next) {
     if (source !== next) {
       sourceRevision++;
+      nativeBoundaries.clear();
+      turnVersions.clear();
+      terminalIdentities.clear();
       source?.manualCompact?.cancelAll('DSH source replaced');
       source?.forkSession?.cancelAll();
       source?.keywordSearch?.cancelAll();
@@ -872,6 +886,18 @@ export async function startHost(initialSource, settings = DEFAULT_HOST_SETTINGS,
    * terminal announcement for the same turn; this is the de-duplication window.
    */
   const lastTerminalAnnounce = new Map();
+  // Disposable delivery guards, not a second error ledger. Only the latest
+  // identity per device/session and native boundary per session are retained.
+  const terminalIdentities = new Map();
+  const subscriptionLeases = new Map();
+  const nativeBoundaries = new Map();
+  const turnVersions = new Map();
+
+  function renewTurnLease(deviceId, sessionId) {
+    const key = terminalAnnounceKey(deviceId, sessionId);
+    subscriptionLeases.set(key, (subscriptionLeases.get(key) ?? 0) + 1);
+    terminalIdentities.delete(key);
+  }
   const TERMINAL_ANNOUNCE_WINDOW_MS = 30_000;
   /**
    * Devices the relay has told us it cannot route to.
@@ -896,6 +922,79 @@ export async function startHost(initialSource, settings = DEFAULT_HOST_SETTINGS,
   /** De-duplication key for "this device was told this session's turn is over". */
   function terminalAnnounceKey(deviceId, sessionId) {
     return `${deviceId}\u0000${sessionId}`;
+  }
+
+  /** Send a native terminal identity once per authorized subscription/connection. */
+  function sendNativeTerminal(deviceId, sessionId, payload, identity) {
+    if (stopped || !active || !acceptedControllers.has(deviceId) || !policy.canAccept(deviceId) || sessionIsHidden(sessionId)
+      || !sessionSubscribers.get(sessionId)?.has(deviceId)) return false;
+    const key = terminalAnnounceKey(deviceId, sessionId);
+    const stamp = `${generation}:${subscriptionLeases.get(key) ?? 0}:${identity}`;
+    if (terminalIdentities.get(key) === stamp) return false;
+    recordPush(sessionId, 'maker:event', offlineDevices.has(deviceId) ? 0 : 1, payload);
+    send({ v: PROTOCOL_VERSION, kind: 'push', dst: deviceId, payload: { channel: 'maker:event', payload } });
+    if (!offlineDevices.has(deviceId)) {
+      terminalIdentities.set(key, stamp);
+      noteTerminalAnnounce(deviceId, sessionId);
+    }
+    return true;
+  }
+
+  /** Event callers intentionally fire-and-forget; provider replacement must not
+   * turn a failed recovery into an unhandled rejection at the DSH boundary. */
+  async function restoreWatchedTurnState(deviceId, sessionId) {
+    try { await readWatchedTurnState(deviceId, sessionId); } catch {
+      if (!stopped) recordHandlerError('turn-recovery', new Error('Native turn recovery capability is unavailable'));
+    }
+  }
+
+  /** Cold/reconnect repair uses fresh native evidence; every await is generation guarded. */
+  async function readWatchedTurnState(deviceId, sessionId) {
+    const reader = options.resolveCapabilities?.()?.readMessages;
+    if (typeof reader?.turnState !== 'function') {
+      announceWatchedTurnState(deviceId, sessionId);
+      return;
+    }
+    const owner = source; const revision = sourceRevision; const connection = generation;
+    const version = turnVersions.get(sessionId);
+    const key = terminalAnnounceKey(deviceId, sessionId);
+    const lease = subscriptionLeases.get(key);
+    const valid = () => !stopped && active && source === owner && sourceRevision === revision
+      && generation === connection && turnVersions.get(sessionId) === version
+      && subscriptionLeases.get(key) === lease && acceptedControllers.has(deviceId) && policy.canAccept(deviceId)
+      && !sessionIsHidden(sessionId) && sessionSubscribers.get(sessionId)?.has(deviceId)
+      && options.resolveCapabilities?.()?.readMessages === reader;
+    if (!valid()) return;
+    try {
+      const state = await reader.turnState(sessionId);
+      if (!valid() || !state) return;
+      // The log can end before a newly admitted turn has appended its start.
+      // A live registry check after replay prevents that gap being called idle.
+      let live;
+      if (typeof owner?.listSessionStates === 'function') {
+        const rows = await owner.listSessionStates(sessionId);
+        live = Array.isArray(rows) ? rows.find(row => String(row?.id) === sessionId) : null;
+      } else if (typeof owner?.getSession === 'function') live = await owner.getSession(sessionId);
+      if (!valid() || !live || typeof live.running !== 'boolean') return;
+      if (live.running) {
+        setCachedRunning(sessionId, true);
+        const payload = { sessionId, event: runningStatusEvent() };
+        recordPush(sessionId, 'maker:event', 1, payload);
+        send({ v: PROTOCOL_VERSION, kind: 'push', dst: deviceId, payload: { channel: 'maker:event', payload } });
+        return;
+      }
+      if (state.running) return; // An unfinished historical turn is not live-registry evidence.
+      if ((nativeBoundaries.get(sessionId)?.seq ?? -1) > state.boundarySeq) return;
+      // No await after the final guard: a new boundary cannot interleave with send.
+      setCachedRunning(sessionId, false);
+      const payload = state.error ? turnErrorPayload(state.error) : { sessionId, event: { type: 'done' } };
+      sendNativeTerminal(deviceId, sessionId, payload, `end:${state.boundarySeq}`);
+    } catch {
+      if (!valid()) return;
+      // Never reflect arbitrary upstream exception prose into remote diagnostics.
+      recordHandlerError('turn-recovery', new Error('Native turn state is unavailable; retry on the next synchronization'));
+      if (valid()) pushHistoryViewChanged(sessionId);
+    }
   }
 
   /** Note that one device has just been told a session's turn is over. */
@@ -942,6 +1041,7 @@ export async function startHost(initialSource, settings = DEFAULT_HOST_SETTINGS,
   function markDeviceUnreachable(deviceId) {
     if (typeof deviceId !== 'string' || deviceId === '') return;
     offlineDevices.add(deviceId);
+    for (const sessionId of watchedSessionsByDevice.get(deviceId) ?? []) renewTurnLease(deviceId, sessionId);
   }
 
   /**
@@ -964,6 +1064,7 @@ export async function startHost(initialSource, settings = DEFAULT_HOST_SETTINGS,
     for (const sessionId of sessions) {
       announceWatchedTurnState(deviceId, sessionId);
       pushHistoryViewChanged(sessionId);
+      replayUserQuestions(sessionId);
     }
     return sessions;
   }
@@ -980,6 +1081,10 @@ export async function startHost(initialSource, settings = DEFAULT_HOST_SETTINGS,
    * @param sessionId - the session whose turn state to report.
    */
   function announceWatchedTurnState(deviceId, sessionId) {
+    if (typeof options.resolveCapabilities?.()?.readMessages?.turnState === 'function') {
+      void restoreWatchedTurnState(deviceId, sessionId);
+      return;
+    }
     const cached = sessionRowFor(sessionId);
     if (cached === undefined || cached.running === true) return;
     const key = terminalAnnounceKey(deviceId, sessionId);
@@ -1096,6 +1201,7 @@ export async function startHost(initialSource, settings = DEFAULT_HOST_SETTINGS,
         watchedListDevices.add(deviceId);
       } else if (topic.startsWith('session:')) {
         const sessionId = topic.slice('session:'.length);
+        renewTurnLease(deviceId, sessionId);
         const devices = sessionSubscribers.get(sessionId) ?? new Set();
         devices.add(deviceId);
         sessionSubscribers.set(sessionId, devices);
@@ -1107,6 +1213,7 @@ export async function startHost(initialSource, settings = DEFAULT_HOST_SETTINGS,
         // …and beyond a *disconnect*: when this device re-links, the Host has to be able to
         // tell it the turn state of every session it was inside, not just the running ones.
         rememberWatchedSession(deviceId, sessionId);
+        replayUserQuestions(sessionId);
       }
     }
   }
@@ -1116,6 +1223,7 @@ export async function startHost(initialSource, settings = DEFAULT_HOST_SETTINGS,
       if (topic === 'sessions') subscribers.delete(deviceId);
       else if (topic.startsWith('session:')) {
         const sessionId = topic.slice('session:'.length);
+        renewTurnLease(deviceId, sessionId);
         const devices = sessionSubscribers.get(sessionId);
         if (devices === undefined) continue;
         devices.delete(deviceId);
@@ -1214,23 +1322,25 @@ export async function startHost(initialSource, settings = DEFAULT_HOST_SETTINGS,
   }
 
   /**
-   * Ask the controllers watching a session a structured question.
-   *
-   * DSH's `user-questions/request` waterfall blocks the tool call until this
-   * resolves, so an unanswered question does not degrade the conversation — it
-   * stops it. The answerer therefore only claims questions for a session a
-   * controller is actually watching, and passes every other one down the chain
-   * so the local UI can answer it.
-   *
-   * Returns `null` when nobody is watching, which is the answerer's cue to call
-   * `next()`.
+   * Register before presentation, even when no phone has opened this session.
+   * Watching controls push delivery only; late phones query the same pending
+   * request while the plugin also forwards it to DSH's native answerer.
+   * Returns null when the bridge is disabled or the session is unidentified.
    */
   async function beginUserQuestion({ sessionId, questions, signal }) {
     if (typeof sessionId !== 'string' || sessionId === '') return null;
-    if (!claimsInteraction(sessionId)) return null;
+    if (!active || stopped) return null;
     const handle = await approvals.askUser({ sessionId, questions, signal });
-    pushSessionUpdate(sessionId, 'maker:interaction-request', { sessionId, request: handle.request });
+    if (!signal?.aborted) pushSessionUpdate(sessionId, 'maker:interaction-request', { sessionId, request: handle.request });
     return handle;
+  }
+
+  function replayUserQuestions(sessionId) {
+    for (const { request } of approvals.list(sessionId)) {
+      if (request.kind === 'ask_user_question') {
+        pushSessionUpdate(sessionId, 'maker:interaction-request', { sessionId, request });
+      }
+    }
   }
 
   async function askUserQuestion(options) {
@@ -1253,7 +1363,10 @@ export async function startHost(initialSource, settings = DEFAULT_HOST_SETTINGS,
    */
   function pushSessionUpdate(sessionId, channel, payload) {
     if (channel === 'maker:input:projection' && activeDelivery) payload = activeDelivery.currentProjection(sessionId, [], payload);
-    const devices = sessionSubscribers.get(sessionId);
+    const guarded = payload?.message?.role === 'error' || payload?.event?.type === 'error';
+    const devices = guarded
+      ? new Set([...(sessionSubscribers.get(sessionId) ?? [])].filter(id => !sessionIsHidden(sessionId) && acceptedControllers.has(id) && policy.canAccept(id)))
+      : sessionSubscribers.get(sessionId);
     const watchers = devices === undefined ? 0 : devices.size;
     const reachable = devices === undefined ? 0 : [...devices].filter((deviceId) => !offlineDevices.has(deviceId)).length;
     recordPush(sessionId, channel, reachable, payload);
@@ -1337,7 +1450,7 @@ export async function startHost(initialSource, settings = DEFAULT_HOST_SETTINGS,
       // nothing, which is the same class of failure as the bug being fixed.)
       const provider = typeof options.resolveCapabilities === 'function' ? options.resolveCapabilities() : undefined;
       const hydrate = provider?.hydrateImages;
-      if (typeof hydrate === 'function') await hydrate([message]);
+      if (message?.role !== 'error' && typeof hydrate === 'function') await hydrate([message]);
     } catch {
       // Un-hydrated is still worth sending.
     }
@@ -1567,6 +1680,7 @@ export async function startHost(initialSource, settings = DEFAULT_HOST_SETTINGS,
        * running turn must be told so rather than left to infer it from silence.
        */
       pushTurnRunning: (sessionId) => announceTurnRunning(sessionId),
+      restoreTurnState: typeof provided.readMessages?.turnState === 'function' ? restoreWatchedTurnState : undefined,
       // The controller's goal panel refreshes from this push, so a write made on
       // the phone reaches any other screen watching the same session.
       pushGoalStatus: (sessionId, status) => pushSessionUpdate(sessionId, 'maker:goal:status-changed', { sessionId, goal: status }),
@@ -1697,7 +1811,23 @@ export async function startHost(initialSource, settings = DEFAULT_HOST_SETTINGS,
    * pure noise.
    * @param sessionId - the session whose turn ended.
    */
-  function announceTurnIdle(sessionId) {
+  function announceTurnIdle(sessionId, event) {
+    if (!event && typeof options.resolveCapabilities?.()?.readMessages?.turnState === 'function') {
+      for (const deviceId of sessionSubscribers.get(sessionId) ?? []) void restoreWatchedTurnState(deviceId, sessionId);
+      return;
+    }
+    const error = turnErrorRow(event, sessionId);
+    const failed = event?.data?.reason?.kind === 'error';
+    if (failed && !error) {
+      recordHandlerError('turn-error', new Error('Invalid native failed-turn identity; history resynchronization required'));
+      pushHistoryViewChanged(sessionId);
+      return;
+    }
+    if (event && Number.isSafeInteger(event.seq)) {
+      if ((nativeBoundaries.get(sessionId)?.seq ?? -1) >= event.seq) return;
+      nativeBoundaries.set(sessionId, { seq: event.seq });
+    }
+    turnVersions.set(sessionId, (turnVersions.get(sessionId) ?? 0) + 1);
     const timer = pendingReconciles.get(sessionId);
     if (timer !== undefined) {
       pendingReconciles.delete(sessionId);
@@ -1709,7 +1839,16 @@ export async function startHost(initialSource, settings = DEFAULT_HOST_SETTINGS,
     // tells it first — and the re-link repair depends on that record meaning "it arrived", so a
     // device the relay calls unreachable must not be written into it.
     const watchers = [...(sessionSubscribers.get(sessionId) ?? [])];
-    pushSessionUpdate(sessionId, 'maker:event', { sessionId, event: { type: 'done' } });
+    if (failed) {
+      const payload = turnErrorPayload(error);
+      for (const deviceId of watchers) sendNativeTerminal(deviceId, sessionId, payload, `end:${event.seq}`);
+      // Error detail never goes to list subscribers or unwatched controllers.
+      publishRowTurnState(sessionId, false);
+      return;
+    }
+    if (event && Number.isSafeInteger(event.seq)) {
+      for (const deviceId of watchers) sendNativeTerminal(deviceId, sessionId, { sessionId, event: { type: 'done' } }, `end:${event.seq}`);
+    } else pushSessionUpdate(sessionId, 'maker:event', { sessionId, event: { type: 'done' } });
     for (const deviceId of watchers) {
       if (!offlineDevices.has(deviceId)) noteTerminalAnnounce(deviceId, sessionId);
     }
@@ -1858,7 +1997,12 @@ export async function startHost(initialSource, settings = DEFAULT_HOST_SETTINGS,
    * Announce that a turn is live.
    * @param sessionId - the session whose turn started.
    */
-  function announceTurnRunning(sessionId) {
+  function announceTurnRunning(sessionId, event) {
+    if (event && Number.isSafeInteger(event.seq)) {
+      if ((nativeBoundaries.get(sessionId)?.seq ?? -1) >= event.seq) return;
+      nativeBoundaries.set(sessionId, { seq: event.seq });
+    }
+    turnVersions.set(sessionId, (turnVersions.get(sessionId) ?? 0) + 1);
     setCachedRunning(sessionId, true);
     pushSessionUpdate(sessionId, 'maker:event', { sessionId, event: runningStatusEvent() });
     publishRowTurnState(sessionId, true);
@@ -2245,6 +2389,7 @@ export async function startHost(initialSource, settings = DEFAULT_HOST_SETTINGS,
       case 'link-open': {
         if (typeof frame.id !== 'string' || typeof frame.src !== 'string') return;
         if (!policy.canAccept(frame.src)) return;
+        for (const sessionId of watchedSessionsByDevice.get(frame.src) ?? []) renewTurnLease(frame.src, sessionId);
         // A link-open is itself proof the relay has a route to this device.
         markDeviceReachable(frame.src);
         linkController(frame.src);
@@ -2271,6 +2416,7 @@ export async function startHost(initialSource, settings = DEFAULT_HOST_SETTINGS,
       }
       case 'link-close': {
         if (typeof frame.src !== 'string') return;
+        for (const sessionId of watchedSessionsByDevice.get(frame.src) ?? []) renewTurnLease(frame.src, sessionId);
         filePeer.closePeer(frame.src);
         acceptedControllers.delete(frame.src);
         observeRemindersSource();
@@ -2497,11 +2643,15 @@ export async function startHost(initialSource, settings = DEFAULT_HOST_SETTINGS,
     subscribers.clear();
     sessionSubscribers.clear();
     liveTurnState.clear();
+    nativeBoundaries.clear();
+    turnVersions.clear();
+    terminalIdentities.clear();
+    subscriptionLeases.clear();
     lastRepairPulse.clear();
     directoryAsked.clear();
-    // A question asked over a link that is going away can never be answered;
-    // settling them cancelled is what releases DSH's awaiting turn.
-    approvals.clear();
+    // Relay recovery is not task cancellation. Keep questions for the next
+    // subscription; explicit switch-off/stop still releases all waits.
+    approvals.clear({ preserveQuestions: keepSwitch });
     inputQueue.clear();
     projections.clear();
 
@@ -2703,8 +2853,8 @@ export async function startHost(initialSource, settings = DEFAULT_HOST_SETTINGS,
      * projection's running flag flaps inside a single turn, so it is not allowed
      * to end one (see `turnEventFor`).
      */
-    pushTurnRunning: (sessionId) => announceTurnRunning(sessionId),
-    pushTurnIdle: (sessionId) => announceTurnIdle(sessionId),
+    pushTurnRunning: (sessionId, event) => announceTurnRunning(sessionId, event),
+    pushTurnIdle: (sessionId, event) => announceTurnIdle(sessionId, event),
     /**
      * Make sure a controller is not left spinning after a turn it was watching.
      *

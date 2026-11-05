@@ -238,11 +238,10 @@ test('a decision aimed at the wrong kind is refused, not mistranslated', async (
   assert.deepEqual(registry.settle(approval.requestId, { kind: 'permission', behavior: 'allow' }), { accepted: true });
 });
 
-test('a question that is never answered releases DSH with empty answers', async () => {
-  // The waterfall blocks the tool call, so a timeout has to resolve it rather
-  // than leave the turn waiting forever.
-  const registry = createApprovalRegistry({ timeoutMs: 0 });
+test('explicit shutdown cancels a question rather than inventing an empty answer', async () => {
+  const registry = createApprovalRegistry();
   const asked = await registry.askUser({ sessionId: 's1', questions: [{ id: 'q1', question: 'Pick one' }] });
   registry.clear();
-  assert.deepEqual(await asked.answered, { answers: [{ id: 'q1', selected: [] }] });
+  await assert.rejects(asked.answered, { name: 'UserQuestionError', code: 'ASK_ABORTED' });
+  assert.deepEqual(registry.list('s1'), []);
 });

@@ -107,9 +107,10 @@ export function turnEventFor(item) {
       return { channel: 'maker:event', payload: { sessionId, event: runningStatusEvent() } };
     case 'waiting':
       return { channel: 'maker:event', payload: { sessionId, event: runningStatusEvent('waiting on input') } };
-    // A failure is unambiguous.
+    // Summary errors have no turn identity. The native boundary/recovery path
+    // publishes an error with persistId; a bare done would erase that distinction.
     case 'error':
-      return { channel: 'maker:event', payload: { sessionId, event: { type: 'done' } } };
+      return null;
     // `idle` is deliberately NOT an ending here.
     //
     // This flag flaps: `api-session/status` reports `running: false` for a moment

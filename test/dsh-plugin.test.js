@@ -49,6 +49,14 @@ test('a failed local surface leaves the Cindy answer path alive', async () => {
   assert.deepEqual((await pending).answers[0].selected, ['mobile']);
 });
 
+test('the awaited question boundary propagates native cancellation instead of returning undefined', async () => {
+  const ctx = makeCtx({});
+  apply(ctx);
+  const { listener } = ctx.record.listenerOptions.find(entry => entry.eventName === 'user-questions/request');
+  const error = Object.assign(new Error('Cancelled'), { name: 'UserQuestionError', code: 'ASK_CANCELLED' });
+  await assert.rejects(listener({}, async () => { throw error; }), value => value === error);
+});
+
 test('exports the DSH Host bundle identity and only requires settings', () => {
   assert.equal(name, 'dsh-cindy-host');
   assert.deepEqual(inject, ['settings']);
@@ -162,8 +170,7 @@ function makeCtx(services = {}) {
       record.eventSubscriptions.push(eventName);
       // The registration options are load-bearing for the two answerer
       // waterfalls — see the test below — so the double keeps them.
-      record.listenerOptions.push({ eventName, options });
-      void listener;
+      record.listenerOptions.push({ eventName, options, listener });
       return () => {};
     },
     effect: (run) => {

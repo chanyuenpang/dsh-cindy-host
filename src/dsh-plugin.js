@@ -1685,48 +1685,43 @@ export function createSettingsScope(ctx, entryId, projected) {
 
 
 /**
- * Present one interaction to Cindy and the downstream DSH UI, settling on the first answer.
- * The downstream branch receives a private abort signal so the losing local card is dismissed;
- * without that cancellation contract a Promise.race would leak a parked waterfall listener.
+ * Forward once to DSH and settle both surfaces through the existing registry.
+ * The losing native card is dismissed through its private cancellation signal.
  */
 export async function arbitrateInteraction({ request, next, begin, settleLocal }) {
-  const handle = await begin();
-  if (handle === null) return next();
-
   const downstreamAbort = new AbortController();
   const upstreamSignal = request?.signal;
   const downstreamSignal = upstreamSignal === undefined
     ? downstreamAbort.signal
     : AbortSignal.any([upstreamSignal, downstreamAbort.signal]);
-  let cancellable = false;
   try {
     request.signal = downstreamSignal;
-    cancellable = request.signal === downstreamSignal;
   } catch {
     try {
       Object.defineProperty(request, 'signal', { value: downstreamSignal, configurable: true, writable: true });
-      cancellable = request.signal === downstreamSignal;
     } catch {
-      cancellable = false;
+      // Without cancellation, use the original native path rather than a phone-only card.
+      return next();
     }
   }
-  // Never start a branch we cannot dismiss; keep the existing Cindy answer path instead.
-  if (!cancellable) return handle.answered;
+  if (request.signal !== downstreamSignal) return next();
+  const handle = await begin(upstreamSignal);
+  if (handle === null) return next();
 
-  const controller = Promise.resolve(handle.answered).then((value) => ({ kind: 'controller', value }));
-  const local = Promise.resolve().then(next).then(
-    (value) => ({ kind: 'local', value }),
-    (error) => ({ kind: 'local-error', error }),
-  );
-  const first = await Promise.race([controller, local]);
-  if (first.kind === 'local-error') return (await controller).value;
-  if (first.kind === 'local') {
-    settleLocal(handle.requestId, first.value);
-    return first.value;
+  void Promise.resolve().then(next).then(
+    (value) => settleLocal(handle.requestId, value),
+    (error) => {
+      // Native cancellation/timeout is a lifecycle result, not a failed delivery.
+      // A missing/disconnected local answerer still leaves the phone usable.
+      if (error?.name === 'UserQuestionError' && error.code !== 'NO_PROVIDER') handle.cancel?.(error);
+    },
+  ).catch((error) => handle.cancel?.(error));
+  try {
+    // A rejected late local settlement cannot override an already accepted phone answer.
+    return await handle.answered;
+  } finally {
+    downstreamAbort.abort(new Error('interaction settled'));
   }
-  downstreamAbort.abort(new Error('interaction settled by Cindy'));
-  void local.then(() => undefined, () => undefined);
-  return first.value;
 }
 
 export function apply(ctx, config) {
@@ -1784,27 +1779,30 @@ export function apply(ctx, config) {
   }
 
   /**
-   * Wrap one host-facing listener in the plugin's single guarded entry point.
+   * Record failures; contain side effects but propagate awaited question failures.
    * @param label - what this listener is, for the diagnostics record.
    * @param listener - the listener as written.
-   * @returns a listener that cannot let its failure escape.
+   * @param options - rethrow only for awaited requests, never fire-and-forget events.
+   * @returns the guarded listener.
    */
-  function guarded(label, listener) {
+  function guarded(label, listener, { rethrow = false } = {}) {
     guardedListeners.push(label);
     return (...args) => {
       try {
         const result = listener(...args);
         if (result !== null && typeof result === 'object' && typeof result.then === 'function') {
-          // A waterfall listener's rejection is the dangerous shape: DSH awaits what it
-          // returns, so a rejection here arrives as an unhandled one at the process level.
+          // Awaited questions reach userQuestions.ask so cancellation keeps its
+          // meaning; fire-and-forget side effects still contain their failures.
           return result.catch((error) => {
             noteBoundaryError(label, error);
+            if (rethrow) throw error;
             return undefined;
           });
         }
         return result;
       } catch (error) {
         noteBoundaryError(label, error);
+        if (rethrow) throw error;
         return undefined;
       }
     };
@@ -2004,9 +2002,7 @@ export function apply(ctx, config) {
     // stopped its timer while the agent was still generating. `turn/start` and
     // `turn/end` are the boundaries that mean what the phone reads into them.
     if (event?.type === 'turn/start' && typeof runtime.pushTurnRunning === 'function') {
-      runtime.pushTurnRunning(sessionId);
-    } else if (event?.type === 'turn/end' && typeof runtime.pushTurnIdle === 'function') {
-      runtime.pushTurnIdle(sessionId);
+      runtime.pushTurnRunning(sessionId, event);
     }
     // A real boundary needs no fallback, and arming one here is not harmless: this
     // handler runs *after* the boundary was announced, so it re-armed the very
@@ -2034,6 +2030,9 @@ export function apply(ctx, config) {
       currentSeam.readMessages.noteEvent(sessionId, event);
       currentSource?.invalidateActivityEvidence?.(sessionId);
     }
+    // Make the failed history row readable before publishing its terminal identity.
+    // Everything above is synchronous, so a new turn cannot interleave here.
+    if (event?.type === 'turn/end' && typeof runtime.pushTurnIdle === 'function') runtime.pushTurnIdle(sessionId, event);
     // Chunks are intentionally absent from deriveEventMessage. Publish a temporary
     // thinking overlay too, retiring it before the durable assistant rows below.
     runtime.pushSessionReasoning?.(sessionId, event, {
@@ -2065,12 +2064,12 @@ export function apply(ctx, config) {
     return arbitrateInteraction({
       request: req,
       next,
-      begin: () => runtime.beginApproval({
+      begin: (signal) => runtime.beginApproval({
         sessionId: typeof sessionId === 'string' ? sessionId : '',
         toolName: typeof req?.toolName === 'string' ? req.toolName : '',
         reason: req?.reason,
         callId: req?.callId,
-        signal: req?.signal,
+        signal,
       }),
       settleLocal: (requestId, outcome) => runtime.settleInteractionOutcome(requestId, outcome),
     });
@@ -2092,28 +2091,26 @@ export function apply(ctx, config) {
     // to the browser path unchanged.
   }), { prepend: true, global: true }), 'dsh-cindy-host: approval answerer');
 
-  // The `ask_user` tool blocks on a different waterfall from approvals, and the
-  // controller renders it as its own card. Leaving it unanswered does not degrade
-  // the conversation — it stops it: the tool call waits for a human who never saw
-  // the question. Same rule as approvals: only claim questions for a session a
-  // controller is watching, and pass the rest down the chain.
+  // Questions are registered even before a phone opens the session, then also
+  // forwarded to DSH. Unlike side-effect listeners this awaited waterfall must
+  // propagate cancellation instead of returning an undefined successful result.
   ctx.effect(() => ctx.on('user-questions/request', guarded('user-questions-request', async (request, next) => {
     if (!runtime || typeof runtime.beginUserQuestion !== 'function') return next();
     const sessionId = request?.agent?.session?.header?.id;
     return arbitrateInteraction({
       request,
       next,
-      begin: () => runtime.beginUserQuestion({
+      begin: (signal) => runtime.beginUserQuestion({
         sessionId: typeof sessionId === 'string' ? sessionId : '',
         questions: request?.questions,
-        signal: request?.signal,
+        signal,
       }),
       settleLocal: (requestId, outcome) => runtime.settleInteractionOutcome(requestId, outcome),
     });
     // Same `prepend` + `global` requirement as the approval answerer above, and the
     // same reason: this waterfall is agent-scoped and the Web bundle's remote
     // forwarding listener parks ahead of a late registration.
-  }), { prepend: true, global: true }), 'dsh-cindy-host: user-question answerer');
+  }, { rethrow: true }), { prepend: true, global: true }), 'dsh-cindy-host: user-question answerer');
 
   // The settings page reaches the Host through this route. `webServer` is absent
   // in headless compositions, so the row is injected optionally: the runtime and

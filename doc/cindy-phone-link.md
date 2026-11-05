@@ -344,10 +344,13 @@ speaks `'allowed-once' | 'rejected' | 'cancelled' | 'unavailable'` — and
 **refused rather than acknowledged**, so the controller keeps the card open
 instead of believing it was answered.
 
-Three lifecycle rules, each with a test: an aborted ask settles `cancelled` and
-discards a late answer; an unanswered question times out rather than hanging
-DSH's turn; and turning the switch off settles every open question, because a
-question asked over a link that is going away can never be answered.
+For permission cards, an aborted request settles `cancelled`, a late answer is
+refused, and the existing Host deadline remains. Structured user questions use
+the same registry but are registered before presentation regardless of watching,
+then forwarded once to the native DSH answerer. Either surface settles the same
+promise and dismisses the other. Questions have no Host deadline; native task
+stop/cancel and native timed-question errors remain authoritative. Relay retries
+preserve pending questions, while explicit Host shutdown cancels bridge waits.
 
 `maker:get-pending-interactions` is also requested by the controller on every
 session open, so it answers even with nothing pending — an empty list is the
@@ -2188,7 +2191,12 @@ attach session → unsubscribe → agent asks a question
   session                        = running (forever; no card anywhere the user is looking)
 ```
 
-The distinction the fix makes is between *currently watching* and *belongs to the phone*:
+The earlier fix below distinguished *currently watching* and *belongs to the phone*.
+The 2026-11-05 Host-only repair supersedes that gate for user questions: they are
+registered even before a phone's first visit, and session open/reconnect replays
+the same pending IDs. Permission ownership remains unchanged. The earlier result was:
+
+
 a session this Host has served to a controller at least once in this process keeps
 claiming its cards, and the card stays discoverable through
 `maker:get-pending-interactions` even while nobody is subscribed. A session no controller
@@ -2201,16 +2209,18 @@ attach session → unsubscribe → agent asks a question
   → accepted, agent continues: "You picked **A**."
 ```
 
-The card's own budget came with this: it was the registry default of **two minutes**,
-which is the wrong shape for the surface being served. The card has no countdown, the
-user may be away from the phone, and the path this replaces waits indefinitely — so a
-short Host timeout is strictly worse than the reference. Half an hour, with
-`maker:input:stop` settling a card immediately as the escape hatch, mirrors the reference
-while still bounding a forgotten turn.
+The earlier repair raised the card budget from two minutes to half an hour.
+As of the 2026-11-05 repair, structured questions have **no Host timeout**, matching
+Cindy ask/plan. Task stop and DSH's own cancellation/timed lifecycle still end the
+request; cancellation is propagated as a question error, not a successful empty
+answer. Temporary relay recovery no longer clears these questions.
 
-`test/host.test.js` pins both halves: an untouched session still defers (`null`), and a
-session that was attached to and then looked away still lists its card and accepts the
-answer.
+`test/host.test.js` retains the permission ownership checks. The question-specific
+regressions in [user-question-bridge.test.js](../test/user-question-bridge.test.js)
+cover first visit after the ask, both answer orders, reconnect and stop.
+[user-question-native.test.js](../test/user-question-native.test.js) is an opt-in
+installed Cordis/userQuestions/Gateway composition check; neither suite is a
+real-handset acceptance claim.
 
 ## The list spinner reads the row, so the row had to be patched
 

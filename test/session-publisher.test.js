@@ -18,7 +18,7 @@ test('a finished turn tells the session watchers to stop spinning', () => {
     null,
     'a flapping running flag must not be allowed to end a turn',
   );
-  assert.deepEqual(turnEventFor({ sessionId: 's1', kind: 'session-status', phase: 'error' }).payload.event, { type: 'done' });
+  assert.equal(turnEventFor({ sessionId: 's1', kind: 'session-status', phase: 'error' }), null, 'summary error cannot manufacture done');
 });
 
 test('a live turn tells the session watchers to spin', () => {

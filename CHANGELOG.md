@@ -1,5 +1,12 @@
 # Changelog
 
+## 0.1.34 — 2026-11-05
+
+- Project durable native failed turns as stable, sanitized error rows and terminal maker events in both cold history and live delivery. Preserve native failure/retry ownership, expose only fixed known-code messages and validated HTTP status, and repair reconnect state without stopping newer turns or leaking provider diagnostics.
+
+- Register user questions before either surface displays them, including sessions a phone has never visited. Replay the existing pending cards on session subscribe/reconnect; keep them through temporary relay recovery and remove the hidden Host question timeout, without changing permission ownership/deadlines.
+- Settle local and phone answers through the same pending completion; preserve native cancellation/timeout errors and clear both cards on task stop instead of returning empty/undefined answers. Keep the existing Cindy protocol and DSH native UI. Add focused Host regressions and opt-in tests against installed Cordis/userQuestions/Gateway; these are not live-handset acceptance or a production deployment.
+
 ## 0.1.33 — 2026-11-04
 
 - Add authorized current-surface reference-source history through native observations, real message identities, filters/cursors and explicit clipping metadata. Keep frozen target-reference capability false and reject structured contexts before every admission/edit/preparation/replay boundary; do not disguise source reads or plain links as target consumption.

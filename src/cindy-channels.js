@@ -609,13 +609,17 @@ export function createChannelRouter({
           }
         }
         for (const sessionId of sessionIds) {
-          let row = live === null ? null : live.find((candidate) => String(candidate?.id) === sessionId) ?? null;
-          if (typeof getSession === 'function') {
-            try { row = await getSession(sessionId) ?? null; } catch { row = null; }
+          if (typeof subscribing.restoreTurnState === 'function') {
+            await subscribing.restoreTurnState(request.src, sessionId);
+          } else {
+            let row = live === null ? null : live.find((candidate) => String(candidate?.id) === sessionId) ?? null;
+            if (typeof getSession === 'function') {
+              try { row = await getSession(sessionId) ?? null; } catch { row = null; }
+            }
+            const running = row === null ? subscribing.isSessionRunning(sessionId) === true : row.running === true;
+            if (running) subscribing.pushTurnRunning(sessionId);
+            else subscribing.pushTurnIdle(sessionId);
           }
-          const running = row === null ? subscribing.isSessionRunning(sessionId) === true : row.running === true;
-          if (running) subscribing.pushTurnRunning(sessionId);
-          else subscribing.pushTurnIdle(sessionId);
           // …and the two things a push that never arrived would have carried.
           //
           // Measured: an app returning from the background does an unsubscribe → resubscribe

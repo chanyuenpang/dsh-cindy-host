@@ -17,6 +17,7 @@
  */
 import { deriveEventMessage, isAppendSurfaceEvent } from '@deepseek-ai/dsh-session/surface';
 import { createReasoningStream } from './reasoning-stream.js';
+import { turnErrorRow, turnStateFromEvents } from './turn-error.js';
 import { toCindyMessageRows, toCindyMessages, hydrateImageAttachments } from './cindy-message-row.js';
 
 /** Default page size when the controller does not ask for one. */
@@ -81,6 +82,8 @@ export const TRANSCRIPT_CACHE_SESSIONS = 3;
  */
 export function foldSessionEvent(event, { sessionId, now = () => new Date() }) {
   if (event === null || typeof event !== 'object') return [];
+  const error = turnErrorRow(event, sessionId);
+  if (error) return [error];
   if (!isAppendSurfaceEvent(event)) return [];
   let message;
   try {
@@ -387,6 +390,11 @@ export function createMessageReader({
       // gap as "nothing happened here".
       if (Number.isFinite(event.seq)) lastSeq = event.seq;
       reasoning.consume(event);
+      const error = turnErrorRow(event, sessionId);
+      if (error) {
+        entries.push({ rows: [error] });
+        continue;
+      }
       const todo = entryForTodoWrite(event);
       if (todo !== null) {
         entries.push(todo);
@@ -477,7 +485,15 @@ export function createMessageReader({
     flight.promise = Promise.resolve().then(async () => {
       try {
         const read = await entriesFor(sessionId);
-        const rows = toCindyMessages(read.entries, { sessionId, now });
+        // Error rows are presentation, never fabricated model messages. Keep each
+        // message's block order while reversing event order, as toCindyMessages does.
+        const seen = new Set();
+        const rows = read.entries.slice().reverse().flatMap(entry => entry.rows
+          ?? toCindyMessages([entry], { sessionId, now })).filter(row => {
+          if (seen.has(row.id)) return false;
+          seen.add(row.id);
+          return true;
+        });
         // A live event during replay makes the snapshot unsafe to cache. Explicit
         // invalidation also detaches this flight so a post-invalidation read starts
         // fresh; an older completion must never overwrite that newer generation.
@@ -593,6 +609,12 @@ export function createMessageReader({
    * The array is the cache's own, so callers treat it as read-only.
    */
   readMessages.all = async (sessionId) => visibleRows(await ensureTranscript(sessionId));
+  // Recovery deliberately bypasses the transcript cache: stale history cannot
+  // decide whether the *current* turn has ended. Runtime generation guards the read.
+  readMessages.turnState = async (sessionId) => {
+    const snapshot = await readSessionLog(sessionId);
+    return turnStateFromEvents(snapshot?.events, sessionId);
+  };
   readMessages.stats = stats;
   return readMessages;
 }

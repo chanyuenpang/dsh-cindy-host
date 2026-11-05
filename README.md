@@ -4,12 +4,12 @@ A Host-side adapter connecting current Cindy clients to DeepSeek Harness.
 
 ## Requirements and installation
 
-Version **0.1.33** adds the regional authentication UI, public reasoning streaming and the native capability subsets described below.
+Version **0.1.34** improves native/phone question synchronization and cancellation, and safely displays durable model/turn failures. It retains 0.1.33's regional authentication UI, public reasoning streaming and native capability subsets.
 
 It supports the exact **DSH 0.2.2-alpha.2** carrier, while retaining `0.2.1-rc.3`, `0.2.1-rc.4` and `0.2.1-rc.5`. Alpha requires **Node.js >=24.9** (tested with 24.12); the older carriers retain this plugin's Node.js >=22.16 minimum. Agent/session/settings peers and alpha Schemastery are explicitly allowed, not a blanket promise for future prereleases. The full Web installation gate uses DSH **0.2.1-rc.5**; alpha core-contract checks do not establish alpha Web/relay/handset acceptance. Install through the Desktop DSH plugin manager. CLI-managed profiles can use:
 
 ```sh
-dsh plugin --profile <profile> add dsh-cindy-host@0.1.33
+dsh plugin --profile <profile> add dsh-cindy-host@0.1.34
 ```
 
 Reload the Host plugin after installation. A full DSH restart is separate. Keep existing Cindy sign-in, device identity and settings; do not run two Host processes with the same identity.
@@ -98,6 +98,20 @@ The Host sends DSH-provided public reasoning text/summaries as native structured
 During generation, `assistant/chunk` reasoning deltas are displayed as temporary thinking rows. Pushes coalesce over 100 ms; the work-grouped history uses the existing coalesced view refresh. Opening a session mid-generation reconstructs the current prefix from the log. The final assistant message replaces the preview, including interrupted prefixes, without duplicating it. Temporary rows do not become durable message-count/grouping evidence, and timers are cleared on Host disconnect.
 
 This ships in 0.1.33; handset acceptance is separate from package checks and local Host activation. Offline regressions execute the pinned real Cindy mobile thinking normalizer; live phone/network acceptance remains separate.
+
+## Questions on DSH and Cindy
+
+While the Host bridge is enabled, questions are registered before presentation, even if no phone has opened that session. DSH's native question UI and the existing Cindy card can both answer; the first accepted answer settles the shared pending entry and dismisses the other surface. Session open/reconnect replays pending cards with the same request IDs. Temporary relay loss does not cancel questions.
+
+Questions have no extra Host timeout. The caller's stop/cancel and DSH's own timed-question lifecycle still apply; explicit Host switch-off/unload cancels outstanding bridge waits. Permission cards retain their existing ownership and deadline. No Cindy/DSH patch or phone protocol upgrade is needed. This does not add cross-process recovery or mobile late-answer support after DSH has continued a timed call.
+
+Run the focused regressions with:
+
+```sh
+node --test test/user-question-bridge.test.js test/host-approvals.test.js test/dsh-plugin.test.js
+```
+
+The opt-in installed-runtime suite additionally exercises real Cordis, userQuestions and Gateway event delivery/replay/cancellation. Point `DSH_TEST_NATIVE_MODULES` at a built DSH node_modules directory, then run `node --test --test-isolation=none test/user-question-native.test.js`. For an Electron asar installation use the installed executable with `ELECTRON_RUN_AS_NODE=1`. These checks use isolated contexts and do not reload the running GUI; real-handset acceptance is separate.
 
 ## Model switching follows DSH
 

@@ -1,4 +1,4 @@
-﻿# ADR: One pending interaction, multiple answer surfaces
+# ADR: One pending interaction, multiple answer surfaces
 
 ## Context
 
@@ -19,9 +19,11 @@ A second surface may be started only when it has a real cancellation/dismiss con
 
 ## Consequences
 
-- Approval and structured question paths share request IDs, settlement, timeout, abort, replay, and dismissal rules.
+- Both paths share single settlement and dismissal. Structured questions are registered whenever the bridge is enabled, independently of watching; only permissions retain the existing watched/previously-watched ownership and Host deadline. Questions follow DSH's caller lifetime without another Host timer.
 - Tests must cover local-first, Cindy-first, local failure, timeout/abort, reconnect replay, and late answers.
-- If a downstream request object cannot carry the private cancellation signal, the Host keeps the existing single Cindy path rather than launching an uncloseable local branch.
+- If the downstream request cannot carry the private cancellation signal, delegate to the original native path without registering a phone-only card.
+- Native and phone outcomes settle the same registry promise, so a late local callback cannot override an accepted phone answer. Native typed cancellation/timeout rejects the awaited question waterfall; it is not an empty answer.
+- Temporary relay recovery preserves pending questions and session subscriptions replay them. Explicit Host shutdown cancels bridge waits. This remains a process-local bridge, not a second persistent DSH question domain.
 
 <!-- state: history -->
 ## Decision evolution
@@ -30,3 +32,8 @@ A second surface may be started only when it has a real cancellation/dismiss con
 ### Dual-surface arbitration introduced
 
 Release 0.1.18 added the cancellable arbiter and user acceptance confirmed that Cindy and DSH could both present the interaction while only one answer settled it.
+
+<!-- dated: 2026-11-05 -->
+### Register before presentation, not after the first phone visit
+
+The Host-only repair removes the user-question watching gate and hidden 30-minute timer, retains questions across relay retries, and forwards native cancellation through the awaited boundary. Permissions keep their prior behavior. The existing registry promise is the single completion for both surfaces, without a new protocol or framework.
