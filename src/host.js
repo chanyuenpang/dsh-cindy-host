@@ -49,6 +49,7 @@ import { MAX_ATTACHMENT_BYTES } from './host-attachments.js';
 import { createMediaRefResolver, createMediaReleaser, createMediaUploader, mediaApiBaseUrl, isAttachmentOssRef } from './host-media.js';
 import { createLocalMediaFetcher, createLocalFileResolver, isBlockedMediaPath, isInsideDirectory, mimeForMediaPath } from './host-media-fetch.js';
 import { createFilePeerManager } from './host-file-peer.js';
+import { createAttachmentMediaFetcher } from './host-attachment-media.js';
 import { createFileIceLoader } from './host-file-ice.js';
 import { createLocalFileUrl } from './host-file-reference.js';
 import { FILE_PEER_MAX_BYTES } from './file-peer-protocol.js';
@@ -256,7 +257,20 @@ export async function startHost(initialSource, settings = DEFAULT_HOST_SETTINGS,
    * uploader as the file browser's export ops, stricter request handling
    * (`host-media-fetch.js`): a containment root is mandatory and both sides are realpath'd.
    */
-  const fetchLocalMedia = createLocalMediaFetcher({ uploader: uploadMedia });
+  const fetchFileMedia = createLocalMediaFetcher({ uploader: uploadMedia });
+  const fetchAttachmentMedia = createAttachmentMediaFetcher({
+    uploader: uploadMedia,
+    getScope: () => stopped ? null : `${generation}:${sourceRevision}`,
+    isAllowed: locator => !sessionIsHidden(locator.sessionId),
+    readSource: async locator => {
+    if (sessionIsHidden(locator.sessionId)) return { ok: false, code: 'FORBIDDEN', message: 'source session unavailable' };
+    const capabilities = typeof options.resolveCapabilities === 'function' ? options.resolveCapabilities() : {};
+    return typeof capabilities.readAttachmentSource === 'function'
+      ? capabilities.readAttachmentSource(locator)
+      : { ok: false, code: 'NOT_AVAILABLE', message: 'native attachment reader unavailable' };
+  } });
+  const fetchLocalMedia = input => typeof input?.url === 'string' && input.url.startsWith('xdt-image://')
+    ? fetchAttachmentMedia(input) : fetchFileMedia(input);
   const resolvePeerFile = createLocalFileResolver({ maxBytes: FILE_PEER_MAX_BYTES });
   const fileUrl = createLocalFileUrl({ resolveFile: resolvePeerFile });
 

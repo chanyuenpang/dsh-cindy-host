@@ -349,7 +349,7 @@ function sameFileVersion(before, after) {
 }
 
 /** Read at most the authorized size plus one sentinel byte, even if the file grows. */
-async function readPreparedInline(real, info, open, stat) {
+export async function readPreparedInline(real, info, open = openImpl, stat = statImpl) {
   const file = await open(real, fsConstants.O_RDONLY | (fsConstants.O_NONBLOCK ?? 0) | (fsConstants.O_NOFOLLOW ?? 0));
   try {
     if (!sameFileVersion(info, await file.stat())) throw new Error('file changed');

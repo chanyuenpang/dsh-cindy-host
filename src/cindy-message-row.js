@@ -16,6 +16,8 @@
  *   tool_result       content: anything previewable  read by `contentToPreview`
  */
 
+import { attachmentImageUrl, nativeMessageImages, toolResultWithImages } from './host-attachment-reference.js';
+
 /**
  * DSH message roles this Host renders, and the phone row role each becomes.
  *
@@ -314,7 +316,7 @@ export function toCindyMessageRows(message, { sessionId, createdAt, now = () => 
     const id = `${sessionId}:${message.id}:0`;
     return [{ id, clientId: id, sessionId, role: 'tool_result', toolUseId: message.toolCallId, agentMeta: null,
       createdAt: createdAt ?? now().toISOString(),
-      content: { text: flattenToolResult(message.content), isError: message.isError === true } }];
+      content: { text: toolResultWithImages(flattenToolResult(message.content), message, sessionId), isError: message.isError === true } }];
   }
   const role = ROW_ROLE_BY_MESSAGE_ROLE.get(message?.role);
   // `system` (the prompt injection), a hook's injected turn, or any role this
@@ -346,10 +348,19 @@ export function toCindyMessageRows(message, { sessionId, createdAt, now = () => 
 
   blocks.forEach((block, index) => {
     if (block === null || typeof block !== 'object') return;
+    // Native assistant images use the same locator as tool images, not a fabricated user attachment.
+    if (role === 'assistant' && block.type === 'image') {
+      const image = nativeMessageImages(message).find(image => image.blockPath === String(index));
+      const url = image && attachmentImageUrl(sessionId, message.id, image.blockPath, image.ref);
+      if (url) {
+        const id = `${sessionId}:${message.id}:${index}`;
+        const label = (image.ref.name ?? 'image').replace(/[\[\]\r\n]/g, '_');
+        rows.push({ id, clientId: id, sessionId, role: 'assistant', toolUseId: null, agentMeta: null, createdAt: time, content: `![${label}](${url})` });
+      }
+      return;
+    }
     const kind = ROLE_BY_BLOCK[block.type];
-    // Images and files are not rows of their own here: an image needs a media
-    // channel this Host does not serve, and the file's chip travels on the text
-    // row above. Emitting them as empty rows would add noise, not information.
+    // User attachments travel on their text row; unknown blocks stay silent.
     if (kind === undefined) return;
     if (toolResultMessage && block.type !== 'tool-result') return;
 
@@ -414,7 +425,7 @@ export function toCindyMessageRows(message, { sessionId, createdAt, now = () => 
         rows.push({
           ...base,
           toolUseId: typeof block.toolCallId === 'string' ? block.toolCallId : null,
-          content: { text: flattenToolResult(block.content), isError: block.isError === true },
+          content: { text: toolResultWithImages(flattenToolResult(block.content), message, sessionId, index), isError: block.isError === true },
         });
         return;
       default:

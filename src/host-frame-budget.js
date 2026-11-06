@@ -31,6 +31,8 @@
  * character, and a page of base64 images is 4/3 of their size.
  */
 
+import { parseAttachmentImageUrl } from './host-attachment-reference.js';
+
 /**
  * The relay's hard frame ceiling, mirrored from `@cindy/device-link-protocol`.
  *
@@ -119,6 +121,30 @@ export function cutToBytes(text, limit) {
   return { text: `${text.slice(0, cut)}${TRUNCATION_SUFFIX}`, cut: true };
 }
 
+/** Keep Host-derived media JSON parseable when long tool text is compacted. */
+function cutManagedImageResult(text, limit) {
+  if (typeof text !== 'string' || !text.includes('xdt_image_urls') || byteLength(text) <= limit) return null;
+  let parsed;
+  try { parsed = JSON.parse(text); } catch { return null; }
+  if (typeof parsed?.text !== 'string' || !Array.isArray(parsed.xdt_image_urls) || !parsed.xdt_image_urls.length
+    || Object.keys(parsed).some(key => key !== 'text' && key !== 'xdt_image_urls')
+    || !parsed.xdt_image_urls.every(url => parseAttachmentImageUrl(url))) return null;
+  const urls = [...parsed.xdt_image_urls];
+  const encode = body => JSON.stringify({ text: body, xdt_image_urls: urls });
+  const suffix = () => TRUNCATION_SUFFIX + (urls.length < parsed.xdt_image_urls.length ? `\n[${parsed.xdt_image_urls.length - urls.length} image references omitted]` : '');
+  while (urls.length && byteLength(encode(suffix())) > limit) urls.pop();
+  let low = 0; let high = parsed.text.length;
+  const prefix = length => {
+    const value = parsed.text.slice(0, length);
+    return /[\uD800-\uDBFF]$/.test(value) ? value.slice(0, -1) : value;
+  };
+  while (low < high) {
+    const middle = Math.ceil((low + high) / 2);
+    if (byteLength(encode(prefix(middle) + suffix())) <= limit) low = middle; else high = middle - 1;
+  }
+  return { text: encode(prefix(low) + suffix()), cut: true };
+}
+
 /** `agentMeta` with the truncation witness merged in, as the reference marks it. */
 function markContentTruncated(agentMeta) {
   const base = agentMeta !== null && typeof agentMeta === 'object' && !Array.isArray(agentMeta) ? agentMeta : {};
@@ -152,7 +178,7 @@ export function compactRowText(rows) {
     }
     if (content === null || typeof content !== 'object' || Array.isArray(content)) return row;
     if (row.role === 'tool_result' || row.role === 'tool-use') {
-      const result = cutToBytes(content.text, TOOL_RESULT_LIMIT);
+      const result = cutManagedImageResult(content.text, TOOL_RESULT_LIMIT) ?? cutToBytes(content.text, TOOL_RESULT_LIMIT);
       if (result.cut) {
         changed = true;
         return { ...row, content: { ...content, text: result.text }, agentMeta: markContentTruncated(row.agentMeta) };

@@ -1,5 +1,12 @@
 # Changelog
 
+## 0.1.39 — 2026-11-07
+
+- Serve bounded, authorized project-grid WebP thumbnails through the existing file-browser contract; keep original-file reads independent of codec failures.
+- Preserve native tool/assistant image blocks through deterministic Cindy managed-media references. Resolve only the DSH attachment namespace against visible source messages and full native descriptors (including omitted optional names), verify bytes/hash/MIME, and deliver bounded thumbnails or on-demand staged originals. Keep live/history identities, source/connection fences, retry/cache budgets and explicit missing-source failures; never infer upload authority from JSON localPath.
+- Add Host regressions for generated PNG/JPEG media, legacy/canonical results, restart/history consistency, thumbnail resource/path boundaries and staging retries. No Cindy changes; publication, runtime activation and handset acceptance are separate verification steps.
+- Classify newly observed companion-live/setup-snapshot/setup-transfer channels as unsupported with exact refusal regressions. This read-only audit maintenance enables no cloud-companion, configuration migration, secret transfer or SSH authorization capability.
+
 ## 0.1.38 — 2026-11-07
 
 - Show a valid `run_code` description in Cindy's collapsed tool label as a Host-only display alias. Normalize the preview to one bounded line, remove control/bidi-spoofing characters, and cap it at 120 Unicode code points without changing original input or full details.

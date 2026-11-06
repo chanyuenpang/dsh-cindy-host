@@ -17,6 +17,8 @@
  *    reference host returns for an op it does not know.
  */
 
+import { fileThumbnail } from './host-file-thumbnail.js';
+
 /** Longest file this Host will inline for `readFile`. */
 export const READ_LIMIT_BYTES = 1024 * 1024;
 
@@ -147,7 +149,7 @@ function looksBinary(text) {
  * @param options - the filesystem service, plus injectable limits.
  * @returns `(args) => Promise<unknown>`, one result per op.
  */
-export function createFileBrowser({ fileSystem, readLimitBytes = READ_LIMIT_BYTES, listAllLimit = LIST_ALL_LIMIT }) {
+export function createFileBrowser({ fileSystem, readLimitBytes = READ_LIMIT_BYTES, listAllLimit = LIST_ALL_LIMIT, thumbnail = fileThumbnail }) {
   if (fileSystem === undefined || fileSystem === null) throw new Error('createFileBrowser requires a filesystem service');
 
   /** Resolve a workdir-relative path, or null when it escapes or cannot resolve. */
@@ -379,17 +381,11 @@ export function createFileBrowser({ fileSystem, readLimitBytes = READ_LIMIT_BYTE
     // reason* answer in their own documented shape, so the controller degrades
     // deliberately instead of showing a transport-looking failure.
     //
-    //  - `thumbnail` needs an image pipeline that produces the `image/webp` data
-    //    URL the controller expects; `THUMB_UNSUPPORTED` is the reference host's
-    //    own code for "this host cannot make one".
-    //  - `exportFileStart` hands a file on this machine to the account's staging area
-    //    so the *controller* can download it — the reverse of the attachment flow this
-    //    Host does serve (there it fetches what the phone uploaded). Uploading on
-    //    demand, with the progress polling `exportFileStatus` implies, is a transfer
-    //    manager rather than a read, and is not served.
-    if (op === 'thumbnail') {
-      return { ok: false, code: 'THUMB_UNSUPPORTED', message: 'this Host generates no thumbnails' };
-    }
+    // Thumbnail failures retain Cindy's THUMB_* result shape; original file reads
+    // remain independent of codec availability.
+    // Export jobs are intercepted by cindy-channels before reaching this reader;
+    // a standalone reader has no transfer manager and refuses those operations.
+    if (op === 'thumbnail') return thumbnail({ workdir, relPath });
     if (op === 'exportFileStart' || op === 'exportFileStatus') {
       return { ok: false, message: 'file export needs the Cindy media pipeline, which this Host does not serve' };
     }

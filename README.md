@@ -4,12 +4,12 @@ A Host-side adapter connecting current Cindy clients to DeepSeek Harness.
 
 ## Requirements and installation
 
-Version **0.1.38** shows valid `run_code` work descriptions in Cindy's collapsed tool labels without renaming execution tools or changing call/result pairing. It retains the earlier history stability, interruption controls and native capability subsets. Host regressions do not establish handset rendering or white-screen acceptance.
+Version **0.1.39** adds bounded project-grid thumbnails and native tool/assistant image delivery through authorized managed-media references. It retains the earlier tool work titles, history stability and interruption controls. Thumbnail decoding reuses the Host's image codec; codec failure does not block independent original-file reads. Host regressions do not establish handset rendering or white-screen acceptance.
 
 It supports the exact **DSH 0.2.2-alpha.2** carrier, while retaining `0.2.1-rc.3`, `0.2.1-rc.4` and `0.2.1-rc.5`. Alpha requires **Node.js >=24.9** (tested with 24.12); the older carriers retain this plugin's Node.js >=22.16 minimum. Agent/session/settings peers and alpha Schemastery are explicitly allowed, not a blanket promise for future prereleases. The full Web installation gate uses DSH **0.2.1-rc.5**; alpha core-contract checks do not establish alpha Web/relay/handset acceptance. Install through the Desktop DSH plugin manager. CLI-managed profiles can use:
 
 ```sh
-dsh plugin --profile <profile> add dsh-cindy-host@0.1.38
+dsh plugin --profile <profile> add dsh-cindy-host@0.1.39
 ```
 
 Reload the Host plugin after installation. A full DSH restart is separate. Keep existing Cindy sign-in, device identity and settings; do not run two Host processes with the same identity.

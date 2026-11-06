@@ -23,6 +23,7 @@ import { createHistoryViewController } from './host-history-view.js';
 import { createFileReader } from './host-files.js';
 import { createFileBrowser } from './host-file-browser.js';
 import { createAttachmentMaterializer } from './host-attachments.js';
+import { createNativeAttachmentSourceReader } from './host-attachment-media.js';
 import { createGoalWriter } from './host-goals.js';
 import { startHost } from './host.js';
 import { refusalError } from './cindy-channels.js';
@@ -654,6 +655,11 @@ export function buildDshSource(ctx, serviceName, options = {}) {
         return null;
       }
     };
+    const readAttachmentSource = createNativeAttachmentSourceReader({
+      getSession: sessionId => sessionSource.getSession(sessionId),
+      readSessionLog: sessionQuery === undefined ? undefined : sessionId => sessionQuery.readSession(sessionId),
+      readImage: readImageAttachment,
+    });
     const readMessages = sessionQuery === undefined
       ? undefined
       : createMessageReader({ readSessionLog: (sessionId) => sessionQuery.readSession(sessionId), readImageAttachment });
@@ -839,6 +845,7 @@ export function buildDshSource(ctx, serviceName, options = {}) {
       // Reported through the status route: "the photo does not render" has three
       // indistinguishable causes from the outside, and this separates them.
       attachmentReads,
+      readAttachmentSource,
       // Internal plumbing rather than a controller capability: the live push path has to inline a
       // message's images before the row leaves, exactly like the two read paths do. It rides the
       // seam so there is **one** hydrator (`hydrateRows`) instead of one per caller — a second
@@ -1485,6 +1492,7 @@ export function capabilityProvider(sources) {
     // NOT_AVAILABLE while the controller sat right here (the `queueControl` failure).
     historyView: sources.historyView,
     attachmentReads: sources.attachmentReads,
+    readAttachmentSource: sources.readAttachmentSource,
     // Internal (the live push path), but it crosses the same seam, so it is forwarded here: the
     // invariant test in `test/dsh-plugin.test.js` requires every seam key to be reachable, and a
     // key that exists but is reachable from nowhere is exactly the bug class this repo keeps

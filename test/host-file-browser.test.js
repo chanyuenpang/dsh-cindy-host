@@ -136,8 +136,8 @@ test('listAllFiles walks the tree and reports its own truncation', async () => {
   assert.equal(capped.truncated, true);
 });
 
-test('an op this Host does not serve says so instead of answering emptily', async () => {
-  const browser = createFileBrowser({ fileSystem: fakeFs(TREE) });
+test('unsupported thumbnails and unknown ops degrade without hiding original file operations', async () => {
+  const browser = createFileBrowser({ fileSystem: fakeFs(TREE), thumbnail: async () => ({ ok: false, code: 'THUMB_UNSUPPORTED', message: 'image codec unavailable' }) });
   // An op the controller asks for and this Host cannot serve *for a stated
   // reason* answers in that op's own documented shape, so the controller degrades
   // deliberately: `THUMB_UNSUPPORTED` is the reference host's own code for "this
@@ -145,7 +145,7 @@ test('an op this Host does not serve says so instead of answering emptily', asyn
   assert.deepEqual(await browser({ op: 'thumbnail', workdir: 'G:\\work', relPath: 'readme.md' }), {
     ok: false,
     code: 'THUMB_UNSUPPORTED',
-    message: 'this Host generates no thumbnails',
+    message: 'image codec unavailable',
   });
   const exportStart = await browser({ op: 'exportFileStart', workdir: 'G:\\work', relPath: 'readme.md' });
   assert.equal(exportStart.ok, false);

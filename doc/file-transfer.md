@@ -22,6 +22,13 @@ DSH Host 对接 Cindy 已有 `device-link:file-peer` / `files-v1` 协议。手�
 
 现有读取权限仍沿用本项目“同 Cindy 账号且未撤销的控制设备”合同；本次没有放宽成匿名下载接口，也不把 SSH 引用猜成本机路径。
 
+## 图片预览（0.1.39；安装与真机分别验收）
+
+- 项目列表 `thumbnail` 已提供 256px / q70 WebP，最多 48 MiB 输入、4000 万解码像素、128 KiB 输出；共享两路解码并发与 5 秒软时限。软超时不代表原生工作已取消，槽位要等真实结束才释放。读取前后验证文件身份/版本、workdir realpath 与敏感路径边界。失败保留 `THUMB_*` 占位，不阻断独立原图入口。
+- 工具结果的原生图片块派生为 Cindy 已有 `xdt_image_urls`，助手原生图片派生为 Markdown 引图；用户原有附件链路不变。仅接受 `xdt-image://dsh-attachment/v1/...` 受限命名空间，每次从可见源会话的原始消息重建完整原生 descriptor，再交原生附件服务读取并核对内容 hash/大小。JSON 内的 `image` / `original` / `localPath` 文字本身没有取图权限，不会被自动上传。
+- 聊天缩图最长边 1024px / q80，700 KiB 以内内联；不能缩图时仅 512 KiB 以内原件可内联，其余按需走既有 OSS staging，原图上限保持 25 MiB。原生 MIME 不依赖文件扩展名。传输缓存按内容及连接/source 代次隔离，重复取件合并，`skipCache` 重建传输对象；缺源不重新生成、不回退读取本机路径。
+- 首次历史、work details 与实时消息共用确定性投影，不把源图片字节塞入历史帧。未改 Cindy；源码实现、发布、实际激活和配对版本真机验证必须分别确认。Cindy Markdown **文件阅读器**内项目相对图片的接线缺口不在此 Host-only 修复范围。
+
 ## 运行时与维护门禁
 
 运行依赖固定为 `werift@0.24.4`（纯 Node，Node >=22），仅请求 peer 时延迟加载，不引入 Electron。该版本直接发送空 Buffer 会消费 SCTP 序号却不发 DATA，使 Cindy EOF 和后续文件卡住。`src/file-peer-rtc.js` 对空包使用同一发送队列、PPID 57 和一个忽略字节，保持顺序及缓冲计数。
@@ -29,6 +36,8 @@ DSH Host 对接 Cindy 已有 `device-link:file-peer` / `files-v1` 协议。手�
 **这个小适配依赖固定版本的内部 API**。升级 werift 必须重新跑真实浏览器验收，尤其“EOF 后再传文件”；不能只凭模拟单测升级。`--native-empty` 可复现上游缺陷，不是通过型测试。
 
 ## 验证
+
+实现阶段的[完整 Host 回归](<../artifacts/image-preview-tests-verified.log#L1326-L1331>)为 1237 项、1229 通过、8 项可选集成跳过、0 失败，并记录过 Electron 原生 codec 的 PNG/JPEG → WebP 验证。0.1.39 发布门禁另启用实际 DSH 0.2.1-rc.5 Cordis/UserQuestions/Gateway 契约并补充原生可选图片名称兼容回归：1234 通过、4 跳过、0 失败。91 文件固定包在全新隔离 profile 通过 30 项运行检查，并经真实 HTTP `thumbnail` 调用分别将生成的 PNG/JPEG 解为 256×144 WebP（宿主 sharp 0.35.5），不是注入的模拟 codec。当前有界通道审计为 259 项、75 服务、184 明确拒绝、0 未分类；新增的 companion-live/setup-snapshot/setup-transfer 仅补充准确拒绝分类及回归，未启用业务功能，不代表全协议覆盖。原生附件 staging 的真实云端/手机链路和真机显示仍需独立验收。
 
 ```powershell
 npm test
