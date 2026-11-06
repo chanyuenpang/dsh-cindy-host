@@ -1,5 +1,10 @@
 # Changelog
 
+## 0.1.38 — 2026-11-07
+
+- Show a valid `run_code` description in Cindy's collapsed tool label as a Host-only display alias. Normalize the preview to one bounded line, remove control/bidi-spoofing characters, and cap it at 120 Unicode code points without changing original input or full details.
+- Keep execution tool names, call/result identities, other tools and exact-name special cards unchanged. Share the projection between live and history reads; invalid/missing descriptions retain the original name. Add focused display/input-immutability/pairing regressions; handset rendering remains separate acceptance.
+
 ## 0.1.37 — 2026-11-06
 
 - Use explicit source-order history snapshots for both validated persistence and the hot fallback reader. Preserve legacy raw order, reconcile live reasoning through native history-live client identities, and page by source cuts; unknown cursors now fail explicitly rather than silently skipping history.

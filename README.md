@@ -4,12 +4,12 @@ A Host-side adapter connecting current Cindy clients to DeepSeek Harness.
 
 ## Requirements and installation
 
-Version **0.1.37** stabilizes source-order history pagination, per-controller history delivery state and bounded interim reasoning updates. It retains 0.1.36's interruption controls and the earlier diagnostics, question synchronization, authentication and native capability subsets. Host regressions do not establish that handset white-screen issues are resolved.
+Version **0.1.38** shows valid `run_code` work descriptions in Cindy's collapsed tool labels without renaming execution tools or changing call/result pairing. It retains the earlier history stability, interruption controls and native capability subsets. Host regressions do not establish handset rendering or white-screen acceptance.
 
 It supports the exact **DSH 0.2.2-alpha.2** carrier, while retaining `0.2.1-rc.3`, `0.2.1-rc.4` and `0.2.1-rc.5`. Alpha requires **Node.js >=24.9** (tested with 24.12); the older carriers retain this plugin's Node.js >=22.16 minimum. Agent/session/settings peers and alpha Schemastery are explicitly allowed, not a blanket promise for future prereleases. The full Web installation gate uses DSH **0.2.1-rc.5**; alpha core-contract checks do not establish alpha Web/relay/handset acceptance. Install through the Desktop DSH plugin manager. CLI-managed profiles can use:
 
 ```sh
-dsh plugin --profile <profile> add dsh-cindy-host@0.1.37
+dsh plugin --profile <profile> add dsh-cindy-host@0.1.38
 ```
 
 Reload the Host plugin after installation. A full DSH restart is separate. Keep existing Cindy sign-in, device identity and settings; do not run two Host processes with the same identity.
@@ -94,6 +94,10 @@ Organization ID/slug/domain and email discovery check both regions. A found orga
 **CAPTCHA browser limitation:** when a region requires it for code delivery, open the official verification page, solve it, then copy its complete successful URL (including `#cindy-captcha=ok.…`) into the DSH form. The standard browser cannot read the cross-origin result automatically. The verification proof is sensitive and short-lived: do not share it. The Host validates its official origin and forwards only the proof to the requested auth action; it does not bypass verification or proxy/inject the challenge page. Apple/SSO browser authorization does not use this manual code-delivery step.
 
 This feature ships in 0.1.33; installation and runtime activation are verified separately. Tests cover protocol, real local callbacks, settings-panel state, credential races and both regions' actual runtime URL routing with fake credentials. Real Apple/enterprise identity providers and iOS discovery/file round trips still require an authorized test account after deployment. See [authentication flow notes](doc/auth-login.md). The new browser flow is exposed by the settings page; the older interactive CLI is not a replacement for that UI on Windows.
+
+## Tool work titles on Cindy mobile (0.1.38)
+
+The Host projects `run_code` calls with a non-empty string `description` as `run_code · <description>` in Cindy’s collapsed tool row. Titles are normalized to one line and limited to a 120-code-point preview; the original input, code and full description remain in expanded details. Calls without a valid title and all other tool names keep their existing mapping. Live events and history use the same projection, and results remain paired by `toolUseId`. This is a Host-only display alias, not a renamed DSH execution tool. Reload an updated Host to apply it; existing phone-cached history may need reloading. Handset rendering has not been acceptance-tested.
 
 ## Thinking content on Cindy mobile (0.1.33)
 

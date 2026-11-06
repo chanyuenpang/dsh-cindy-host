@@ -69,8 +69,26 @@ function parseToolArguments(raw) {
  */
 const TOOL_NAME_BY_DSH_NAME = { todo_write: 'TodoWrite' };
 
-/** Map one DSH tool name to the phone's vocabulary. */
-function cindyToolName(name) {
+/**
+ * Project a tool name for Cindy's read-only transcript, never for execution.
+ * Mobile's generic tool row uses toolName as its collapsed label and leaves
+ * input.description in expanded details. Only run_code needs this display alias;
+ * special card names (notably TodoWrite) must retain their exact vocabulary.
+ */
+function cindyToolName(name, input) {
+  if (name === 'run_code' && input !== null && typeof input === 'object'
+    && !Array.isArray(input) && typeof input.description === 'string') {
+    // One bounded line, without control/bidi characters that could spoof the name.
+    // Keep the original input intact for expanded details and result pairing by ID.
+    const title = input.description
+      .replace(/[\u0000-\u001f\u007f-\u009f\u200e\u200f\u202a-\u202e\u2066-\u2069]/g, ' ')
+      .replace(/\s+/gu, ' ').trim();
+    const characters = Array.from(title);
+    if (characters.length > 0) {
+      const preview = characters.length > 120 ? `${characters.slice(0, 119).join('')}…` : title;
+      return `${name} · ${preview}`;
+    }
+  }
   return TOOL_NAME_BY_DSH_NAME[name] ?? name;
 }
 
@@ -379,17 +397,19 @@ export function toCindyMessageRows(message, { sessionId, createdAt, now = () => 
           ? `${sessionId}:reasoning-stream:${identity.turn}:${identity.step}:${index}` : clientId;
         rows.push({ ...base, clientId: logical, content: { text: block.text } });
         return;
-      case 'tool-call':
+      case 'tool-call': {
+        const input = parseToolArguments(block.arguments);
         rows.push({
           ...base,
           toolUseId: typeof block.id === 'string' ? block.id : null,
           content: {
-            toolName: typeof block.name === 'string' ? cindyToolName(block.name) : '',
-            input: parseToolArguments(block.arguments),
+            toolName: typeof block.name === 'string' ? cindyToolName(block.name, input) : '',
+            input,
             ...(typeof block.id === 'string' ? { toolUseId: block.id } : {}),
           },
         });
         return;
+      }
       case 'tool-result':
         rows.push({
           ...base,
