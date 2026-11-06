@@ -16,7 +16,7 @@
  * history, and model requests all share, so a second copy here would drift.
  */
 import { deriveEventMessage, isAppendSurfaceEvent } from '@deepseek-ai/dsh-session/surface';
-import { createReasoningStream } from './reasoning-stream.js';
+import { createHistoryProjection } from './history-snapshot.js';
 import { turnDiagnosticRow, turnStateFromEvents } from './turn-error.js';
 import { advanceInterruptionMetadata } from './diagnostic-presentation.js';
 import { toCindyMessageRows, toCindyMessages, hydrateImageAttachments } from './cindy-message-row.js';
@@ -107,7 +107,8 @@ export function foldSessionEvent(event, { sessionId, now = () => new Date() }) {
   const createdAt = Number.isFinite(event.time) ? new Date(event.time).toISOString() : now().toISOString();
   // The controller's own id for a submitted prompt travels with the row so it
   // can retire the copy it showed optimistically.
-  return toCindyMessageRows(message, { sessionId, createdAt, now, promptClientId: promptRpcIdOf(event) });
+  return toCindyMessageRows(message, { sessionId, createdAt, now, promptClientId: promptRpcIdOf(event),
+    reasoningIdentity: event.type === 'assistant/message' ? event.data : null });
 }
 
 /** The `source` a message carries, whichever shape the surface handed over. */
@@ -291,6 +292,18 @@ function widenNewestPage(options) {
   return { ...options, limit: NEWEST_WINDOW_ROWS };
 }
 
+/** Shared public display fold; never changes input delivery evidence. */
+export function displayEventRows(event, context) {
+  const todo = entryForTodoWrite(event);
+  return todo ? toCindyMessageRows(todo.message, { ...context, createdAt: todo.createdAt }) : foldSessionEvent(event, context);
+}
+
+export function historySnapshotFromEvents(events, sessionId, options = {}) {
+  const projection = createHistoryProjection(sessionId);
+  for (const event of events) projection.consume(event, displayEventRows(event, { sessionId }));
+  return projection.snapshot(options);
+}
+
 /**
  * Render one DSH `todo/write` snapshot as the row the phone draws its plan card from.
  *
@@ -377,53 +390,25 @@ export function createMessageReader({
   const seeding = new Map();
   let clock = 0;
 
-  /** Fold one session's log into message entries, in log order. */
+  /** One fold feeds both the legacy raw order and the explicit history snapshot. */
   async function entriesFor(sessionId) {
     const snapshot = await readSessionLog(sessionId);
     const events = Array.isArray(snapshot?.events) ? snapshot.events : [];
     const entries = [];
-    const reasoning = createReasoningStream(sessionId);
+    const history = createHistoryProjection(sessionId);
     let lastSeq = null;
     let nativeMetadata = null;
     let nativeValid = true;
     for (const event of events) {
       if (event === null || typeof event !== 'object') continue;
-      // Every event's seq counts, not only the ones that render: contiguity is a
-      // property of the log, and a caller comparing against renders would read a
-      // gap as "nothing happened here".
       if (!Number.isSafeInteger(event.seq) || event.seq < 0 || (lastSeq !== null && event.seq !== lastSeq + 1)) nativeValid = false;
       if (Number.isFinite(event.seq)) lastSeq = event.seq;
       nativeMetadata = advanceInterruptionMetadata(nativeMetadata, event, sessionId);
-      reasoning.consume(event);
-      const diagnostic = turnDiagnosticRow(event, sessionId);
-      if (diagnostic) {
-        entries.push({ rows: [diagnostic] });
-        continue;
-      }
-      const todo = entryForTodoWrite(event);
-      if (todo !== null) {
-        entries.push(todo);
-        continue;
-      }
-      if (!isAppendSurfaceEvent(event)) continue;
-      let message;
-      try {
-        message = deriveEventMessage(event);
-      } catch {
-        // One unprojectable event must not cost the whole transcript; the same
-        // rule the surface fold applies per node.
-        continue;
-      }
-      if (message === null || message === undefined) continue;
-      entries.push({
-        message,
-        createdAt: Number.isFinite(event.time) ? new Date(event.time).toISOString() : now().toISOString(),
-        // Same reason as the live fold: the durable read has to identify a user
-        // turn by the id the controller minted, or its optimistic copy survives.
-        promptClientId: promptRpcIdOf(event),
-      });
+      const rows = displayEventRows(event, { sessionId, now });
+      history.consume(event, rows);
+      if (rows.length) entries.push({ rows });
     }
-    return { entries, lastSeq, reasoning, nativeValid, nativeMetadata: nativeValid ? nativeMetadata : null };
+    return { entries, lastSeq, history, reasoning: history.reasoning, nativeValid, nativeMetadata: nativeValid ? nativeMetadata : null };
   }
 
   /** Drop the least recently used transcripts, keeping the window bounded. */
@@ -503,9 +488,9 @@ export function createMessageReader({
         // invalidation also detaches this flight so a post-invalidation read starts
         // fresh; an older completion must never overwrite that newer generation.
         if (seeding.get(sessionId) === flight && !flight.dirty) {
-          touch(sessionId, { rows, reasoning: read.reasoning, seq: read.lastSeq, at: clock, nativeValid: read.nativeValid, nativeMetadata: read.nativeMetadata });
+          touch(sessionId, { rows, history: read.history, reasoning: read.reasoning, seq: read.lastSeq, at: clock, nativeValid: read.nativeValid, nativeMetadata: read.nativeMetadata });
         }
-        return transcripts.get(sessionId) ?? { rows, reasoning: read.reasoning, nativeMetadata: read.nativeMetadata };
+        return transcripts.get(sessionId) ?? { rows, history: read.history, reasoning: read.reasoning, nativeMetadata: read.nativeMetadata };
       } finally {
         // Failure is not an authoritative empty transcript. Release this flight
         // on success or rejection, without deleting a newer read's ownership.
@@ -560,7 +545,7 @@ export function createMessageReader({
     if (entry.nativeValid !== false) entry.nativeMetadata = advanceInterruptionMetadata(entry.nativeMetadata, event, sessionId);
     entry.seq = seq;
     entry.at = ++clock;
-    entry.reasoning.consume(event);
+    // The history projection owns the raw overlay reducer too.
     // A live todo snapshot becomes the same `TodoWrite` row the durable read produces, so
     // the phone's plan card updates while the plan is being worked rather than only when
     // the transcript is re-read.
@@ -568,6 +553,7 @@ export function createMessageReader({
     const rows = todoEntry === null
       ? foldSessionEvent(event, { sessionId, now })
       : toCindyMessageRows(todoEntry.message, { sessionId, createdAt: todoEntry.createdAt, now });
+    entry.history.consume(event, rows);
     // Newest first: this event is the newest thing in the log, so its rows are the
     // new head of the array, in block order.
     if (rows.length > 0) entry.rows = [...rows, ...entry.rows];
@@ -615,6 +601,7 @@ export function createMessageReader({
    * The array is the cache's own, so callers treat it as read-only.
    */
   readMessages.all = async (sessionId) => visibleRows(await ensureTranscript(sessionId));
+  readMessages.historySnapshot = async (sessionId) => (await ensureTranscript(sessionId)).history.snapshot();
   // Recovery deliberately bypasses the transcript cache: stale history cannot
   // decide whether the *current* turn has ended. Runtime generation guards the read.
   readMessages.turnState = async (sessionId) => {

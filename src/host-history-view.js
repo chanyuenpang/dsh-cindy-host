@@ -29,8 +29,8 @@
  *  - `intent` replaces the set of expanded work keys wholesale; it is advisory.
  *  - An error whose text matches `isHistoryViewUnavailable` sends the controller back to
  *    the raw window. `UNSUPPORTED_CAPABILITY` is therefore how this Host *deliberately*
- *    declines a session it cannot project (a transcript past the scan budget) — the same
- *    lever the reference uses.
+ *    declines an unavailable projection capability, never a large or stale session.
+ *    Per-session missing references use retryable NOT_FOUND/BAD_REQUEST instead.
  *
  * Grouping here is by **DSH turn boundary as the controller can see it**: a row whose role
  * is `user` starts a work group, and everything up to the next one belongs to it. The
@@ -129,8 +129,8 @@ function isActivityRow(row) {
  *   default) derives it: a transcript that does not end in an answer is still being written.
  * @returns items in **chronological** order, oldest first.
  */
-export function groupHistoryItems(rows, { running = null, maxWorkRows = WORK_ITEM_MAX_ROWS } = {}) {
-  const chronological = [...rows].reverse();
+export function groupHistoryItems(rows, { running = null, maxWorkRows = WORK_ITEM_MAX_ROWS, chronological: inSourceOrder = false } = {}) {
+  const chronological = inSourceOrder ? rows : [...rows].reverse();
   const items = [];
   let run = [];
 
@@ -159,6 +159,7 @@ export function groupHistoryItems(rows, { running = null, maxWorkRows = WORK_ITE
 
 /** Rows of the live tail a streaming work item shows without being expanded. */
 export const WORK_PREVIEW_ROWS = 5;
+export const WORK_PREVIEW_BYTES = 6 * 1024;
 
 /**
  * One work item for a run of activity rows.
@@ -190,8 +191,14 @@ function workItem(run, streaming) {
   // streaming group. Without it, folding activity into work items meant a long turn showed
   // nothing but a spinner: measured, the phone sat on 「一直在思考中转圈」 for minutes while
   // this Host pushed 100+ rows that were all inside a collapsed group.
-  if (streaming && run.length > 0) {
-    const tail = run.slice(Math.max(0, run.length - WORK_PREVIEW_ROWS));
+  const tail = [];
+  let previewBytes = 0;
+  if (streaming) for (let index = run.length - 1; index >= 0 && tail.length < WORK_PREVIEW_ROWS; index -= 1) {
+    const size = itemBytes(run[index]);
+    if (previewBytes + size > WORK_PREVIEW_BYTES) break;
+    tail.unshift(run[index]); previewBytes += size;
+  }
+  if (tail.length > 0) {
     const previewFirst = tail[0];
     const previewLast = tail[tail.length - 1];
     summary.preview = {
@@ -222,13 +229,15 @@ function itemBytes(item) {
 /**
  * Build the reader behind the three view channels.
  *
- * @param options - `rows` (the transcript reader's whole-transcript accessor),
+ * @param options - `snapshot` (explicit source-order rows and reference resolver),
+ *   or `rows` for legacy callers with a strictly newest-first array,
  *   `sessionRunning` (whether the session is in a turn right now, for `isStreaming`),
  *   and the page/scan limits.
  * @returns `{ page, details, intent, expandedFor }`.
  */
 export function createHistoryViewController({
   rows,
+  snapshot,
   sessionRunning = () => false,
   pageItems = HISTORY_PAGE_ITEMS,
   pageBytes = HISTORY_PAGE_BYTES,
@@ -263,16 +272,20 @@ export function createHistoryViewController({
     if (typeof sessionId !== 'string' || sessionId === '') {
       return { ok: false, code: 'BAD_REQUEST', message: 'history view needs a session' };
     }
-    if (typeof rows !== 'function') {
+    if (typeof rows !== 'function' && typeof snapshot !== 'function') {
       return { ok: false, code: 'NOT_AVAILABLE', message: 'this DSH Host cannot project session history' };
     }
     let all;
     try {
-      all = await rows(sessionId);
+      all = typeof snapshot === 'function' ? await snapshot(sessionId) : await rows(sessionId);
     } catch {
       return { ok: false, code: 'NOT_FOUND', message: 'this session has no readable transcript' };
     }
-    if (!Array.isArray(all)) return { ok: false, code: 'INTERNAL', message: 'the transcript could not be read' };
+    if (Array.isArray(all)) {
+      const chronological = [...all].reverse();
+      all = { rows: chronological, resolve: id => chronological.findIndex(row => row.id === id) };
+    }
+    if (!Array.isArray(all?.rows) || typeof all.resolve !== 'function') return { ok: false, code: 'INTERNAL', message: 'the transcript could not be read' };
     // Long transcripts are **served**, not refused.
     //
     // This was `all.length > scanMaxRows → UNSUPPORTED_CAPABILITY`, on the reasoning that the
@@ -293,7 +306,7 @@ export function createHistoryViewController({
     // `UNSUPPORTED_CAPABILITY` and `CHANNEL_NOT_ALLOWED` are therefore reserved for "this Host
     // has no projection capability at all" — a deployment fact — and never for a property of
     // one session. See ADR-0007's decision evolution.
-    return { ok: true, rows: all };
+    return { ok: true, rows: all.rows, resolve: all.resolve };
   }
 
   /**
@@ -304,23 +317,17 @@ export function createHistoryViewController({
   async function page(sessionId, before = undefined) {
     const read = await transcriptFor(sessionId);
     if (read.ok !== true) return read;
-    const items = groupHistoryItems(read.rows, {
-      running: typeof sessionRunning === 'function' ? sessionRunning(sessionId) === true : null,
-    });
-
-    // `before` names a row inside the older part of the transcript: everything at or after
-    // it has already been sent, so the next page starts strictly older than that item.
-    let end = items.length;
+    let endRow = read.rows.length;
     if (typeof before === 'string' && before !== '') {
-      const index = items.findIndex((item) => firstIdOf(item) === before
-        || (item.type === 'work' && item.summary.lastMessageId === before));
-      if (index >= 0) end = index;
-      else {
-        // A cursor this Host cannot place: answer the oldest page we have rather than the
-        // newest one again, which is what re-serving the same rows would amount to.
-        end = Math.min(items.length, pageItems);
-      }
+      endRow = read.resolve(before, { cut: true });
+      if (endRow < 0) return { ok: false, code: 'NOT_FOUND', message: 'history cursor is no longer in this session' };
     }
+    // Cut by source position before grouping: an anchor may now lie inside a merged work.
+    const items = groupHistoryItems(read.rows.slice(0, endRow), {
+      chronological: true,
+      running: !before && (typeof sessionRunning === 'function' ? sessionRunning(sessionId) === true : null),
+    });
+    const end = items.length;
     const selected = [];
     let bytes = 1024;
     for (let index = end - 1; index >= 0; index -= 1) {
@@ -354,16 +361,16 @@ export function createHistoryViewController({
     const firstId = typeof ref?.firstMessageId === 'string' ? ref.firstMessageId : '';
     const lastId = typeof ref?.lastMessageId === 'string' ? ref.lastMessageId : '';
     if (firstId === '' || lastId === '') return { ok: false, code: 'BAD_REQUEST', message: 'a work range needs both endpoints' };
-    // The transcript is newest first; the range is inclusive in log order.
-    const chronological = [...read.rows].reverse();
-    const from = chronological.findIndex((row) => row.id === firstId);
-    const to = chronological.findIndex((row) => row.id === lastId);
+    // Both endpoints and the forward cursor resolve against one source-order snapshot.
+    const chronological = read.rows;
+    const from = read.resolve(firstId);
+    const to = read.resolve(lastId);
     if (from < 0 || to < 0 || to < from) return { ok: false, code: 'NOT_FOUND', message: 'this work range is no longer in the transcript' };
     const range = chronological.slice(from, to + 1);
     let start = 0;
     if (typeof after === 'string' && after !== '') {
-      const index = range.findIndex((row) => row.id === after);
-      if (index < 0) return { ok: false, code: 'BAD_REQUEST', message: 'the detail cursor is outside this work range' };
+      const index = read.resolve(after) - from;
+      if (index < 0 || index >= range.length) return { ok: false, code: 'BAD_REQUEST', message: 'the detail cursor is outside this work range' };
       start = index + 1;
     }
     const messages = [];

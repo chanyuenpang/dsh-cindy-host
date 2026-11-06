@@ -1,5 +1,5 @@
 import { createAttachmentMaterializer, hostAttachmentsOf } from './host-attachments.js';
-import { foldSessionEvent } from './dsh-message-fold.js';
+import { historySnapshotFromEvents } from './dsh-message-fold.js';
 import { interruptedTurnClosers } from '@deepseek-ai/dsh-session';
 import { turnStateFromEvents } from './turn-error.js';
 import { continuationKind } from './continuation-protocol.js';
@@ -57,7 +57,14 @@ export function createDshInputDeliveryBackend({getServices,sessionController,get
       // session or agent must never be diagnosed as a crashed writer.
       const cold=!s.sessions.get(sid)&&typeof s.agents?.get==='function'&&!s.agents.get(sid);
       const events=cold?[...persisted,...interruptedTurnClosers(persisted)]:persisted;
-      const rows=[];for(const event of events){const folded=foldSessionEvent(event,{sessionId:sid});folded.forEach((row,index)=>{const rowid=event.seq*65536+index;if(!Number.isSafeInteger(rowid))throw deliveryError('DELIVERY_EVIDENCE_CORRUPT','Message order exceeds the safe protocol range');rows.push({...row,rowid});});}return rows.reverse();},
+      // Preserve the raw newest-first order/rowid contract while including the same
+      // public live overlay as history. Receipt evidence still reads the native log only.
+      return historySnapshotFromEvents(events, sid, { rowids: true }).rows.reverse();},
+    async historySnapshot(sid) {
+      const persisted = await readLog(sid); const s = services();
+      const cold = !s.sessions.get(sid) && typeof s.agents?.get === 'function' && !s.agents.get(sid);
+      return historySnapshotFromEvents(cold ? [...persisted, ...interruptedTurnClosers(persisted)] : persisted, sid);
+    },
     async evidence(sid){const events=await readLog(sid);const proof=durableInputEvidence(events,sid);const agent=getServices().agents?.get(sid);return {...proof,running:agent?.status==='running',live:agent!==undefined};},
     async prepare(sid,row,{resolveAttachmentRef,mode='queue'}={}){
       assertNoStructuredSessionReferences(row);

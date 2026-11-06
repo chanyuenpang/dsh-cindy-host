@@ -1,5 +1,11 @@
 # Changelog
 
+## 0.1.37 — 2026-11-06
+
+- Use explicit source-order history snapshots for both validated persistence and the hot fallback reader. Preserve legacy raw order, reconcile live reasoning through native history-live client identities, and page by source cuts; unknown cursors now fail explicitly rather than silently skipping history.
+- Fold raw thinking pushes only for the subscribed controller that successfully received a current history page. Reset this disposable state on read/send failure and lifecycle changes, preserve pending-read trailing refreshes, and fence replies against stale relay generations.
+- Coalesce interim reasoning at 1s with latest-wins deduplication and serialized UTF-8 budgets (32 KiB/s, 64 KiB burst/snapshot). Bound automatic preview ranges to 5 rows/6 KiB without truncating full details or delaying terminal retirement. These are Host-side safeguards, not handset white-screen acceptance or proof that every device's failure is resolved.
+
 ## 0.1.36 — 2026-11-06
 
 - Project proven native interruption identities and timestamp tuples consistently into session list/get, boundaries and reconnect updates. Clear non-pending/hidden/running presentation without fabricating transcript-clear or completion facts.

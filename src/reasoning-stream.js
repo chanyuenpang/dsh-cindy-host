@@ -44,15 +44,16 @@ export function createReasoningStream(sessionId) {
     return isDelta || isEnd;
   }
 
-  function rows() {
-    return [...blocks].flatMap(([index, block]) => {
+  function entries() {
+    return [...blocks].sort(([a], [b]) => a - b).flatMap(([index, block]) => {
       const content = block.chunks.join('');
       if (!content) return [];
-      const id = `${sessionId}:reasoning-stream:${key}:${index}`;
-      return [{ id, clientId: id, sessionId, role: 'thinking', content: { text: content, isStreaming: block.isStreaming },
-        toolUseId: null, agentMeta: null, createdAt: block.createdAt, isStreaming: block.isStreaming }];
+      const clientId = `${sessionId}:reasoning-stream:${key}:${index}`;
+      return [{ scope: key, index, row: { id: `history-live:${clientId}`, clientId, sessionId, role: 'thinking', content: { text: content, isStreaming: block.isStreaming },
+        toolUseId: null, agentMeta: null, createdAt: block.createdAt, isStreaming: block.isStreaming } }];
     });
   }
 
-  return { consume, rows, clear };
+  const rows = () => entries().map(entry => entry.row);
+  return { consume, rows, entries, clear };
 }

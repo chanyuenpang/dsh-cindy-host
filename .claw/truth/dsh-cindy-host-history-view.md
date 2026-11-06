@@ -1,4 +1,4 @@
-﻿# Work-grouped history view channels
+# Work-grouped history view channels
 
 <!-- state: current -->
 ## Current behavior
@@ -66,6 +66,29 @@ Refusal and fallback semantics (fail closed, deliberately):
   `capabilitiesNow().historyView`, so `capabilityProvider` in `src/dsh-plugin.js` has to
   forward `sources.historyView` (the project's seam-forwarding invariant test catches an
   omission here).
+
+Live reasoning overlay and paging behavior:
+
+### Current Host correction (2026-11-06)
+
+- History pages/details now share an explicit source-order snapshot (`src/history-snapshot.js`, `src/host-history-view.js`); raw transcript ordering/wire contract remains separate. Validated durable reads still use their flush/contiguous-prefix evidence rather than being bypassed by fallback cache. Pagination resolves `before`/`first`/`last`/`after` against that same snapshot; an unknown cursor fails explicitly instead of masquerading as the oldest page.
+- Live reasoning uses `history-live:<logical clientId>` and preserves logical identity when durable. Retired display-only rows retain only a replay-reconstructible paging cut, not their body; resolver/replay does not add database or event-log records.
+- Thinking `created` filtering is scoped to the accepted controller/session subscription whose latest history page was successfully written on its current connection (`src/history-delivery-state.js`, `src/host.js`). It is not a remote application ACK; pending, failed, stale, or unauthorized delivery does not establish readiness.
+- Interim reasoning publication (`src/reasoning-publisher.js`) is deduplicated/latest-wins with a one-second coalescing interval, a 32 KiB/s token rate, 64 KiB burst and 64 KiB per-snapshot UTF-8 payload ceiling before fan-out. Oversized interim content is not truncated and mislabeled complete; complete content remains available through raw/history details or durable output. Automatic work preview is capped at 5 rows / 6 KiB serialized content. These are source-publisher budgets, not total network or end-to-end memory bounds.
+- Automated evidence in `doc/history-stability-verification.md`: 1209 tests (1201 pass, 8 skipped, 0 failed), channel audit 249 (75 served, 174 declined, 0 unclassified), and `git diff --check` passed. This does not establish deployment, handset acceptance, or the Android blank-screen root cause.
+
+<!-- state: history -->
+## Evolution history
+
+<!-- dated: 2026-11-06 -->
+### Projection-order, cursor-continuity and interim-push correction
+
+The investigation reproduced the ordering and cursor defects described below. The Host correction above records current behavior; those findings remain useful as defect/incident context, not current contracts:
+
+- The live reader composed `visibleRows` as reasoning overlay rows followed by cached transcript rows (`src/dsh-message-fold.js`), while the history grouper reversed its input (`src/host-history-view.js`). A production-module memory reproduction recorded a thinking+assistant sequence as assistant+work and marked the trailing work group streaming while the turn remained active. This was a reproduced projection/order defect, not evidence that it alone caused a phone blank screen.
+- Before the correction, an unplaceable `before` cursor selected the oldest available page, and retirement of temporary reasoning IDs could create a paging gap. Regression coverage was added for the corrected explicit unknown-cursor failure and live-to-durable continuity.
+- A publisher simulation (600 × 100-character increments; 60 KB final text) produced 18,199,200 bytes of cumulative full-message payload. This was a local simulated measurement, not observed phone-network traffic. The simulation motivated source-side budgeting; it was not proof of a measured handset traffic volume.
+- Native comparison in the investigation found per-controller/history-readiness filtering, bounded work previews, revision-based patches and live-to-durable alias resolution. Those comparisons do not prove the Android blank-screen mechanism. Renderer-mount, JS and OOM causes remain unresolved absent phone-side traces/device reproduction.
 
 Pitfalls:
 

@@ -64,7 +64,7 @@ test('reasoning chunks use session-scoped native thinking pushes and retire the 
   const timers = new Map();
   let timerId = 0;
   const { runtime, socket } = await runtimeWithSocket({
-    setTimeout: (callback, ms) => { const id = ++timerId; timers.set(id, { callback, ms }); return id; },
+    setTimeout: (callback, ms) => { const id = ++timerId; timers.set(id, { callback: () => { timers.delete(id); callback(); }, ms }); return id; },
     clearTimeout: id => timers.delete(id),
   });
   try {
@@ -77,7 +77,7 @@ test('reasoning chunks use session-scoped native thinking pushes and retire the 
       chunk: { type: 'reasoning-delta', index: 0, text: '公开摘要' } } };
     runtime.pushSessionReasoning('s1', event);
     runtime.pushSessionReasoning('s2', event);
-    for (const { callback, ms } of [...timers.values()]) if (ms === 100) callback();
+    for (const { callback, ms } of [...timers.values()]) if (ms === 1000) callback();
     const created = socket.sent.filter(frame => frame.kind === 'push' && frame.payload.channel === 'local-db:messages:created');
     assert.equal(created.length, 1);
     assert.equal(created[0].dst, 'phone');
@@ -93,7 +93,7 @@ test('reasoning chunks use session-scoped native thinking pushes and retire the 
     assert.deepEqual(messages[1].payload.payload.clientIds, [row.clientId]);
     runtime.pushSessionReasoning('s1', { ...event, seq: 3, data: { ...event.data, step: 2 } });
   } finally { await runtime.stop(); }
-  assert.equal([...timers.values()].filter(timer => timer.ms === 100).length, 0, 'no reasoning timer outlives the Host');
+  assert.equal([...timers.values()].filter(timer => timer.ms === 1000).length, 0, 'no reasoning timer outlives the Host');
 });
 
 test('device deletion removes only confirmed records and ignores stale owner completion', async () => {

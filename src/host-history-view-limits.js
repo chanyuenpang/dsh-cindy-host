@@ -1,12 +1,11 @@
 /**
- * The history view's page budgets, mirrored from the Cindy contract.
+ * Conservative Host page budgets within the Cindy v1 contract.
  *
  * Stated here rather than imported because this Host composes the protocol over the wire,
- * not the package: `@cindy/maker-shared/message-window` publishes
- * `HISTORY_VIEW_PAGE_ITEMS = 20`, `HISTORY_VIEW_PAGE_BYTES = 256 * 1024`,
- * `HISTORY_DETAIL_PAGE_BYTES = 256 * 1024`, and `HISTORY_VIEW_VERSION = 1`. A change on
- * the Cindy side shows up as a failing test here instead of a page the phone silently
- * truncates.
+ * not the package. The current Cindy v1 view ceiling is 1 MiB, with 20 items and
+ * a 256 KiB detail page. This Host deliberately keeps its view budget at 256 KiB;
+ * a smaller service budget is compatible and avoids increasing mobile load. These
+ * values are Host budgets, not an assertion that all current upstream limits match.
  */
 
 /** Items one `local-db:messages:view` page may carry. */

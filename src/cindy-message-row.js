@@ -286,7 +286,7 @@ const RENDERABLE_SOURCE_KINDS = new Set(['user', 'model', 'tool']);
  *   user turn — the `clientId` the controller minted for the prompt.
  * @returns one row per renderable content block, in order.
  */
-export function toCindyMessageRows(message, { sessionId, createdAt, now = () => new Date(), promptClientId = null }) {
+export function toCindyMessageRows(message, { sessionId, createdAt, now = () => new Date(), promptClientId = null, reasoningIdentity = null }) {
   const rows = [];
   // Canonical DSH results use a tool-role message with root outcome/call ID,
   // not the legacy user-role nested tool-result block. Keep both formats.
@@ -372,7 +372,12 @@ export function toCindyMessageRows(message, { sessionId, createdAt, now = () => 
         if (typeof block.text !== 'string' || block.text === '') return;
         // Thinking is a structured native role on both Cindy clients. Unlike
         // ordinary prose, a string here is discarded by mobile normalizeThinking.
-        rows.push({ ...base, content: { text: block.text } });
+        // Native history-live refs resolve by clientId after the durable id replaces the live id.
+        const identity = reasoningIdentity;
+        const logical = Number.isSafeInteger(identity?.turn) && identity.turn >= 0
+          && Number.isSafeInteger(identity?.step) && identity.step >= 0
+          ? `${sessionId}:reasoning-stream:${identity.turn}:${identity.step}:${index}` : clientId;
+        rows.push({ ...base, clientId: logical, content: { text: block.text } });
         return;
       case 'tool-call':
         rows.push({
@@ -437,6 +442,7 @@ export function toCindyMessages(messages, { sessionId, now = () => new Date() })
     createdAt: entry.createdAt,
     now,
     promptClientId: entry.promptClientId ?? null,
+    reasoningIdentity: entry.reasoningIdentity ?? null,
   }));
   const rows = [];
   for (const group of perMessage.reverse()) rows.push(...group);

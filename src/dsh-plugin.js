@@ -687,9 +687,9 @@ export function buildDshSource(ctx, serviceName, options = {}) {
      * The work-grouped history window the controller prefers once it has seen
      * `history-view-v1`.
      *
-     * Grouping runs over the same cached transcript the raw window pages
-     * (`readMessages.all`), so the two views can never disagree about what the session
-     * contains — and neither of them re-reads the log to answer.
+     * History consumes an explicit source-order snapshot, not the raw window's legacy
+     * array order. Prefer the flushed/validated durable backend when available; the
+     * fallback reader shares its cached fold and reasoning reducer with its raw window.
      */
     const deliveryServices = { sessions: undefined, persistence: undefined, agents: undefined };
     ctx.inject(['sessions', 'sessionPersistence', 'agents'], deliveryCtx => {
@@ -709,7 +709,11 @@ export function buildDshSource(ctx, serviceName, options = {}) {
     const historyView = readMessages === undefined
       ? undefined
       : createHistoryViewController({
-        rows: committedRows,
+        snapshot: async (sessionId) => {
+          const snapshot = await (inputDeliveryBackend.available()
+            ? inputDeliveryBackend.historySnapshot(sessionId) : readMessages.historySnapshot(sessionId));
+          return { ...snapshot, rows: options.projectMessages?.(snapshot.rows) ?? snapshot.rows };
+        },
         // The turn state has to be **wired** here; the controller's own default is `() => false`.
         // That default is why a running turn was never marked `isStreaming`, which cost two things
         // at once and looked like a client problem both times: the phone drew no live card, and

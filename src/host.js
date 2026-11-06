@@ -36,6 +36,7 @@ import { SessionReadModel } from './session-read-model.js';
 import { ProjectionReadModelSink } from './projection-read-model-sink.js';
 import { publishLifecycle, runningStatusEvent, turnEventFor } from './session-publisher.js';
 import { createReasoningPublisher } from './reasoning-publisher.js';
+import { createHistoryDeliveryState } from './history-delivery-state.js';
 import { turnDiagnosticRow, turnDiagnosticPayload } from './turn-error.js';
 import { advanceInterruptionMetadata, diagnosticOwner, interruptionFields, projectDismissedErrors } from './diagnostic-presentation.js';
 import { acceptLink } from './host-authorization.js';
@@ -315,6 +316,9 @@ export async function startHost(initialSource, settings = DEFAULT_HOST_SETTINGS,
   const subscribers = new Set();
   /** Devices following one session's live stream: `sessionId -> Set<deviceId>`. */
   const sessionSubscribers = new Map();
+  const historyDelivery = createHistoryDeliveryState((deviceId, sessionId) =>
+    acceptedControllers.has(deviceId) && policy.canAccept(deviceId) && !sessionIsHidden(sessionId)
+      && sessionSubscribers.get(sessionId)?.has(deviceId) === true);
   /**
    * Sessions a controller has attached to at least once in this process.
    *
@@ -710,7 +714,7 @@ export async function startHost(initialSource, settings = DEFAULT_HOST_SETTINGS,
   }
 
   function send(frame) {
-    if (ws === null || typeof ws.send !== 'function') return;
+    if (ws === null || typeof ws.send !== 'function' || (ws.readyState !== undefined && ws.readyState !== 1)) return false;
     // The relay **rejects** a frame over `MAX_FRAME_BYTES` outright — it does not
     // truncate it, and the controller waiting on that frame is left until its own
     // deadline. So an oversized frame is refused here, where it is observable, rather
@@ -721,12 +725,14 @@ export async function startHost(initialSource, settings = DEFAULT_HOST_SETTINGS,
       frameRefusals.push({ at: now().toISOString(), kind: typeof frame?.kind === 'string' ? frame.kind : null, bytes });
       if (frameRefusals.length > FRAME_REFUSAL_LOG_LIMIT) frameRefusals.splice(0, frameRefusals.length - FRAME_REFUSAL_LOG_LIMIT);
       frameRefusalTotal += 1;
-      return;
+      return false;
     }
     try {
       ws.send(JSON.stringify(frame));
+      return true;
     } catch {
       // A send that throws belongs to the socket's own error path.
+      return false;
     }
   }
 
@@ -1125,6 +1131,7 @@ export async function startHost(initialSource, settings = DEFAULT_HOST_SETTINGS,
   function markDeviceUnreachable(deviceId) {
     if (typeof deviceId !== 'string' || deviceId === '') return;
     offlineDevices.add(deviceId);
+    historyDelivery.forget(deviceId);
     for (const sessionId of watchedSessionsByDevice.get(deviceId) ?? []) renewTurnLease(deviceId, sessionId);
   }
 
@@ -1229,6 +1236,7 @@ export async function startHost(initialSource, settings = DEFAULT_HOST_SETTINGS,
       if (result.ok) {
         directoryEpoch++;
         acceptedControllers.delete(deviceId);
+        historyDelivery.forget(deviceId);
         observeRemindersSource();
         subscribers.delete(deviceId);
         status.removeDevice(deviceId);
@@ -1307,6 +1315,7 @@ export async function startHost(initialSource, settings = DEFAULT_HOST_SETTINGS,
       if (topic === 'sessions') subscribers.delete(deviceId);
       else if (topic.startsWith('session:')) {
         const sessionId = topic.slice('session:'.length);
+        historyDelivery.forget(deviceId, sessionId);
         renewTurnLease(deviceId, sessionId);
         const devices = sessionSubscribers.get(sessionId);
         if (devices === undefined) continue;
@@ -1318,6 +1327,7 @@ export async function startHost(initialSource, settings = DEFAULT_HOST_SETTINGS,
 
   /** Drop every subscription a device holds, on disconnect. */
   function forgetSubscriptions(deviceId) {
+    historyDelivery.forget(deviceId);
     subscribers.delete(deviceId);
     for (const [sessionId, devices] of sessionSubscribers) {
       devices.delete(deviceId);
@@ -1448,9 +1458,14 @@ export async function startHost(initialSource, settings = DEFAULT_HOST_SETTINGS,
   function pushSessionUpdate(sessionId, channel, payload) {
     if (channel === 'maker:input:projection' && activeDelivery) payload = activeDelivery.currentProjection(sessionId, [], payload);
     const guarded = channel === 'local-db:messages:created' || channel === 'maker:event';
+    const thinking = channel === 'local-db:messages:created' && payload?.message?.role === 'thinking';
     const devices = guarded
       ? new Set([...(sessionSubscribers.get(sessionId) ?? [])].filter(id => !sessionIsHidden(sessionId) && acceptedControllers.has(id) && policy.canAccept(id)))
       : sessionSubscribers.get(sessionId);
+    // Only a successfully delivered view opts this controller out of raw thinking.
+    if (thinking && devices) for (const deviceId of devices) {
+      if (historyDelivery.ready(deviceId, sessionId)) devices.delete(deviceId);
+    }
     const watchers = devices === undefined ? 0 : devices.size;
     const reachable = devices === undefined ? 0 : [...devices].filter((deviceId) => !offlineDevices.has(deviceId)).length;
     recordPush(sessionId, channel, reachable, payload);
@@ -1476,6 +1491,9 @@ export async function startHost(initialSource, settings = DEFAULT_HOST_SETTINGS,
   const reasoningPublisher = createReasoningPublisher({
     push: pushSessionUpdate, invalidate: pushHistoryViewChanged,
     watched: (sessionId) => watchersFor(sessionId) > 0,
+    rawNeeded: (sessionId) => [...(sessionSubscribers.get(sessionId) ?? [])].some(deviceId =>
+      acceptedControllers.has(deviceId) && policy.canAccept(deviceId) && !historyDelivery.ready(deviceId, sessionId)),
+    now: () => Number(now()),
     setTimeout: setTimeoutImpl, clearTimeout: clearTimeoutImpl,
   });
 
@@ -1485,6 +1503,7 @@ export async function startHost(initialSource, settings = DEFAULT_HOST_SETTINGS,
    */
   function pushHistoryViewChanged(sessionId) {
     if (typeof sessionId !== 'string' || sessionId === '') return;
+    historyDelivery.changed(sessionId);
     if (watchersFor(sessionId) === 0) return;
     if (historyViewPushes.has(sessionId)) return;
     const timer = setTimeoutImpl(() => {
@@ -2052,6 +2071,9 @@ export async function startHost(initialSource, settings = DEFAULT_HOST_SETTINGS,
       (channel, count, payload) => recordPush(sessionId, channel, count, payload));
   }
   function publishSessionMeta(sessionId, patch) {
+    if (patch?.clearedAt !== undefined || patch?.status === 'deleted' || patch?.status === 'archived') {
+      for (const deviceId of sessionSubscribers.get(sessionId) ?? []) historyDelivery.forget(deviceId, sessionId);
+    }
     publishRowPatch(sessionId, { ...patch, updatedAt: now().toISOString() });
   }
 
@@ -2491,6 +2513,7 @@ export async function startHost(initialSource, settings = DEFAULT_HOST_SETTINGS,
       case 'link-open': {
         if (typeof frame.id !== 'string' || typeof frame.src !== 'string') return;
         if (!policy.canAccept(frame.src)) return;
+        historyDelivery.forget(frame.src);
         for (const sessionId of watchedSessionsByDevice.get(frame.src) ?? []) renewTurnLease(frame.src, sessionId);
         // A link-open is itself proof the relay has a route to this device.
         markDeviceReachable(frame.src);
@@ -2521,6 +2544,7 @@ export async function startHost(initialSource, settings = DEFAULT_HOST_SETTINGS,
         for (const sessionId of watchedSessionsByDevice.get(frame.src) ?? []) renewTurnLease(frame.src, sessionId);
         filePeer.closePeer(frame.src);
         acceptedControllers.delete(frame.src);
+        historyDelivery.forget(frame.src);
         observeRemindersSource();
         status.upsertDevice(frame.src, { isController: false });
         status.refreshConnectionState();
@@ -2553,18 +2577,28 @@ export async function startHost(initialSource, settings = DEFAULT_HOST_SETTINGS,
         // Listing-only controllers never send `link-open`; an invoke is itself
         // proof that the phone reached this Host, so it links the device too.
         if (!acceptedControllers.has(frame.src)) linkController(frame.src);
+        const historyRead = historyDelivery.begin(frame);
+        const invokeGeneration = generation;
+        const invokeSocket = ws;
         void handleInvoke(frame).then(
           (reply) => {
             // `null` means the request was unaddressable; the relay guard above
             // already rejects those, so this only defends the invariant.
-            if (reply === null) return;
+            if (reply === null || invokeGeneration !== generation || invokeSocket !== ws) {
+              historyDelivery.finish(historyRead, false); return;
+            }
             // Fitting and sending are Host code on a reply that ultimately came from DSH, so
             // they are exactly where an unexpected shape would surface — and a throw from
             // inside a `.then` callback is an unhandled rejection, which this process treats
             // as fatal. The controller still needs an answer, so it gets one.
             try {
-              send(fitReplyToFrame(reply, frame));
+              const fitted = fitReplyToFrame(reply, frame);
+              const sent = send(fitted);
+              const page = fitted?.payload?.result;
+              const complete = sent && fitted?.payload?.ok === true && page?.version === 1 && Array.isArray(page.items);
+              if (historyDelivery.finish(historyRead, complete)) pushHistoryViewChanged(historyRead.sessionId);
             } catch (error) {
+              historyDelivery.finish(historyRead, false);
               recordHandlerError('invoke-reply', error);
               send({
                 v: PROTOCOL_VERSION,
@@ -2579,6 +2613,8 @@ export async function startHost(initialSource, settings = DEFAULT_HOST_SETTINGS,
             // Named with the channel: seven identical `TimeoutError`s in the diagnostics after one
             // restart were unattributable, and "which read is missing its budget" is the whole
             // question. `frame.payload.channel` is the only thing that answers it.
+            historyDelivery.finish(historyRead, false);
+            if (invokeGeneration !== generation || invokeSocket !== ws) return;
             recordHandlerError(`invoke:${typeof frame?.payload?.channel === 'string' ? frame.payload.channel : '?'}`, error);
             send({ v: PROTOCOL_VERSION, kind: 'invoke-result', id: frame.id, dst: frame.src, payload: { ok: false, error: { code: 'INTERNAL', message: 'DSH Host failed to serve this channel' } } });
           },
@@ -2741,6 +2777,7 @@ export async function startHost(initialSource, settings = DEFAULT_HOST_SETTINGS,
     // would push to a link that is gone.
     clearHistoryViewPushes();
     reasoningPublisher.clear();
+    historyDelivery.clear();
     acceptedControllers.clear();
     subscribers.clear();
     sessionSubscribers.clear();
@@ -2810,6 +2847,7 @@ export async function startHost(initialSource, settings = DEFAULT_HOST_SETTINGS,
     // to have moved them. `replace` never writes back — see `session-flags.js`.
     sessionFlags.replace(next?.sessionFlags);
     policy.update(next);
+    historyDelivery.clear();
     observeRemindersSource();
     filePeer.pruneUnauthorized();
     fileExports.pruneUnauthorized();
