@@ -76,6 +76,11 @@ export function toCindySessionListRow(item, { now = () => new Date(), device, de
   return {
     id,
     title,
+    // DSH projects ordinary user tasks, not Cindy Make/bot sessions. The phone's
+    // entry gate requires explicit provenance before mounting the chat and its
+    // local history cache; omitting it forces an extra remote lookup on re-entry.
+    // This is task provenance, independent of the model's providerId below.
+    source: 'desktop',
     createdAt,
     updatedAt,
     // `'active' | 'archived' | 'deleted'`; the controller's default status filter

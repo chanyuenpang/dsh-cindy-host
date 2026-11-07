@@ -37,6 +37,19 @@ test('carries the identity the controller de-dupes and filters on', () => {
   assert.equal(row.deviceLinkDeviceName, 'DSH Host');
 });
 
+test('declares ordinary task provenance independently of the model provider', () => {
+  // CindyMakeSessionGate treats undefined source as unconfirmed and does not mount
+  // the chat (or its history-cache reader) until a remote metadata lookup finishes.
+  for (const providerId of [undefined, 'deepseek-official', 'openai-codex', 'anthropic']) {
+    const input = { ...ROW, providerId };
+    const row = toCindySessionListRow(input, { device: DEVICE });
+    assert.equal(row.source, 'desktop', 'DSH user tasks use Cindy ordinary-task provenance');
+    assert.equal(toCindySessionList([input], { device: DEVICE })[0].source, 'desktop');
+    if (providerId === undefined) assert.equal('providerId' in row, false);
+    else assert.equal(row.providerId, providerId, 'task provenance must not replace the model provider');
+  }
+});
+
 test('reports no display-model fields, which the controller derives itself', () => {
   const row = toCindySessionListRow(ROW, { device: DEVICE });
   for (const field of ['subtitle', 'detail', 'messagePreview', 'liveActivity', 'lastActivityAt', 'pendingInteractionCount', 'scheduleInfo', 'worktreeLabel']) {

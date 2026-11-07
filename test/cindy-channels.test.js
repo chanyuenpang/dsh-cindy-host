@@ -1635,7 +1635,41 @@ test('gets one session by its top-level id, in the same shape as the list', asyn
   const list = await router(request('local-db:sessions:list'));
   const one = await router(request('local-db:sessions:get', ['b']));
   assert.equal(one.payload.ok, true);
+  assert.equal(list.payload.result[1].source, 'desktop');
+  assert.equal(one.payload.result.source, 'desktop');
   assert.deepEqual(one.payload.result, list.payload.result[1], 'one exit shape, so they cannot drift apart');
+});
+
+test('list and direct detail confirm ordinary task source even when history counts fail', async () => {
+  let detailReads = 0;
+  const router = createChannelRouter({
+    listSessions: async () => ROWS,
+    // The direct-lookup path must use the same provenance as the list, even for
+    // a task outside the current list page (for example, an older saved route).
+    getSession: async (id) => {
+      detailReads += 1;
+      return id === 'older' ? { ...ROWS[0], id, providerId: 'openai-codex' } : undefined;
+    },
+    subscribers: new Set(),
+    getDevice: () => ({ deviceId: 'dev-host', deviceName: 'DSH Host' }),
+    resolveCapabilities: () => ({
+      countMessages: async () => { throw new Error('history temporarily unavailable'); },
+    }),
+  });
+  const list = await router(request('local-db:sessions:list'));
+  assert.equal(list.payload.ok, true);
+  assert.equal(detailReads, 0, 'a list already carries the source the phone gate needs');
+  for (const row of list.payload.result) assert.equal(row.source, 'desktop');
+
+  const detail = await router(request('local-db:sessions:get', ['older']));
+  assert.equal(detail.payload.ok, true);
+  assert.equal(detail.payload.result.source, 'desktop');
+  assert.equal(detail.payload.result.providerId, 'openai-codex');
+  assert.equal(detail.payload.result._count, null, 'unavailable history counts do not hide task provenance');
+
+  const missing = await router(request('local-db:sessions:get', ['missing']));
+  assert.equal(missing.payload.ok, false);
+  assert.equal(missing.payload.error.code, 'NOT_FOUND', 'source metadata must not fabricate missing tasks');
 });
 
 test('a Host with no relay identity yet still answers with rows', async () => {

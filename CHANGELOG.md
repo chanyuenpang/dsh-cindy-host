@@ -1,5 +1,10 @@
 # Changelog
 
+## 0.1.40 — 2026-11-07
+
+- Declare `source: 'desktop'` consistently on ordinary DSH task rows in session lists and direct detail reads, independently of model/provider identity. Let Cindy recognize known ordinary-task provenance without requiring an extra source-confirmation lookup before mounting the chat.
+- Preserve provenance when history counts are unavailable and keep missing tasks as explicit `NOT_FOUND` failures. Add projection/router regressions without changing authorization, source logs, provider selection, Cindy code or its cache implementation; handset re-entry/cache behavior remains separate acceptance.
+
 ## 0.1.39 — 2026-11-07
 
 - Serve bounded, authorized project-grid WebP thumbnails through the existing file-browser contract; keep original-file reads independent of codec failures.
