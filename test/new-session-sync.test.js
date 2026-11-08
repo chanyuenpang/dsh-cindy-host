@@ -49,7 +49,7 @@ test('known blank ID reads bypass discovery filtering and retain applied model m
   const blank = summary('new', { blank: true, projections: { values: { modelSelection: {
     next: { provider: 'openai-codex', model: 'gpt-test', reasoningEffort: 'high' },
   }, permissions: { currentValue: 'read-only' } } } });
-  const items = [blank, summary('visible'), summary('child', { origin: 'subagent' }), summary('nested', { parentSessionId: 'visible' })];
+  const items = [blank, summary('visible'), summary('child', { origin: 'subagent' }), summary('nested', { parentSessionId: 'visible', origin: 'subagent' })];
   const source = createSessionControllerSource({ sessionController: { list: async () => ({ items }) } });
   assert.deepEqual((await source.listSessions()).map(row => row.id), ['visible']);
   const row = await source.getSession('new');
@@ -111,10 +111,13 @@ test('create then get/history works before first enqueue using the live observat
 test('exact observation releases leases and never invents absence for I/O errors', async () => {
   const f = makeSeam();
   f.records.set('child', { header: { origin: 'subagent' } });
-  f.records.set('nested', { header: { parentSession: 'parent' } });
+  f.records.set('nested', { header: { parentSession: 'parent', origin: 'subagent' } });
   f.records.set('no-cwd', { header: { cwd: undefined } });
   for (const id of ['child', 'nested', 'no-cwd']) assert.equal(await f.seam.source.getSession(id), undefined);
   assert.equal(f.disposed(), 3);
+  f.records.set('fork', { header: { parentSession: 'parent' } });
+  assert.equal((await f.seam.source.getSession('fork')).id, 'fork', 'lineage alone does not hide a historical ordinary fork');
+  assert.equal(f.disposed(), 4);
   assert.equal(await f.seam.source.getSession('missing'), undefined);
   f.setError(new Error('disk I/O failed'));
   await assert.rejects(f.seam.source.getSession('new'), /disk I\/O failed/);

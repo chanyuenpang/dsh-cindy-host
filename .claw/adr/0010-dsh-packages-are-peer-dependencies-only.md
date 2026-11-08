@@ -123,3 +123,10 @@ it if the host has it"; **for `@deepseek-ai/dsh*`**, the peer key must not exist
 plugin genuinely requires that package, and an optional seam is expressed by removing the peer
 (decision 1) plus a lazy, failure-tolerant load.
 
+
+<!-- dated: 2026-11-08 -->
+### Admit only inspected and verified DSH carriers
+
+The 0.1.41 candidate admits DSH Agent/Session/Settings peers at exactly `0.2.1-rc.3 || 0.2.1-rc.4 || 0.2.1-rc.5 || 0.2.2-alpha.2 || 0.2.2-rc.1`, preserving the 0.1.40 carrier set. Adding a carrier requires inspecting its published contracts and verifying the actual boot compatibility evaluator plus a packed-plugin isolated load; a broad prerelease range would claim unverified future carriers. The 0.2.2 adaptation retains peers-only ownership and the absent optional apiproxy peer. Development resolution of Cordis 4.1.0 and Schemastery 3.19.0 does not install a second DSH generation into user profiles.
+
+Keep the plugin Node baseline (>=22.16.0) distinct from a particular host CLI baseline (DSH 0.2.2-rc.1: >=24.9). This allows the retained older carriers to keep their own runtime requirements. Current package and evidence anchors are `package.json`, `test/release-identity.test.js`, and `doc/dsh-0.2.2-rc.1-compatibility.md`; the 0.1.32 evidence is local tarball validation, not registry publication or production deployment.

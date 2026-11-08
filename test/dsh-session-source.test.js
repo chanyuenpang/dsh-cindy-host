@@ -160,7 +160,7 @@ test('subagent runs are not controller sessions', async () => {
     sessionController: makeController([
       { sessionId: 'task-1', updatedAt: 3, running: false },
       { sessionId: 'sub-1', updatedAt: 2, running: false, origin: 'subagent' },
-      { sessionId: 'sub-2', updatedAt: 1, running: true, parentSessionId: 'task-1' },
+      { sessionId: 'sub-2', updatedAt: 1, running: true, parentSessionId: 'task-1', origin: 'subagent' },
       { sessionId: 'draft-1', updatedAt: 0, running: false, blank: true },
     ]),
     subscribe: makeSubscribe(),
@@ -178,11 +178,26 @@ test('subagent runs are not controller sessions', async () => {
   const pushed = createSessionControllerSource({ sessionController: makeController([]), subscribe });
   const dispose = pushed.onEvent((item) => events.push(item));
   subscribe.emit('api-session/added', { sessionId: 'sub-9', origin: 'subagent', running: true });
-  subscribe.emit('api-session/added', { sessionId: 'sub-10', parentSessionId: 'task-1' });
+  subscribe.emit('api-session/added', { sessionId: 'sub-10', parentSessionId: 'task-1', origin: 'subagent' });
   subscribe.emit('api-session/added', { sessionId: 'draft-9', blank: true });
   subscribe.emit('api-session/added', { sessionId: 'task-9', running: false });
   assert.deepEqual(events.map((item) => item.sessionId), ['task-9']);
   dispose();
+});
+
+test('historical ordinary forks survive full listing, running listing, lookup and added pushes', async () => {
+  const fork = { sessionId: 'fork', parentSessionId: 'source', updatedAt: 3, running: true, blank: false };
+  const subscribe = makeSubscribe();
+  const source = createSessionControllerSource({ sessionController: makeController([fork]), subscribe });
+  assert.deepEqual((await source.listSessions()).map((row) => row.id), ['fork']);
+  assert.deepEqual((await source.listSessionStates()).map((row) => row.id), ['fork']);
+  assert.equal((await source.getSession('fork')).id, 'fork');
+  const events = [];
+  const dispose = source.onEvent((event) => events.push(event));
+  try {
+    subscribe.emit('api-session/added', fork);
+    assert.equal(events.some((event) => event.sessionId === 'fork'), true);
+  } finally { dispose(); }
 });
 
 test('a listing folds one bounded batch of titles and warms the rest behind it', async () => {

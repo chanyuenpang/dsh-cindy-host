@@ -31,8 +31,10 @@ export function readActiveSessionSummaries(ctx) {
     const session = sessions.get(id);
     if (!session || agent.session !== session) continue;
     const header = session.header;
+    // DSH 0.2.2 keeps parentSession on historical ordinary forks as lineage.
+    // Only origin classifies a delegated run; lineage must not hide user tasks.
     if (!header || header.id !== id || header.origin === 'subagent'
-      || header.parentSession != null || typeof header.cwd !== 'string' || !header.cwd) continue;
+      || typeof header.cwd !== 'string' || !header.cwd) continue;
 
     const snapshot = projections.snapshot(session, ['sessionListMetadata']);
     const metadata = snapshot.values.sessionListMetadata;
