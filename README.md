@@ -4,15 +4,19 @@ A Host-side adapter connecting current Cindy clients to DeepSeek Harness.
 
 ## Requirements and installation
 
-Version **0.1.40** declares ordinary-task provenance consistently in session list/detail rows, independent of the model provider, so Cindy can recognize known DSH tasks without an additional source-confirmation lookup. It retains the earlier image delivery, thumbnails, work titles, history stability and interruption controls. It does not implement a new phone cache; handset re-entry, rendering and white-screen acceptance remain separate.
+Version **0.1.41** adds DSH `0.2.2-rc.1` compatibility and keeps historical ordinary forks visible by classifying subagents through `origin`, not parent lineage. It retains 0.1.40's task provenance, system credential storage, image delivery, thumbnails, work titles, history stability and interruption controls. Handset re-entry, rendering and white-screen acceptance remain separate.
 
-It supports the exact **DSH 0.2.2-alpha.2** carrier, while retaining `0.2.1-rc.3`, `0.2.1-rc.4` and `0.2.1-rc.5`. Alpha requires **Node.js >=24.9** (tested with 24.12); the older carriers retain this plugin's Node.js >=22.16 minimum. Agent/session/settings peers and alpha Schemastery are explicitly allowed, not a blanket promise for future prereleases. The full Web installation gate uses DSH **0.2.1-rc.5**; alpha core-contract checks do not establish alpha Web/relay/handset acceptance. Install through the Desktop DSH plugin manager. CLI-managed profiles can use:
+It supports the exact **DSH 0.2.2-rc.1** carrier, while retaining `0.2.2-alpha.2`, `0.2.1-rc.3`, `0.2.1-rc.4` and `0.2.1-rc.5`. DSH 0.2.2 requires **Node.js >=24.9** (RC tested with 24.18); the older carriers retain this plugin's Node.js >=22.16 minimum. Agent/session/settings peers and alpha Schemastery are explicitly allowed, not a blanket promise for future prereleases. RC validation covers isolated Web installation and runtime smoke; the prior alpha checks cover core contracts. Neither establishes relay or handset acceptance. Install through the Desktop DSH plugin manager. CLI-managed profiles can use:
 
 ```sh
-dsh plugin --profile <profile> add dsh-cindy-host@0.1.40
+dsh plugin --profile <profile> add dsh-cindy-host@0.1.41
 ```
 
 Reload the Host plugin after installation. A full DSH restart is separate. Keep existing Cindy sign-in, device identity and settings; do not run two Host processes with the same identity.
+
+## 0.1.41: DSH 0.2.2 RC compatibility
+
+Accepts the exact RC Agent, Session and Settings SDKs, Cordis 4.1 and Schemastery 3.19. Historical ordinary forks can retain `parentSession`/`parentSessionId`; only `origin: 'subagent'` classifies delegated sessions. The correction covers discovery, active reads, direct lookup and creation pushes. Cindy's handshake identity remains unchanged. See [verification details](doc/dsh-0.2.2-rc.1-compatibility.md) for candidate checks and the earlier local prototype's limits.
 
 ## 0.1.36: interruption controls
 

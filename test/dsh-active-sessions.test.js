@@ -74,9 +74,9 @@ test('running to idle, disposal, and replacement services take effect without a 
   assert.equal(readActiveSessionSummaries(f.ctx), null);
 });
 
-test('filters durable children, subagents, missing cwd, and blanks before exposing tasks', () => {
+test('filters subagents, missing cwd, and blanks before exposing tasks', () => {
   const f = fixture();
-  f.add('child', { header: { parentSession: 'parent' } });
+  f.add('child', { header: { parentSession: 'parent', origin: 'subagent' } });
   f.add('subagent', { header: { origin: 'subagent' } });
   f.add('no-cwd', { header: { cwd: undefined } });
   f.add('empty-cwd', { header: { cwd: '' } });
@@ -91,6 +91,15 @@ test('filters durable children, subagents, missing cwd, and blanks before exposi
   assert.equal(rows[0].updatedAt, 100);
   assert.equal(rows[1].blank, false, 'authoritative metadata overrides seq fallback');
   assert.deepEqual(f.reads, ['blank', 'empty', 'nonempty', 'projected-nonblank']);
+});
+
+test('DSH 0.2.2 historical ordinary forks remain visible while subagents stay hidden', () => {
+  const f = fixture();
+  f.add('fork', { header: { parentSession: 'source' } });
+  f.add('delegated', { header: { parentSession: 'source', origin: 'subagent' } });
+  const rows = readActiveSessionSummaries(f.ctx);
+  assert.deepEqual(rows.map((row) => row.sessionId), ['fork']);
+  assert.equal(rows[0].parentSessionId, 'source');
 });
 
 test('unavailable registry APIs return null, while an available empty registry is authoritative', () => {

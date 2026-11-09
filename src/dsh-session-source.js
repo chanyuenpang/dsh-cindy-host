@@ -28,8 +28,9 @@ function activity(kind, sessionId, phase, extra = {}) {
  * Whether a session belongs in a controller's session list.
  *
  * **A subagent run and an unprompted draft are not tasks.** DSH marks delegated
- * sessions in the summary (`origin: 'subagent'`, and a `parentSessionId` when the
- * delegation has a parent). It also marks a newly opened, never-prompted conversation
+ * sessions in the summary (`origin: 'subagent'`). `parentSessionId` is lineage,
+ * and can also appear on historical ordinary forks (DSH 0.2.2). It also marks a
+ * newly opened, never-prompted conversation
  * as `blank: true`. Neither appears in DSH's user-facing sidebar, so neither may be
  * projected as a Cindy task — which is why a deployment's
  * `~/.dsh/sessions` can hold two hundred subagent logs the user has never seen. This Host
@@ -41,8 +42,7 @@ function activity(kind, sessionId, phase, extra = {}) {
  * @returns true when a controller should see it.
  */
 function isControllerSession(item) {
-  if (item === null || typeof item !== 'object' || item.origin === 'subagent') return false;
-  return item.parentSessionId === undefined || item.parentSessionId === null;
+  return item !== null && typeof item === 'object' && item.origin !== 'subagent';
 }
 function isControllerVisible(item) {
   return isControllerSession(item) && item.blank !== true;

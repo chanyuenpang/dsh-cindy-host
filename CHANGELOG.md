@@ -1,5 +1,12 @@
 # Changelog
 
+## 0.1.41 — 2026-11-08
+
+- Accept the exact DSH `0.2.2-rc.1` Agent/Session/Settings carrier alongside the existing 0.2.1 RC and 0.2.2-alpha.2 peers. Keep DSH packages host-provided and preserve 0.1.40's complete feature set, including credentials without keytar.
+- Keep historical ordinary forks visible when they retain parent lineage; identify delegated sessions by `origin: 'subagent'` across discovery, active reads, direct lookup and creation pushes.
+- Update the development SDK lock to the reviewed RC; distinguish DSH 0.2.2's Node >=24.9 requirement from the plugin's older-carrier Node >=22.16 baseline. Keep Cindy handshake identity unchanged.
+- Validate the actual release candidate separately from the earlier 0.1.31-based local prototype: 1,235 automated tests passed (8 skipped), native question/Gateway checks 4/4, RC core contracts 7/7, real Windows DPAPI persistence/restore/renewal/logout, channel audit with 0 unclassified channels, and clean tarball installation with Web runtime smoke 30/30. Live relay/handset and real OAuth/model requests remain outside this compatibility release's verification claim.
+
 ## 0.1.40 — 2026-11-07
 
 - Declare `source: 'desktop'` consistently on ordinary DSH task rows in session lists and direct detail reads, independently of model/provider identity. Let Cindy recognize known ordinary-task provenance without requiring an extra source-confirmation lookup before mounting the chat.

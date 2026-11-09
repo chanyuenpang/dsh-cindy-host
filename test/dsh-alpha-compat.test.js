@@ -21,8 +21,8 @@ test('alpha peers are explicit and lockfile root stays in sync without bundling 
   const manifest = JSON.parse(readFileSync(new URL('../package.json', import.meta.url)));
   const lock = JSON.parse(readFileSync(new URL('../package-lock.json', import.meta.url)));
   assert.deepEqual(lock.packages[''].peerDependencies, manifest.peerDependencies);
-  for (const name of ['@deepseek-ai/dsh-session', '@deepseek-ai/dsh-settings']) {
-    assert.deepEqual(manifest.peerDependencies[name].split(' || '), ['0.2.1-rc.3', '0.2.1-rc.4', '0.2.1-rc.5', '0.2.2-alpha.2']);
+  for (const name of ['@deepseek-ai/dsh-agent', '@deepseek-ai/dsh-session', '@deepseek-ai/dsh-settings']) {
+    assert.deepEqual(manifest.peerDependencies[name].split(' || '), ['0.2.1-rc.3', '0.2.1-rc.4', '0.2.1-rc.5', '0.2.2-alpha.2', '0.2.2-rc.1']);
   }
   assert.equal(manifest.peerDependencies['@deepseek-ai/schemastery'], '^3.18.1 || 3.18.6-alpha.1');
   for (const group of ['dependencies', 'optionalDependencies']) {

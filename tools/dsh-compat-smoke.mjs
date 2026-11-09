@@ -23,11 +23,11 @@ const anchor = pathToFileURL(join(runtimeDir, 'package.json'));
 const requireRuntime = createRequire(anchor);
 const load = name => import(pathToFileURL(requireRuntime.resolve(`@deepseek-ai/${name}`)));
 const version = JSON.parse(await readFile(requireRuntime.resolve('@deepseek-ai/dsh-session/package.json'), 'utf8')).version;
-assert.equal(version, '0.2.2-alpha.2', 'This fixture matrix targets the reviewed alpha carrier only');
+assert.ok(['0.2.2-alpha.2', '0.2.2-rc.1'].includes(version), 'This fixture matrix targets reviewed DSH 0.2.2 carriers only');
 const manifest = JSON.parse(await readFile(join(pluginDir, 'package.json'), 'utf8'));
 const requirePlugin = createRequire(pathToFileURL(join(pluginDir, 'package.json')));
 for (const peer of ['dsh-session', 'schemastery']) {
-  assert.equal(requirePlugin.resolve(`@deepseek-ai/${peer}/package.json`), requireRuntime.resolve(`@deepseek-ai/${peer}/package.json`), `Plugin must resolve the isolated alpha ${peer}, not a development/production copy`);
+  assert.equal(requirePlugin.resolve(`@deepseek-ai/${peer}/package.json`), requireRuntime.resolve(`@deepseek-ai/${peer}/package.json`), `Plugin must resolve the isolated ${version} ${peer}, not a development/production copy`);
 }
 const { evaluatePluginCompatibility } = await load('dsh-app-boot');
 let count = 0;
@@ -43,7 +43,7 @@ const semver = requireRuntime('semver');
 const schemaVersion = JSON.parse(await readFile(requireRuntime.resolve('@deepseek-ai/schemastery/package.json'), 'utf8')).version;
 assert.ok(semver.satisfies(schemaVersion, manifest.peerDependencies['@deepseek-ai/schemastery']));
 assert.ok(!semver.satisfies('3.18.6-alpha.2', manifest.peerDependencies['@deepseek-ai/schemastery']));
-passed('the actual alpha Schemastery satisfies the plugin peer, without admitting future alphas');
+passed('the actual DSH Schemastery satisfies the plugin peer, without admitting future alphas');
 for (const [module, exportName, methods] of [
   ['dsh-api-session-controller', 'SessionController', ['list', 'create', 'resolveAgent', 'selectModel', 'modelCatalog', 'prompt', 'updateQueue', 'cancel']],
   ['dsh-settings', 'SettingsForms', ['describe', 'update', 'replace', 'mutate']],
@@ -52,7 +52,7 @@ for (const [module, exportName, methods] of [
   const exports = await load(module);
   for (const method of methods) assert.equal(typeof exports[exportName].prototype[method], 'function', `${exportName}.${method}`);
 }
-passed('alpha controller/settings/archive method contracts remain present (signature check, not behavioral acceptance)');
+passed('DSH controller/settings/archive method contracts remain present (signature check, not behavioral acceptance)');
 
 // Resolve the unpacked plugin through the isolated SDK's node_modules, never the
 // Desktop installation or the checkout's older development peer graph.
@@ -68,7 +68,7 @@ assert.equal(foldSessionEvent(user, { sessionId: session.id }).length, 1);
 const assistant = session.append('assistant/message', { turn: 1, step: 1, message: createAssistantMessage({ content: [{ type: 'text', text: 'alpha answer' }] }), stream: [] }, { surfaceOp: 'append' });
 assert.equal(foldSessionEvent(assistant, { sessionId: session.id }).length, 1);
 assert.equal(durableInputEvidence(session.snapshotEvents(), session.id).users[0].clientId, 'alpha-input');
-passed('real alpha Session events fold into Cindy rows and preserve durable input identity');
+passed('real DSH Session events fold into Cindy rows and preserve durable input identity');
 
 const { Context } = await load('cordis');
 const { default: Loader } = await load('cordis-plugin-loader');
@@ -84,7 +84,7 @@ try {
   ]) await root.loader.create({ id, name: pathToFileURL(requireRuntime.resolve(`@deepseek-ai/${name}`)).href, ...(config ? { config } : {}) });
   await root.loader.await();
   for (const name of ['sessions', 'sessionProjections', 'agents', 'skills', 'agentPresets']) assert.ok(root.get(name), `Missing live alpha service: ${name}`);
-  passed('real alpha Cordis Loader activates Session, projections, Agents, skills and preset registry');
+  passed('real DSH Cordis Loader activates Session, projections, Agents, skills and preset registry');
 
   const providerFile = join(fixtureDir, 'skill-provider.mjs');
   await writeFile(providerFile, `export const inject = ['skills'];\nexport function apply(ctx) { ctx.effect(() => ctx.skills.register({ name: 'alpha-scoped', description: 'Scoped smoke skill', content: 'Test only', source: 'runtime' })); }\n`);
@@ -97,7 +97,7 @@ try {
     const skills = await seam.palette.skills({ cwd: fixtureDir });
     assert.ok(skills.some(skill => skill.name === 'alpha-scoped'), 'draft must see default preset skills through acquireScope');
     assert.equal(root.agents.list().length, 0);
-    passed('packed plugin reads an actual alpha preset-scoped skill without starting an Agent');
+    passed('packed plugin reads an actual DSH preset-scoped skill without starting an Agent');
   } finally { await unregister(); }
 
   // Settings provider is deliberately a port fixture: this tests actual Loader
@@ -109,8 +109,8 @@ try {
   assert.ok(entry.fiber);
   assert.equal(entry.fiber.error, undefined);
   assert.equal(entry.fiber.state, 2, 'plugin must be ACTIVE, not merely registered');
-  passed('packed plugin Config parses and mounts under actual alpha Cordis/Schemastery');
+  passed('packed plugin Config parses and mounts under actual DSH Cordis/Schemastery');
 } finally {
   await root.fiber.dispose();
 }
-console.log(`${count}/${count} alpha core-contract checks passed (no Web, profile persistence, relay or handset acceptance claimed)`);
+console.log(`${count}/${count} ${version} core-contract checks passed (no Web, profile persistence, relay or handset acceptance claimed)`);
