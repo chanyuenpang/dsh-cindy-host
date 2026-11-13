@@ -4,12 +4,14 @@ A Host-side adapter connecting current Cindy clients to DeepSeek Harness.
 
 ## Requirements and installation
 
-Version **0.1.41** adds DSH `0.2.2-rc.1` compatibility and keeps historical ordinary forks visible by classifying subagents through `origin`, not parent lineage. It retains 0.1.40's task provenance, system credential storage, image delivery, thumbnails, work titles, history stability and interruption controls. Handset re-entry, rendering and white-screen acceptance remain separate.
+Version **0.1.42** adds exact DSH `0.2.2-rc.2` compatibility, retaining 0.1.41's historical ordinary-fork handling, task provenance, credential storage, image delivery, thumbnails, work titles, history stability and interruption controls. Cindy's handshake identity is unchanged. Handset re-entry, rendering and white-screen acceptance remain separate.
 
-It supports the exact **DSH 0.2.2-rc.1** carrier, while retaining `0.2.2-alpha.2`, `0.2.1-rc.3`, `0.2.1-rc.4` and `0.2.1-rc.5`. DSH 0.2.2 requires **Node.js >=24.9** (RC tested with 24.18); the older carriers retain this plugin's Node.js >=22.16 minimum. Agent/session/settings peers and alpha Schemastery are explicitly allowed, not a blanket promise for future prereleases. RC validation covers isolated Web installation and runtime smoke; the prior alpha checks cover core contracts. Neither establishes relay or handset acceptance. Install through the Desktop DSH plugin manager. CLI-managed profiles can use:
+It supports the exact **DSH 0.2.2-rc.1 and 0.2.2-rc.2** carriers, while retaining `0.2.2-alpha.2`, `0.2.1-rc.3`, `0.2.1-rc.4` and `0.2.1-rc.5`. DSH 0.2.2 requires **Node.js >=24.9**; older carriers retain this plugin's Node.js >=22.16 minimum. Agent/session/settings peers are explicitly allowed, not a blanket promise for future prereleases. RC.2 automated validation uses the actual native SDK, including Cordis/Gateway question arbitration, without a real account or handset. Installation, UI, relay and handset acceptance are distinct checks.
+
+The 0.1.42 candidate is distributed as a verified tarball until separately published. Add that tarball through the Desktop plugin manager; CLI-managed profiles can use:
 
 ```sh
-dsh plugin --profile <profile> add dsh-cindy-host@0.1.41
+dsh plugin --profile <profile> add <path-to-dsh-cindy-host-0.1.42.tgz>
 ```
 
 Reload the Host plugin after installation. A full DSH restart is separate. Keep existing Cindy sign-in, device identity and settings; do not run two Host processes with the same identity.

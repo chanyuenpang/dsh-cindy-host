@@ -1,5 +1,10 @@
 # Changelog
 
+## 0.1.42 — 2026-11-13
+
+- Accept the reviewed DSH `0.2.2-rc.2` Agent/Session/Settings carrier without bundling a DSH runtime or enabling unreviewed prereleases. Preserve the existing supported carriers and Cindy handshake identity.
+- Revalidate native Session observers and controller/subagent reads against the RC.2 carrier; batched appends still publish the existing per-event observation API. Real handset, relay, OAuth and model calls remain separate acceptance requirements.
+
 ## 0.1.41 — 2026-11-08
 
 - Accept the exact DSH `0.2.2-rc.1` Agent/Session/Settings carrier alongside the existing 0.2.1 RC and 0.2.2-alpha.2 peers. Keep DSH packages host-provided and preserve 0.1.40's complete feature set, including credentials without keytar.
