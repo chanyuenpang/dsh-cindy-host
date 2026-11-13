@@ -1,5 +1,10 @@
 # Changelog
 
+## 0.1.43 — 2026-11-14
+
+- Accept the exact DSH `0.2.2-rc.3` Agent/Session/Settings carrier alongside all previously supported versions, without bundling DSH core packages or accepting future prereleases.
+- Preserve runtime behavior and Cindy handshake identity; update release identity, lockfile and compatibility regression coverage. The packed candidate passed 1,239 tests on an isolated real rc3 SDK (4 skipped), core contracts 7/7, clean native installation and Web runtime smoke 30/30; channel audit has 0 unclassified channels. Live handset, relay, OAuth and model calls remain separate acceptance requirements; publication does not reload an installed Host.
+
 ## 0.1.42 — 2026-11-13
 
 - Accept the reviewed DSH `0.2.2-rc.2` Agent/Session/Settings carrier without bundling a DSH runtime or enabling unreviewed prereleases. Preserve the existing supported carriers and Cindy handshake identity.
