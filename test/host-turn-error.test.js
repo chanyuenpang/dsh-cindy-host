@@ -47,7 +47,14 @@ async function setup(events = [], customize = () => {}, ports = {}) {
 }
 const pushes = (socket, channel) => socket.sent.filter(frame => frame.kind === 'push' && frame.payload.channel === channel);
 const terminals = socket => socket.sent.filter(frame => frame.kind === 'push' && frame.payload.channel === 'maker:event'
-  && ['done', 'error'].includes(frame.payload.payload.event.type));
+  && (frame.payload.payload.event.type === 'done' || (frame.payload.payload.event.type === 'error' && frame.payload.payload.event.data?.isTerminal !== false)));
+const retry = (seq = 1, patch = {}) => ({ type: 'llm/retry', seq, time: 1000 + seq * 1000,
+  data: { turn: 1, step: 1, retryId: 'r1', mode: 'normal', retry: 1, maxRetries: 3, delayMs: 2000,
+    failure: { code: 'TRANSPORT', message: 'SECRET' }, ...patch } });
+const retryStarted = (seq = 2) => ({ type: 'llm/retry-started', seq, time: 1000 + seq * 1000,
+  data: { turn: 1, step: 1, retryId: 'r1', retry: 1 } });
+const makerEvents = socket => pushes(socket, 'maker:event').map(frame => frame.payload.payload.event);
+const retryEvents = socket => makerEvents(socket).filter(event => event.type === 'error' && event.data?.willRetry === true);
 
 test('listing reads diagnostic settings once per page, not once per session',async()=>{
  let reads=0;const x=await setup([], (reader,source)=>{source.listSessions=async()=>Array.from({length:100},(_,n)=>({id:`s${n}`,cwd:'/repo',running:false,interruption:null}));},
@@ -230,18 +237,118 @@ test('reconnect delivers interruption text itself before the terminal, scoped to
 
 test('scheduled retry reports safe ongoing status without a terminal or stale-turn cancellation', async () => {
   const x = await setup();
-  const retry = { type: 'llm/retry', seq: 1, time: 2000, data: { turn: 1, mode: 'normal', retry: 1, maxRetries: 3, delayMs: 2000, failure: { code: 'RATE_LIMIT', message: 'SECRET' } } };
+  const scheduled = retry();
   try {
     await x.subscribe(); x.runtime.pushTurnRunning('s1', start(0)); x.socket.sent.length = 0;
-    x.runtime.pushSessionDiagnostic('s1', retry);
+    x.runtime.pushSessionDiagnostic('s1', scheduled);
     assert.equal(terminals(x.socket).length, 0); assert.equal(x.runtime.isSessionRunning('s1'), true);
-    assert.ok(x.socket.sent.some(f => f.payload?.payload?.event?.data?.status?.includes('已安排重试')));
+    assert.equal(retryEvents(x.socket).at(-1).data.message, 'Reconnecting... 1/3');
+    assert.equal(pushes(x.socket, 'local-db:messages:created').length, 0);
     assert.equal(JSON.stringify(x.socket.sent).includes('SECRET'), false);
-    x.runtime.pushTurnIdle('s1', fail(2)); x.socket.sent.length = 0; x.runtime.pushSessionDiagnostic('s1', retry);
+    x.runtime.pushTurnIdle('s1', fail(2)); x.socket.sent.length = 0; x.runtime.pushSessionDiagnostic('s1', scheduled);
     assert.equal(x.socket.sent.length, 0);
     x.runtime.pushTurnRunning('s1', { ...start(3), data: { turn: 2 } }); x.socket.sent.length = 0;
-    x.runtime.pushSessionDiagnostic('s1', { ...retry, seq: 4 });
+    x.runtime.pushSessionDiagnostic('s1', { ...scheduled, seq: 4 });
     assert.equal(x.socket.sent.length, 0, 'late retry from a different turn cannot overwrite the current status');
+  } finally { await x.runtime.stop(); }
+});
+
+test('retry progress survives started and neutral summary statuses; real progress clears it', async () => {
+  const x = await setup();
+  try {
+    await x.subscribe(); x.runtime.pushTurnRunning('s1', start(0));
+    for (const event of [retry(), retryStarted()]) x.runtime.pushSessionDiagnostic('s1', event);
+    assert.equal(retryEvents(x.socket).at(-1).data.message, 'Reconnecting... 1/3');
+    x.socket.sent.length = 0;
+    await x.source.emit({ kind: 'session-status', sessionId: 's1', phase: 'running', sequence: 1 });
+    assert.equal(makerEvents(x.socket).at(-1).data.message, 'Reconnecting... 1/3');
+    x.socket.sent.length = 0;
+    x.runtime.pushSessionDiagnostic('s1', { type: 'assistant/message', seq: 3, time: 4000, data: { turn: 1 } });
+    assert.deepEqual(makerEvents(x.socket), [{ type: 'status', data: { isRunning: true, status: 'running' } }]);
+    assert.equal(pushes(x.socket, 'local-db:messages:created').length, 0);
+    x.socket.sent.length = 0; x.runtime.pushSessionDiagnostic('s1', retry());
+    assert.deepEqual(makerEvents(x.socket), [], 'a duplicate/late retry cannot replace real progress');
+  } finally { await x.runtime.stop(); }
+});
+
+for (const phase of ['waiting', 'started', 'progress', 'always', 'unmapped']) test(`cold/relink recovery restores ${phase} without retry rows`, async () => {
+  const events = [start(0), retry(1, phase === 'always' ? { mode: 'always', maxRetries: undefined }
+    : phase === 'unmapped' ? { failure: { code: 'RATE_LIMIT' } } : {})];
+  if (phase === 'started' || phase === 'progress') events.push(retryStarted());
+  if (phase === 'progress') events.push({ type: 'step/start', seq: 3, time: 4000, data: { turn: 1, step: 2 } });
+  const x = await setup(events);
+  try {
+    x.state.running = true; await x.subscribe();
+    assert.equal(makerEvents(x.socket)[0].type, 'status', 'restore maker turn gate before retry');
+    assert.equal(retryEvents(x.socket).length, ['waiting', 'started'].includes(phase) ? 1 : 0);
+    assert.deepEqual(await x.reader.all('s1'), []);
+    x.socket.sent.length = 0;
+    x.socket.frame({ v: 1, kind: 'link-open', id: 'relink', src: 'phone' }); await tick(); await tick();
+    if (['waiting', 'started'].includes(phase)) assert.equal(makerEvents(x.socket).at(-1).data.message, 'Reconnecting... 1/3');
+    else assert.equal(retryEvents(x.socket).length, 0);
+    assert.equal(terminals(x.socket).length, 0);
+  } finally { await x.runtime.stop(); }
+});
+
+for (const type of ['llm/retry-started', 'step/start', 'turn/end', 'turn/start']) test(`old waiting recovery cannot overwrite newer ${type}`, async () => {
+  const gate = deferred(); let wait = false;
+  const x = await setup([start(0), retry()], reader => {
+    const original = reader.turnState;
+    reader.turnState = id => wait ? gate.promise : original(id);
+  });
+  try {
+    x.state.running = true; await x.subscribe(); wait = true;
+    await x.subscribe();
+    if (type === 'turn/end') x.runtime.pushTurnIdle('s1', fail(3));
+    else if (type === 'turn/start') x.runtime.pushTurnRunning('s1', { ...start(3), data: { turn: 2 } });
+    else x.runtime.pushSessionDiagnostic('s1', type === 'llm/retry-started' ? retryStarted() : { type, seq: 3, time: 4000, data: { turn: 1, step: 2 } });
+    x.socket.sent.length = 0;
+    gate.resolve(turnStateFromEvents([start(0), retry()], 's1')); await tick(); await tick();
+    assert.equal(makerEvents(x.socket).length, 0);
+  } finally { gate.resolve(null); await x.runtime.stop(); }
+});
+
+test('human-input waiting and source replacement do not retain old transport progress', async () => {
+  const x = await setup();
+  try {
+    await x.subscribe(); x.runtime.pushTurnRunning('s1', start(0)); x.runtime.pushSessionDiagnostic('s1', retry());
+    await x.source.emit({ kind: 'session-status', sessionId: 's1', phase: 'waiting', sequence: 1 });
+    x.socket.sent.length = 0;
+    await x.source.emit({ kind: 'session-status', sessionId: 's1', phase: 'running', sequence: 2 });
+    assert.equal(retryEvents(x.socket).length, 0);
+    x.runtime.pushSessionDiagnostic('s1', retry(3));
+    await x.runtime.setSource(new FixtureDshSource()); x.socket.sent.length = 0;
+    x.runtime.pushTurnRunning('s1', { ...start(4), data: { turn: 2 } });
+    assert.equal(retryEvents(x.socket).length, 0);
+  } finally { await x.runtime.stop(); }
+});
+
+for (const role of ['assistant', 'thinking']) test(`native live ${role} clears progress before commit and resubscribe cannot revive it`, async () => {
+  let listener; let reader;
+  const liveAssistant = { watch: (_id, fn) => { listener = fn; fn({ rows: [], immediate: true, historyChanged: false }); return () => {}; } };
+  const x = await setup([start(0), retry(), retryStarted()], value => { reader = value; }, {
+    resolveCapabilities: () => ({ readMessages: reader, liveAssistant }),
+  });
+  try {
+    x.state.running = true; await x.subscribe();
+    assert.equal(retryEvents(x.socket).at(-1).data.message, 'Reconnecting... 1/3');
+    x.socket.sent.length = 0;
+    listener({ rows: [{ id: 'live1', clientId: 'live1', role, content: role === 'thinking' ? { text: '恢复输出', isStreaming: true } : '恢复输出' }],
+      attempt: { turn: 1, step: 1, startedAfterSeq: 2 }, immediate: true, historyChanged: false });
+    assert.equal(retryEvents(x.socket).length, 0);
+    assert.equal(makerEvents(x.socket).some(event => event.type === 'status'), true);
+    x.socket.sent.length = 0; await x.subscribe();
+    assert.equal(retryEvents(x.socket).length, 0, 'older committed retry cannot undo a native output clear');
+  } finally { await x.runtime.stop(); }
+});
+
+test('human waiting clear survives fresh authoritative retry replay on resubscribe', async () => {
+  const x = await setup([start(0), retry()]);
+  try {
+    x.state.running = true; await x.subscribe();
+    await x.source.emit({ kind: 'session-status', sessionId: 's1', phase: 'waiting', sequence: 1 });
+    x.socket.sent.length = 0; await x.subscribe();
+    assert.equal(retryEvents(x.socket).length, 0);
   } finally { await x.runtime.stop(); }
 });
 

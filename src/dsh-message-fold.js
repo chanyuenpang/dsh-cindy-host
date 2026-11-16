@@ -582,7 +582,26 @@ export function createMessageReader({
   readMessages.count = countRows;
   /** Exact project-grouping evidence derived from the same folded transcript. */
   readMessages.activity = async (sessionId) => {
-    const { rows, nativeMetadata } = await ensureTranscript(sessionId);
+    // List enrichment must not populate/evict the three-session detail LRU.
+    // Reuse a warm detail, otherwise retain scalar row identities only: no
+    // history/work-group materialization and no transcript body in the list memo.
+    const cached = transcripts.get(sessionId);
+    let rows = cached?.rows, nativeMetadata = cached?.nativeMetadata;
+    if (!rows) {
+      const snapshot = await readSessionLog(sessionId);
+      const selected = new Map(); let lastSeq = null, valid = true;
+      for (const event of Array.isArray(snapshot?.events) ? snapshot.events : []) {
+        if (!event || typeof event !== 'object') continue;
+        if (!Number.isSafeInteger(event.seq) || event.seq < 0 || lastSeq !== null && event.seq !== lastSeq + 1) valid = false;
+        if (Number.isFinite(event.seq)) lastSeq = event.seq;
+        nativeMetadata = advanceInterruptionMetadata(nativeMetadata, event, sessionId);
+        for (const row of displayEventRows(event, { sessionId, now })) {
+          selected.delete(row.id); selected.set(row.id, { role: row.role, createdAt: row.createdAt });
+        }
+      }
+      if (!valid) nativeMetadata = null;
+      rows = [...selected.values()].reverse();
+    }
     let userSendAt = null;
     for (let index = rows.length - 1; index >= 0; index -= 1) {
       const row = rows[index];

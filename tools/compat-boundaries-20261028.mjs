@@ -1,5 +1,11 @@
 /** Explicit unavailable features, not claims of client support or successful execution. */
 export const UNSUPPORTED_INVOKES = new Map([
+  ['device-link:agent-net-switch:v1', 'No remote agent network/proxy switching adapter is exposed; native DSH network policy is not overridden.'],
+  ['maker:settings:navigate', 'Remote Cindy settings navigation is not a DSH settings mutation or UI-navigation contract.'],
+  ['maker:subscription-accounts', 'No Cindy subscription-account pool or credential-routing registry is exposed.'],
+  ['maker:subscription-pool:quota', 'No provider subscription-pool quota contract is mapped; session usage and model catalogs are not account quota.'],
+  ['maker:worker-roles:get', 'No Cindy worker-role registry is hosted; native subagent reads do not implement team role management.'],
+  ['maker:worker-roles:apply', 'No Cindy worker-role mutation adapter is hosted.'],
   [
     "agent-island:completion-action",
     "No native agent-island completion action registry is owned by this adapter."
@@ -82,6 +88,7 @@ export const UNSUPPORTED_INVOKES = new Map([
   ]
 ]);
 export const UNSENT_PUSHES = new Map([
+  ['subscription-accounts:changed', 'No subscription-account pool is exposed or mutated, so no account-pool changed push is fabricated.'],
   [
     "local-db:sessions:list",
     "The Host answers list invokes and emits lifecycle/activity patches; it has no separate bulk-list push."
@@ -90,10 +97,8 @@ export const UNSENT_PUSHES = new Map([
     "local-db:task-tags:changed",
     "No task-tag mutation API is served, so no tag changes can be announced."
   ],
-  [
-    "maker:history-work-patch",
-    "Incremental work patches are optional; this Host emits full history-view invalidations instead."
-  ],
+  // maker:history-work-patch is implemented by the native live delivery path;
+  // its lease/base-revision safety is covered in host-native-sync.test.js.
   [
     "maker:orca:worker-changed",
     "No Cindy Orca worker registry is composed."

@@ -453,70 +453,26 @@ export function createChannelRouter({
     }
   }
 
-  /**
-   * Read the session rows the phone renders.
-   *
-   * `local-db:sessions:list` is also the phone's device-responsiveness probe, so
-   * it has to stay a single cheap read — which is why the row is folded from the
-   * source's one listing rather than from a per-session fetch.
-   *
-   * **And it may not block on that read at all.** Measured on a live Host (2026-09-18,
-   * 19:08–19:15): eighteen `invoke:local-db:sessions:list` calls aborted with
-   * `TimeoutError` in seven minutes while a build saturated the machine — the abort is at
-   * the **invoke** level (list read + title folding + row building together overran the
-   * deadline), so the source's own stale-serve guard never saw it, and the phone read a
-   * failed list as "the device is offline". The list a controller renders is satisfied by a
-   * few seconds' staleness, so the rows are cached and the read happens behind the answer:
-   * a warm cache answers instantly, and a refresh that fails leaves the previous page
-   * standing rather than turning a slow machine into a disconnected phone.
-   */
-  let rowsCache = null;
-  let rowsRefresh = null;
+  // Only equivalent in-flight reads are shared. The source owns the projection;
+  // retaining another settled page here would require a future phone poll to heal it.
   let rowsGeneration = 0;
-  /** How long a served page stays fresh enough to answer with before a refresh is kicked. */
-  const SESSION_ROWS_TTL_MS = 5_000;
-
-  /**
-   * Void the cached page because this Host just changed a row.
-   *
-   * Called from every write path that changes what a list read must say — the reply a
-   * controller applies is folded from the same rows, so a stale page there is not a small
-   * lag but an instruction to revert the user's edit.
-   */
-  function invalidateSessionRows() {
-    rowsGeneration += 1;
-    rowsCache = null;
-    rowsRefresh = null; // A pre-write read cannot fulfill a post-write request.
-  }
-
-  /** Read + fold once, sharing one flight between concurrent callers. */
-  function refreshSessionRows() {
-    if (rowsRefresh !== null) return rowsRefresh;
-    const generation = rowsGeneration;
+  const rowFlights = new Map();
+  function invalidateSessionRows() { rowsGeneration++; rowFlights.clear(); }
+  async function sessionRows(query = {}) {
+    const key = JSON.stringify([rowsGeneration, query.limit, query.status, query.includePinned]);
+    if (query.fresh !== true && rowFlights.has(key)) return rowFlights.get(key);
     const attempt = (async () => {
-      const items = await listSessions();
-      const rows = toCindySessionList(items, { now, device: deviceIdentity(), defaultModel: catalogDefaultModel, catalog: agentCatalog });
-      if (generation === rowsGeneration) rowsCache = { rows, at: now() };
-      return rows;
-    })();
-    rowsRefresh = attempt;
-    const settle = () => { if (rowsRefresh === attempt) rowsRefresh = null; };
-    attempt.then(settle, settle);
-    return attempt;
-  }
-
-  async function sessionRows() {
-    const cached = rowsCache;
-    if (cached !== null) {
-      if (now() - cached.at > SESSION_ROWS_TTL_MS) {
-        // Stale-while-revalidate: the controller gets a real page now and a fresher one on
-        // its next poll. A failed refresh is deliberately silent — the page above is durable.
-        refreshSessionRows().catch(() => {});
+      for (let retry = 0; retry < 8; retry++) {
+        const generation = rowsGeneration;
+        const items = await listSessions(query);
+        if (generation !== rowsGeneration) continue; // Do not even reply with an old completion.
+        return toCindySessionList(items, { now, device: deviceIdentity(), defaultModel: catalogDefaultModel, catalog: agentCatalog });
       }
-      return cached.rows;
-    }
-    // Cold start: the only case where the probe must wait for a read.
-    return refreshSessionRows();
+      throw refusalError('NOT_AVAILABLE', 'Session list changed repeatedly; synchronize again');
+    })();
+    rowFlights.set(key, attempt);
+    try { return await attempt; }
+    finally { if (rowFlights.get(key) === attempt) rowFlights.delete(key); }
   }
 
   /** Mirror Cindy's native sessions:list paging contract over the cached full projection. */
@@ -538,9 +494,14 @@ export function createChannelRouter({
 
   async function sessionRow(sessionId) {
     if (typeof getSession === 'function') {
-      const item = await getSession(sessionId);
-      if (item == null || String(item.id) !== sessionId) return undefined;
-      return toCindySessionListRow(item, { now, device: deviceIdentity(), defaultModel: catalogDefaultModel, catalog: agentCatalog });
+      for (let retry = 0; retry < 8; retry++) {
+        const generation = rowsGeneration;
+        const item = await getSession(sessionId);
+        if (generation !== rowsGeneration) continue;
+        if (item == null || String(item.id) !== sessionId) return undefined;
+        return toCindySessionListRow(item, { now, device: deviceIdentity(), defaultModel: catalogDefaultModel, catalog: agentCatalog });
+      }
+      throw refusalError('NOT_AVAILABLE', 'Session changed repeatedly; synchronize again');
     }
     let row = (await sessionRows()).find((candidate) => candidate.id === sessionId);
     if (row === undefined) {
@@ -599,44 +560,49 @@ export function createChannelRouter({
       // The creation pipeline awaits the sessions-topic subscription BEFORE
       // sending create. Reading the corpus for that acknowledgement made cold
       // listing timeouts look like failed creates that never reached this Host.
-      if (sessionIds.length > 0 && typeof subscribing.isSessionRunning === 'function'
-        && typeof subscribing.pushTurnIdle === 'function'
-        && typeof subscribing.pushTurnRunning === 'function') {
-        let live = null;
-        if (typeof getSession !== 'function') {
-          try {
-            const rows = await listStates();
-            live = Array.isArray(rows) ? rows : null;
-          } catch {
-            // Legacy sources without exact reads keep the runtime fallback.
-          }
-        }
-        for (const sessionId of sessionIds) {
-          if (typeof subscribing.restoreTurnState === 'function') {
-            await subscribing.restoreTurnState(request.src, sessionId);
-          } else {
-            let row = live === null ? null : live.find((candidate) => String(candidate?.id) === sessionId) ?? null;
-            if (typeof getSession === 'function') {
-              try { row = await getSession(sessionId) ?? null; } catch { row = null; }
+      const repairSubscribedSessions = async () => {
+        if (sessionIds.length > 0 && typeof subscribing.isSessionRunning === 'function'
+          && typeof subscribing.pushTurnIdle === 'function'
+          && typeof subscribing.pushTurnRunning === 'function') {
+          let live = null;
+          if (typeof getSession !== 'function') {
+            try {
+              const rows = await listStates();
+              live = Array.isArray(rows) ? rows : null;
+            } catch {
+              // Legacy sources without exact reads keep the runtime fallback.
             }
-            const running = row === null ? subscribing.isSessionRunning(sessionId) === true : row.running === true;
-            if (running) subscribing.pushTurnRunning(sessionId);
-            else subscribing.pushTurnIdle(sessionId);
           }
-          // …and the two things a push that never arrived would have carried.
-          //
-          // Measured: an app returning from the background does an unsubscribe → resubscribe
-          // flicker (26 subscribes / 13 unsubscribes in one session), a send landed inside it, and
-          // the frames carrying "accepted" and "the view changed" were discarded by the relay with
-          // nobody to retry them — the bubble spun forever and the transcript stayed stale until
-          // the app was restarted. A subscription is the one moment the client is guaranteed to be
-          // listening, so it is where the Host repairs what it could not deliver: the authoritative
-          // input projection (which retires a spinning bubble) and a view invalidation (which makes
-          // it re-read). Both are idempotent and cost one frame each.
-          if (typeof subscribing.pushInputProjection === 'function') subscribing.pushInputProjection(sessionId);
-          if (typeof subscribing.invalidateHistoryView === 'function') subscribing.invalidateHistoryView(sessionId);
+          for (const sessionId of sessionIds) {
+            if (typeof subscribing.restoreTurnState === 'function') {
+              await subscribing.restoreTurnState(request.src, sessionId);
+            } else {
+              let row = live === null ? null : live.find((candidate) => String(candidate?.id) === sessionId) ?? null;
+              if (typeof getSession === 'function') {
+                try { row = await getSession(sessionId) ?? null; } catch { row = null; }
+              }
+              const running = row === null ? subscribing.isSessionRunning(sessionId) === true : row.running === true;
+              if (running) subscribing.pushTurnRunning(sessionId);
+              else subscribing.pushTurnIdle(sessionId);
+            }
+            // …and the two things a push that never arrived would have carried.
+            //
+            // Measured: an app returning from the background does an unsubscribe → resubscribe
+            // flicker (26 subscribes / 13 unsubscribes in one session), a send landed inside it, and
+            // the frames carrying "accepted" and "the view changed" were discarded by the relay with
+            // nobody to retry them — the bubble spun forever and the transcript stayed stale until
+            // the app was restarted. A subscription is the one moment the client is guaranteed to be
+            // listening, so it is where the Host repairs what it could not deliver: the authoritative
+            // input projection (which retires a spinning bubble) and a view invalidation (which makes
+            // it re-read). Both are idempotent and cost one frame each.
+            if (typeof subscribing.pushInputProjection === 'function') subscribing.pushInputProjection(sessionId);
+            if (typeof subscribing.invalidateHistoryView === 'function') subscribing.invalidateHistoryView(sessionId);
+          }
         }
-      }
+      };
+      // Passive native follow and turn recovery must not hold the subscription acknowledgement.
+      if (typeof subscribing.liveAssistant?.watch === 'function') void repairSubscribedSessions().catch(() => {});
+      else await repairSubscribedSessions();
       return invokeResult(request, { subscribed: topics });
     }
 
@@ -648,7 +614,12 @@ export function createChannelRouter({
     }
 
     if (channel === 'local-db:sessions:list') {
-      return invokeResult(request, sessionListPage(await sessionRows(), args));
+      const options = args[2] && typeof args[2] === 'object' ? args[2] : {};
+      if (options.before !== undefined || options.ids !== undefined || options.usageHistory !== undefined) {
+        return invokeError(request, 'NOT_AVAILABLE', 'Privileged local session queries are not available remotely');
+      }
+      const query = { limit: args[0] ?? 20, status: args[1], includePinned: options.includePinned === true, fresh: options.fresh === true };
+      return invokeResult(request, sessionListPage(await sessionRows(query), args));
     }
 
     if (channel === 'local-db:sessions:ack-interrupted' || channel === 'local-db:messages:dismiss-error') {
@@ -1790,6 +1761,9 @@ export function createChannelRouter({
     if (channel === 'maker:input:get-projection') {
       const capabilities = capabilitiesNow();
       const sessionId = String(args[0] ?? '');
+      // Delivery receipts do not import DSH-origin pending inputs. Refresh the
+      // native mirror first, including when the delivery branch returns early.
+      if (sessionId && typeof capabilities.refreshInputProjection === 'function') await capabilities.refreshInputProjection(sessionId);
       if (typeof capabilities.inputDelivery === 'function') {
         let delivery;
         try { delivery = capabilities.inputDelivery(); } catch (error) { return deliveryReply(request, () => { throw error; }); }
@@ -1798,7 +1772,7 @@ export function createChannelRouter({
       // Read what DSH actually holds before falling back to the fold: a fold that
       // never heard a `queue` frame reports an empty queue, which is how the
       // controller came to keep a 队列中 row for a message the agent had answered.
-      if (sessionId !== '' && typeof capabilities.readSessionState === 'function' && typeof capabilities.projectionFromItems === 'function') {
+      if (sessionId !== '' && typeof capabilities.refreshInputProjection !== 'function' && typeof capabilities.readSessionState === 'function' && typeof capabilities.projectionFromItems === 'function') {
         const state = await capabilities.readSessionState(sessionId);
         if (state !== null && state !== undefined) {
           return invokeResult(request, capabilities.projectionFromItems(sessionId, queueItemsFromInbox(state.inbox)));
@@ -1871,10 +1845,10 @@ export function createChannelRouter({
       if (view === undefined || view === null) return invokeError(request, 'NOT_AVAILABLE', 'This DSH Host projects no session history view');
       const sessionId = typeof args[0] === 'string' ? args[0] : '';
       const answered = channel === 'local-db:messages:view'
-        ? await view.page(sessionId, args[1]?.before)
+        ? await view.page(sessionId, args[1]?.before, { workLines: args[1]?.workLines === true })
         : channel === 'local-db:messages:work-details'
           ? await view.details(sessionId, args[1], args[2]?.after)
-          : await view.intent(sessionId, args[1]);
+          : await view.intent(sessionId, args[1], request.src);
       // Pending bodies belong in InputProjection, never synthetic user history.
       return answered?.ok === true
         ? invokeResult(request, answered.result)
@@ -1932,5 +1906,6 @@ export function createChannelRouter({
     return invokeError(request);
   };
   handleInvoke.invalidateSessionRows = invalidateSessionRows;
+  handleInvoke.sessionWireRow = item => toCindySessionListRow(item, { now, device: deviceIdentity(), defaultModel: catalogDefaultModel, catalog: agentCatalog });
   return handleInvoke;
 }

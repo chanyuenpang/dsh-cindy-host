@@ -52,7 +52,7 @@ test('declares ordinary task provenance independently of the model provider', ()
 
 test('reports no display-model fields, which the controller derives itself', () => {
   const row = toCindySessionListRow(ROW, { device: DEVICE });
-  for (const field of ['subtitle', 'detail', 'messagePreview', 'liveActivity', 'lastActivityAt', 'pendingInteractionCount', 'scheduleInfo', 'worktreeLabel']) {
+  for (const field of ['subtitle', 'detail', 'messagePreview', 'liveActivity', 'pendingInteractionCount', 'scheduleInfo', 'worktreeLabel']) {
     assert.equal(field in row, false, `${field} belongs to the controller's view model, not the wire`);
   }
 });

@@ -9,12 +9,16 @@ export function createHistoryProjection(sessionId) {
   let liveBase = 0;
   let scope = null;
   let live = [];
+  let identity = {};
+  let version = 0;
+  const snapshots = new Map();
   const compare = (a, b) => a[0] - b[0] || a[1] - b[1];
 
   function consume(event, rows = []) {
     const position = ordinal++;
     const before = live;
-    reasoning.consume(event);
+    const changed = reasoning.consume(event);
+    if (changed || rows.length) { version++; snapshots.clear(); }
     const entries = reasoning.entries();
     const nextScope = entries[0]?.scope ?? null;
     if (entries.length && scope !== nextScope) liveBase = position;
@@ -24,10 +28,13 @@ export function createHistoryProjection(sessionId) {
     for (const entry of before) {
       if (!current.has(entry.row.clientId)) retired.set(entry.row.clientId, entry.position);
     }
+    // An unexpected rewritten ID invalidates the permanent-prefix promise.
+    if (rows.some(row => stored.has(row.id))) identity = {};
     rows.forEach((row, index) => stored.set(row.id, { row, position: [position, index] }));
   }
 
   function snapshot({ rowids = false } = {}) {
+    if (snapshots.has(rowids)) return snapshots.get(rowids);
     const entries = [...stored.values(), ...live].sort((a, b) => compare(a.position, b.position));
     const rows = entries.map(entry => {
       if (!rowids) return entry.row;
@@ -45,7 +52,10 @@ export function createHistoryProjection(sessionId) {
       }
     });
     const retiredCuts = new Map(retired);
-    return { rows, resolve(id, { cut = false } = {}) {
+    const liveIds = new Set(live.map(entry => entry.row.id));
+    const firstLive = rows.findIndex(row => liveIds.has(row.id));
+    const result = { rows, projection: { identity, version, sealedPrefixLength: firstLive < 0 ? rows.length : firstLive },
+      resolve(id, { cut = false } = {}) {
       if (ids.has(id)) return ids.get(id);
       const key = typeof id === 'string' && id.startsWith('history-live:') ? id.slice(13) : id;
       const position = cut ? retiredCuts.get(key) : undefined;
@@ -53,6 +63,8 @@ export function createHistoryProjection(sessionId) {
       const index = entries.findIndex(entry => compare(entry.position, position) >= 0);
       return index < 0 ? rows.length : index;
     } };
+    snapshots.set(rowids, result);
+    return result;
   }
   return { consume, snapshot, reasoning };
 }

@@ -928,7 +928,7 @@ test('a finished turn patches the row for a controller that is only holding the 
     assert.deepEqual(pushes[0].payload.payload, { sessionId: 's1', event: { type: 'done' } });
     assert.equal(pushes[1].payload.payload.sessionId, 's1');
     assert.equal(pushes[1].payload.payload.patch.running, false);
-    assert.equal(typeof pushes[1].payload.payload.patch.updatedAt, 'string');
+    assert.equal(pushes[1].payload.payload.patch.updatedAt, undefined, 'unknown legacy recency is not fabricated from wall time');
 
     // And the other direction: nobody is told anything twice.
     socket.frame({ v: 1, kind: 'invoke', id: 'sub-2', src: 'phone-3', payload: { channel: 'device-link:subscribe', args: [{ topics: ['session:s1'] }] } });
@@ -980,8 +980,8 @@ test('a controller archives a session, and every device holding the row is patch
       .filter((frame) => frame.kind === 'push' && frame.payload.channel === 'local-db:sessions:patched')
       .map((frame) => ({ dst: frame.dst, patch: frame.payload.payload.patch }));
     assert.deepEqual(patches, [
-      { dst: 'laptop-1', patch: { status: 'archived', pinnedAt: null, updatedAt: patches[0].patch.updatedAt } },
-      { dst: 'phone-2', patch: { status: 'archived', pinnedAt: null, updatedAt: patches[0].patch.updatedAt } },
+      { dst: 'laptop-1', patch: { status: 'archived', pinnedAt: null, updatedAt: patches[0].patch.updatedAt, lastActivityAt: patches[0].patch.updatedAt } },
+      { dst: 'phone-2', patch: { status: 'archived', pinnedAt: null, updatedAt: patches[0].patch.updatedAt, lastActivityAt: patches[0].patch.updatedAt } },
     ], 'one frame per controller, and the phone is not told twice for holding two topics');
 
     // The hidden row is out of the live list, and out of the phone's list read. The

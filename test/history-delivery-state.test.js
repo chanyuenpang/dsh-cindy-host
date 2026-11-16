@@ -33,3 +33,39 @@ test('failed reads, lost leases and stale completions cannot revive readiness', 
   allowed = true; assert.equal(state.ready('phone', 's'), false);
   assert.equal(state.begin({ src: 'phone', payload: { channel: 'local-db:messages:view-intent', args: ['s', []] } }), null);
 });
+
+test('patch receipts use actual fitted pages, CAS versions and isolated controller intents', () => {
+  const state = createHistoryDeliveryState(() => true);
+  const latest = deviceId => ({ src: deviceId, payload: { channel: 'local-db:messages:view', args: ['s', { workLines: true }] } });
+  const fitted = { version: 1, items: [], hasMore: true, nextCursor: 'actually-fitted' };
+  state.finish(state.begin(latest('a')), true, fitted);
+  state.finish(state.begin(latest('b')), true, fitted);
+  const a = state.capture('a', 's');
+  assert.deepEqual(a.page, fitted);
+  fitted.nextCursor = 'mutated-reader';
+  assert.equal(a.page.nextCursor, 'actually-fitted', 'the receipt does not alias the reader result');
+  assert.equal(state.acceptPatch(a, { ...a.page, nextCursor: 'patch' }), true);
+  assert.equal(state.acceptPatch(a, fitted), false, 'a patch receipt is single-use');
+  const concurrent = state.capture('a', 's');
+  const page = state.begin(latest('a'));
+  assert.equal(state.current(concurrent), false, 'a new page read fences old patch construction');
+  state.finish(page, true, fitted);
+  assert.deepEqual(state.intent('a', 's', [{ key: 'preview-work-a' }]), { ok: true, result: true });
+  assert.deepEqual(state.expandedFor('a', 's'), ['work-a']);
+  assert.deepEqual(state.expandedFor('b', 's'), []);
+  const stale = state.capture('a', 's');
+  state.forget('a');
+  assert.equal(state.current(stale), false);
+  assert.deepEqual(state.expandedFor('a', 's'), []);
+  assert.equal(state.capture('b', 's').page.nextCursor, 'actually-fitted');
+});
+
+test('legacy and older pages cannot establish a patch baseline', () => {
+  const state = createHistoryDeliveryState(() => true);
+  const page = { version: 1, items: [], hasMore: false, nextCursor: null };
+  state.finish(state.begin(request('legacy')), true, page);
+  assert.equal(state.capture('legacy', 's').page, null);
+  const older = request('older', 'cursor'); older.payload.args[1].workLines = true;
+  state.finish(state.begin(older), true, page);
+  assert.equal(state.capture('older', 's').page, null);
+});

@@ -1,529 +1,484 @@
-/**
- * The DSH data source for the Cindy Host.
- *
- * The original bundle read DSH through `ctx.apiProxy` (`InProcessApiClient`).
- * Current DSH Web does not mount `apiProxy`, so that source was permanently
- * `undefined` and the projection never started — the phone saw an empty session
- * list. This module reads the same facts from the services the Web profile
- * actually mounts:
- *
- *  - `ctx.sessionController.list()`  → the session list (`SessionSummary`), the
- *    host-side counterpart of the old `client.sessions.list()`;
- *  - cordis `api-session/added|removed|status|activity|error` events → the host
- *    lifecycle stream, the counterpart of the old `events.host()` frames.
- *
- * Both are ordinary host services and events, so nothing here needs Typert
- * codegen or a client carrier.
- *
- * The projection layer above is unchanged: it needs `listSessions()` and
- * `onEvent(listener)`, and that is exactly what this source offers.
+/** A single, disposable SessionListView. Native services remain the fact owners.
+ * Subscribe before any baseline; snapshots, exact reads and row notifications use
+ * collection/row/domain cut fences. No result TTL, stale-success or corpus transcript warm.
  */
-
-/** Activity kinds the projection's allowlist accepts (see `contracts.js`). */
-function activity(kind, sessionId, phase, extra = {}) {
-  return { kind, sessionId: String(sessionId), sequence: 0, phase, ...extra };
+const ordinary = item => item && typeof item === 'object' && item.origin !== 'subagent';
+const visible = item => ordinary(item) && item.blank !== true;
+const failure = message => Object.assign(new Error(message), { code: 'NOT_AVAILABLE' });
+const clone = value => structuredClone(value);
+const byActivity = (a, b) => String(b.updatedAt).localeCompare(String(a.updatedAt)) || String(b.id).localeCompare(String(a.id));
+function coreSignature(item) {
+  const { values = {}, ...provenance } = item.projections ?? {};
+  return JSON.stringify({ id: item.sessionId, createdAt: item.createdAt, updatedAt: item.updatedAt,
+    running: item.running, blank: item.blank, cwd: item.cwd, origin: item.origin,
+    projections: { ...provenance, values: { title: values.title, sessionListMetadata: values.sessionListMetadata,
+      modelSelection: values.modelSelection, permissions: values.permissions } } });
 }
 
-/**
- * Whether a session belongs in a controller's session list.
- *
- * **A subagent run and an unprompted draft are not tasks.** DSH marks delegated
- * sessions in the summary (`origin: 'subagent'`). `parentSessionId` is lineage,
- * and can also appear on historical ordinary forks (DSH 0.2.2). It also marks a
- * newly opened, never-prompted conversation
- * as `blank: true`. Neither appears in DSH's user-facing sidebar, so neither may be
- * projected as a Cindy task — which is why a deployment's
- * `~/.dsh/sessions` can hold two hundred subagent logs the user has never seen. This Host
- * listed every one of them as "Untitled DSH task": measured on a real profile, 219 rows of
- * which the visible handful were the actual tasks, and the whole list had to be folded
- * (titles included) on every poll. Filtering here is therefore both the honest row set and
- * most of the latency.
- * @param item - one `SessionSummary` from the session service.
- * @returns true when a controller should see it.
- */
-function isControllerSession(item) {
-  return item !== null && typeof item === 'object' && item.origin !== 'subagent';
-}
-function isControllerVisible(item) {
-  return isControllerSession(item) && item.blank !== true;
+/** Optional enrichment has its own version; it must not invalidate core reads. */
+export const listEventAffectsCore = event => event?.kind !== 'evidence';
+
+/** Select after status/pin overlays, before expensive evidence reads. */
+export function selectSessionRows(rows, { limit, status, includePinned } = {}) {
+  const matching = rows.filter(row => status === 'active' || status === 'archived'
+    ? (row.status ?? 'active') === status : row.status !== 'deleted').sort(byActivity);
+  if (limit === undefined) return matching;
+  const cap = Number.isFinite(Number(limit)) && Number(limit) > 0 ? Math.min(1000, Math.floor(Number(limit))) : 20;
+  const recent = matching.slice(0, cap);
+  const ids = new Set(recent.map(row => row.id));
+  return includePinned === true ? [...recent, ...matching.filter(row => row.pinnedAt != null && !ids.has(row.id))] : recent;
 }
 
-/**
- * @param options - the host session services and the event subscriber to use.
- * @returns a projection source backed by the live Web profile.
- */
 export function createSessionControllerSource({
-  sessionController,
-  subscribe,
-  readTitles,
-  readSessionMeta,
-  readActivityEvidence,
-  readSessionSummary,
-  readActiveSessions,
-  listTimeoutMs = 15_000,
-  // How old a listing may be when it is served in place of one that failed. Long enough to
-  // cover a cold start, short enough that a session created or renamed in the meantime is not
-  // hidden for long — and the controller polls this channel every few seconds anyway.
-  listStaleMaxMs = 120_000,
-  // How many uncached titles one read may fold. The phone's responsiveness probe *is*
-  // `local-db:sessions:list`, and a title is a log-backed fold (~50ms each) — folding a
-  // few hundred of them per read made the probe answer in ~12s on a real profile, which
-  // the handset reads as "the computer is not responding". Bounded, the same read costs
-  // one batch and the rest of the titles arrive over the next few polls.
-  titleRefreshBudget = 16,
-  // Transcript folds are heavier than title reads; keep the visible-path batch small.
-  activityRefreshBudget = 4,
-  // A cached title is re-read at most this often, so a title changed by DSH's own
-  // regeneration heals without this module needing to hear about it.
-  titleTtlMs = 60_000,
-  now = () => Date.now(),
+  sessionController, subscribe, readTitles, readSessionMeta, readActivityEvidence,
+  readSessionSummary, readActiveSessions, strictCore = typeof readSessionSummary === 'function',
+  listTimeoutMs = 5_000, titleRefreshBudget = 16, evidenceConcurrency = 2,
+  evidenceCacheSize = 1024, now = () => Date.now(),
 }) {
-  if (sessionController === undefined) throw new Error('createSessionControllerSource requires sessionController');
-
-  // `SessionSummary` carries no `createdAt`, but the phone's session row requires
-  // one. The header read that supplies it is paid once per session id: creation
-  // time and working directory are immutable, so a cache can never go stale.
-  const createdAtCache = new Map();
-  /** sessionId → `{ title: string|null, readAt: number }`; null means "no title yet". */
-  const titleCache = new Map();
-  /** The in-flight background title warm-up, or null. At most one runs at a time. */
-  let warming = null;
-  /** Exact `{ messageCount, userSendAt }` observations, invalidated by live events. */
-  const activityEvidenceCache = new Map();
-  /** The one background transcript-evidence warm-up. */
-  let activityWarming = null;
-  /** The one listing read currently in flight, shared by every concurrent caller. */
-  let inFlightList = null;
-  /** The last listing that was really read, and when — the stale fallback's whole state. */
-  let lastListed = null;
-  /** How many listings were answered from that fallback since start. */
-  let staleServes = 0;
-  let lastStaleReason = null;
-  let activeStateReads = 0;
-  let activeStateFallbacks = 0;
-  let lastActiveStateError = null;
-
-  /**
-   * Titles for the ids asked about, folding only what is missing or stale.
-   *
-   * `ids` arrives in the order the session service reports (newest first in practice),
-   * so the rows the controller is about to show are the ones that get their title first;
-   * a row left out shows as untitled until a later read reaches it.
-   */
-  async function titlesFor(sessionIds) {
-    const out = new Map();
-    if (typeof readTitles !== 'function') return out;
-    const at = now();
-    const stale = [];
-    for (const id of sessionIds) {
-      const cached = titleCache.get(id);
-      // Expiry schedules a refresh; it does not make a known title disappear.
-      // In particular, rows outside this read's budget still need their label.
-      if (cached?.title != null) out.set(id, cached.title);
-      if (cached !== undefined && at - cached.readAt < titleTtlMs) {
-        continue;
-      }
-      stale.push(id);
-    }
-    const batch = stale.slice(0, titleRefreshBudget);
-    if (batch.length === 0) return out;
-    await foldTitles(batch, out);
-    // The rest of the titles are warmed **after** the answer is on its way: the
-    // controller gets its list in one batch's time, and by its next poll the rest are
-    // cached, so a few hundred sessions never sit in front of a handset's timeout.
-    // `warmTitles` owns its own rejection path (`…catch(…).finally(…)`) and returns
-    // nothing, so this call is already incapable of becoming an unhandled rejection —
-    // which matters, because DSH's boot treats one of those as fatal to the whole process.
-    if (stale.length > batch.length) void warmTitles(stale.slice(titleRefreshBudget));
-    return out;
-  }
-
-  /** Fold one batch of titles into the cache (and into `out`, when the caller wants them). */
-  async function foldTitles(batch, out) {
-    let fetched;
-    try {
-      fetched = await readTitles(batch);
-    } catch {
-      // A transient failure is not evidence that a known title was cleared.
-      // Fall through so failed attempts still receive the normal retry backoff.
-    }
-    for (const id of batch) {
-      const value = typeof fetched?.get === 'function' ? fetched.get(id) : null;
-      // The batch adapter omits rejected and empty snapshots alike. Neither is
-      // an authoritative clear; only a usable title replaces the last good one.
-      const title = (typeof value === 'string' ? value.trim() : '') || titleCache.get(id)?.title || null;
-      titleCache.set(id, { title, readAt: now() });
-      if (title !== null && out !== undefined) out.set(id, title);
-    }
-  }
-
-  /**
-   * Continue filling the title cache in the background.
-   *
-   * One warm-up at a time: the controller polls the list every few seconds, and a
-   * pile-up of warm-ups would put the same log folds back in competition with the reads
-   * they are meant to keep cheap.
-   */
-  function warmTitles(ids) {
-    if (warming !== null || ids.length === 0) return;
-    warming = (async () => {
-      for (let index = 0; index < ids.length; index += titleRefreshBudget) {
-        const batch = ids.slice(index, index + titleRefreshBudget);
-        const fresh = batch.filter((id) => {
-          const cached = titleCache.get(id);
-          return cached === undefined || now() - cached.readAt >= titleTtlMs;
-        });
-        if (fresh.length > 0) await foldTitles(fresh);
-      }
-    })().catch(() => {
-      // A warm-up that fails is a missing label, never a broken list.
-    }).finally(() => {
-      warming = null;
+  if (!sessionController) throw new Error('createSessionControllerSource requires sessionController');
+  evidenceConcurrency = Math.min(2, Math.max(1, Math.floor(evidenceConcurrency) || 2));
+  evidenceCacheSize = Math.min(1024, Math.max(1, Math.floor(evidenceCacheSize) || 1024));
+  const rows = new Map();
+  const signatures = new Map();
+  const dirty = new Map();
+  const repaired = new Map();
+  const demanded = new Set();
+  const headers = new Map();
+  const knownIds = new Set();
+  const nonTaskIds = new Set();
+  // Explicit native format scope, not an operational-error/absence cache.
+  const migrationRequired = new Set();
+  const evidence = new Map();
+  const evidenceVersions = new Map();
+  const evidenceQueue = new Map();
+  const evidenceFlights = new Map();
+  const rowFlights = new Map();
+  const changes = new Set();
+  const lifecycle = new Set();
+  let viewRevision = 0, enrichmentRevision = 0;
+  let epoch = 0, catalogRevision = 0, coreGeneration = 0, disposed = false, listFlight = null, repairFlight = null, initialized = false;
+  let catalogTail = Promise.resolve(), coreActive = 0;
+  const coreQueue = [];
+  function coreSlot() {
+    return new Promise((resolve, reject) => {
+      const enter = () => {
+        if (disposed) { reject(failure('Session list source was disposed')); return; }
+        coreActive++;
+        resolve(() => { coreActive--; coreQueue.shift()?.enter(); });
+      };
+      if (coreActive < 2) enter();
+      else if (coreQueue.length < 128) coreQueue.push({ enter, reject });
+      else reject(failure('Session core repair is at capacity; retry synchronization'));
     });
   }
-
-
-
-  /** Read exact transcript evidence without making the whole list wait for every log. */
-  async function activitiesFor(sessionIds) {
-    const out = new Map();
-    if (typeof readActivityEvidence !== 'function') return out;
-    const missing = [];
-    for (const id of sessionIds) {
-      const cached = activityEvidenceCache.get(id);
-      if (cached !== undefined) out.set(id, cached);
-      else missing.push(id);
-    }
-    const batch = missing.slice(0, activityRefreshBudget);
-    if (batch.length > 0) await foldActivities(batch, out);
-    if (missing.length > batch.length) void warmActivities(missing.slice(activityRefreshBudget));
-    return out;
-  }
-
-  async function foldActivities(ids, out) {
-    const settled = await Promise.allSettled(ids.map((id) => readActivityEvidence(id)));
-    settled.forEach((result, index) => {
-      if (result.status !== 'fulfilled') return;
-      const value = result.value;
-      if (!Number.isFinite(value?.messageCount) || value.messageCount < 0) return;
-      if (value.userSendAt !== null && typeof value.userSendAt !== 'string') return;
-      const evidence = { messageCount: Math.floor(value.messageCount), userSendAt: value.userSendAt, ...(Object.hasOwn(value, 'interruption') ? { interruption: value.interruption } : {}) };
-      activityEvidenceCache.set(ids[index], evidence);
-      out?.set(ids[index], evidence);
-    });
-  }
-
-  function warmActivities(ids) {
-    if (activityWarming !== null || ids.length === 0) return;
-    activityWarming = (async () => {
-      for (let index = 0; index < ids.length; index += activityRefreshBudget) {
-        const batch = ids.slice(index, index + activityRefreshBudget)
-          .filter((id) => !activityEvidenceCache.has(id));
-        if (batch.length > 0) await foldActivities(batch);
-      }
-    })().catch(() => {
-      // Unknown evidence leaves a row unclassified; it never invents activity.
-    }).finally(() => {
-      activityWarming = null;
-    });
-  }
-
-  /** Fill `createdAtCache` for ids the header reader knows. */
-  async function metaFor(sessionIds) {
-    const missing = sessionIds.filter((id) => !createdAtCache.has(id));
-    if (typeof readSessionMeta !== 'function' || missing.length === 0) return;
-    try {
-      const meta = await readSessionMeta(missing);
-      for (const [id, value] of meta ?? []) createdAtCache.set(id, value);
-    } catch {
-      // Fall through: an unknown creation time degrades the row, not the list.
+  let evidenceWorkers = 0, retryTimer = null, repairTimer = null, repairBackoff = 1000;
+  const stats = { coverage: 'cold', reads: 0, exactReads: 0, rejectedVersions: 0, evidenceReads: 0,
+    evidenceErrors: 0, staleServes: 0, lastStaleReason: null, lastListedAt: null, lastListedCount: null,
+    activeStateReads: 0, activeStateFallbacks: 0, lastActiveStateError: null, lastError: null };
+  const version = id => dirty.get(id) ?? 0;
+  const evidenceVersion = id => evidenceVersions.get(id) ?? 0;
+  const requireOpen = () => { if (disposed) throw failure('Session list source was disposed'); };
+  function emit(listeners, event) {
+    for (const listener of listeners) {
+      try { Promise.resolve(listener(event)).catch(() => {}); } catch { /* Never break a native append. */ }
     }
   }
-
-  /**
-   * One session listing, as the service reports it, minus the sessions a controller
-   * must not see (subagent runs).
-   *
-   * Filtered **here**, at the single point both readers go through, so a future reader
-   * cannot accidentally serve them again.
-   *
-   * Two properties beyond the read itself, both learned from a live failure: seven
-   * `local-db:sessions:list` invokes rejected with `TimeoutError` in the thirteen seconds after
-   * a restart (the phone reconnecting, plus the two desktop controllers polling, while 45 cold
-   * sessions were being read), and a controller renders a failed list as *nothing* — the
-   * spinner the user reported.
-   *
-   * - **Single flight.** Concurrent callers share one read. Three controllers polling during a
-   *   cold start do not multiply the work that is already missing its deadline.
-   * - **A stale answer beats a failed one.** When the read does miss its deadline, the list read
-   *   moments ago is served instead of an error, inside a bound. The data is real and durable —
-   *   only its age is in question, and the controller's next poll corrects it — while the
-   *   failure mode it replaces is an empty list and a spinner.
-   * - **With no previous listing, the read gets one retry.** That is the cold start: a Host that
-   *   has just restarted has served nothing yet, so the stale fallback above has nothing to give,
-   *   and the first read is the one that pays for caches the second read then finds warm. Measured:
-   *   `invoke:local-db:sessions:get` and `invoke:local-db:sessions:list` both recorded
-   *   `TimeoutError`s in the boot window, and a failed list read is what the controller renders as
-   *   an empty session list. The retry is inside the shared flight, so concurrent callers cost one
-   *   retry between them, and it only happens when there is no fallback to serve instead.
-   */
-  let listGeneration = 0;
-  function invalidateListing() {
-    listGeneration += 1;
-    inFlightList = null;
-    lastListed = null;
+  function notify(event) {
+    if (listEventAffectsCore(event)) viewRevision++; else enrichmentRevision++;
+    emit(changes, event);
   }
-
-  async function listItems() {
-    if (inFlightList !== null) return inFlightList;
-    const generation = listGeneration;
-    const attempt = (async () => {
-      let lastError = null;
-      const tries = lastListed === null ? 2 : 1;
-      for (let index = 0; index < tries; index += 1) {
+  function bump(id) {
+    epoch++;
+    if (id) {
+      if (!knownIds.has(id)) { knownIds.add(id); catalogRevision++; }
+      dirty.set(id, version(id) + 1); signatures.delete(id);
+    } else { catalogRevision++; coreGeneration++; signatures.clear(); repaired.clear(); }
+  }
+  function rowVisible(row) {
+    return row && !migrationRequired.has(row.id) && row.blank !== true && (typeof readTitles !== 'function' && !strictCore || typeof row.title === 'string' && row.title.trim() !== '');
+  }
+  function commit(id, row, stamp) {
+    requireOpen();
+    if (version(id) !== stamp) { stats.rejectedVersions++; throw failure('Session changed during list observation'); }
+    const previous = rows.get(id);
+    if (row === undefined) rows.delete(id); else rows.set(id, row);
+    if (JSON.stringify(previous) !== JSON.stringify(row)) notify({ kind: 'row', sessionId: id,
+      row: row && clone(row), previous: previous && clone(previous), discovered: !rowVisible(previous) && rowVisible(row),
+      initial: !initialized, version: stamp });
+    return row;
+  }
+  async function metadata(items) {
+    const missing = items.filter(item => !Number.isFinite(item.createdAt) && !headers.has(String(item.sessionId))).map(item => String(item.sessionId));
+    if (missing.length && typeof readSessionMeta === 'function') {
+      const values = await readSessionMeta(missing);
+      requireOpen();
+      for (const [id, value] of values ?? []) headers.set(id, value);
+    }
+  }
+  async function project(item, title) {
+    if (!ordinary(item)) return undefined;
+    const id = String(item.sessionId);
+    const meta = headers.get(id);
+    const created = Number.isFinite(item.createdAt) ? item.createdAt : Date.parse(meta?.createdAt);
+    const values = item.projections?.values ?? {};
+    const listMeta = values.sessionListMetadata;
+    if (strictCore && (!Number.isFinite(created) || typeof listMeta?.blank !== 'boolean'
+      || !Object.hasOwn(values, 'title'))) throw failure('Native session core projections are not available');
+    const updated = listMeta ? Math.max(created, listMeta.lastPromptAt ?? 0) : item.updatedAt;
+    if (strictCore && !Number.isFinite(updated)) throw failure('Native session activity time is unavailable');
+    // Legacy fixture sources have no immutable headers. Production opts into strictCore.
+    const at = new Date(Number.isFinite(updated) ? updated : 0).toISOString();
+    const selection = values.modelSelection?.next ?? values.modelSelection?.lastUsed;
+    const permission = values.permissions?.currentValue;
+    return { id, title: Object.hasOwn(values, 'title') ? values.title : title,
+      running: item.running === true, updatedAt: at, lastActivityAt: at,
+      createdAt: Number.isFinite(created) ? new Date(created).toISOString() : at,
+      cwd: item.cwd ?? meta?.cwd ?? null, blank: listMeta?.blank ?? item.blank === true,
+      ...(selection?.model ? { model: selection.model } : {}),
+      ...(selection?.provider ? { providerId: selection.provider } : {}),
+      ...(selection?.reasoningEffort ? { effort: selection.reasoningEffort } : {}),
+      ...(permission ? { permissionMode: permission } : {}) };
+  }
+  async function exact(id, seed, force = false) {
+    const stamp = version(id), generation = coreGeneration;
+    const existing = rowFlights.get(id);
+    if (!force && existing?.stamp === stamp && existing.generation === generation) return existing.promise;
+    const flight = { stamp, generation, promise: null };
+    flight.promise = (async () => {
+      let item = seed;
+      if (typeof readSessionSummary === 'function') {
+        const release = await coreSlot();
         try {
-          const signal = typeof AbortSignal?.timeout === 'function' ? AbortSignal.timeout(listTimeoutMs) : undefined;
-          const value = await sessionController.list({}, signal);
-          const items = (Array.isArray(value?.items) ? value.items : []).filter(isControllerVisible);
-          if (generation === listGeneration) lastListed = { items, at: now() };
-          return items;
-        } catch (error) {
-          lastError = error;
-        }
+          if (generation !== coreGeneration || stamp !== version(id)) throw failure('Session changed before core repair');
+          stats.exactReads++; item = await readSessionSummary(id);
+        } finally { release(); }
       }
-      throw lastError;
+      else if (strictCore) throw failure('Exact native session observations are unavailable');
+      requireOpen();
+      if (generation !== coreGeneration) throw failure('Session list scope changed during observation');
+      if (item == null || !ordinary(item)) { repaired.set(id, stamp); return commit(id, undefined, stamp); }
+      if (String(item.sessionId) !== id) throw failure('Native session observation identity mismatch');
+      if (!strictCore) await metadata([item]);
+      let title;
+      if (!strictCore && !Object.hasOwn(item.projections?.values ?? {}, 'title') && typeof readTitles === 'function') {
+        title = (await readTitles([id]))?.get(id);
+      }
+      const row = await project(item, title);
+      if (generation !== coreGeneration) throw failure('Session list scope changed during observation');
+      const result = commit(id, row, stamp); repaired.set(id, stamp);
+      return result;
     })();
-    inFlightList = attempt;
-    try {
-      return await attempt;
-    } catch (error) {
-      if (lastListed !== null && now() - lastListed.at <= listStaleMaxMs) {
-        staleServes += 1;
-        lastStaleReason = error instanceof Error ? error.message : String(error);
-        return lastListed.items;
+    rowFlights.set(id, flight);
+    try { return await flight.promise; }
+    finally { if (rowFlights.get(id) === flight) rowFlights.delete(id); }
+  }
+  async function verifyRow(id, seed) {
+    // A row changing while observed needs a new exact cut, not a corpus scan.
+    for (let attempt = 0; attempt < 8; attempt++) {
+      requireOpen(); const stamp = version(id), generation = coreGeneration;
+      if (attempt && typeof readSessionSummary !== 'function') {
+        const value = await sessionController.list({}, AbortSignal.timeout(listTimeoutMs));
+        seed = value?.items?.find(item => String(item.sessionId) === id);
       }
-      throw error;
-    } finally {
-      if (inFlightList === attempt) inFlightList = null;
+      try {
+        const row = await exact(id, seed);
+        if (generation !== coreGeneration) throw failure('Session list scope changed during observation');
+        if (stamp !== version(id)) continue;
+        return { row, stamp, generation };
+      } catch (error) {
+        if (disposed || generation !== coreGeneration || stamp === version(id)) throw error;
+      }
+    }
+    throw failure('Session is changing during core repair');
+  }
+  async function settleRows(items) {
+    const seeds = new Map(items.map(item => [String(item.sessionId), item]));
+    for (let pass = 0; pass < 8; pass++) {
+      const ids = new Set([...seeds.keys(), ...rows.keys()]);
+      const pending = [...ids].filter(id => !migrationRequired.has(id) && repaired.get(id) !== version(id));
+      if (!pending.length) return;
+      for (let index = 0; index < pending.length; index += 2) {
+        await Promise.all(pending.slice(index, index + 2).map(id => verifyRow(id, seeds.get(id))));
+      }
+    }
+    throw failure('Session core changed repeatedly; synchronize again');
+  }
+  // Evidence is an independently versioned scalar memo, never a prerequisite for a list.
+  function queueEvidence(ids) {
+    if (typeof readActivityEvidence !== 'function' || disposed) return;
+    for (const id of ids) {
+      demanded.delete(id); demanded.add(id);
+      while (demanded.size > evidenceCacheSize) demanded.delete(demanded.values().next().value);
+    }
+    for (const id of ids) if (!evidence.has(id) && !evidenceQueue.has(id) && !evidenceFlights.has(id) && evidenceQueue.size < evidenceCacheSize) {
+      evidenceQueue.set(id, { stamp: evidenceVersion(id), attempts: 0, due: 0 });
+    }
+    pumpEvidence();
+  }
+  function pumpEvidence() {
+    if (disposed) return;
+    if (retryTimer) { clearTimeout(retryTimer); retryTimer = null; }
+    while (evidenceWorkers < evidenceConcurrency) {
+      const next = [...evidenceQueue].find(([, job]) => job.due <= now());
+      if (!next) break;
+      const [id, job] = next; evidenceQueue.delete(id);
+      evidenceWorkers++; stats.evidenceReads++;
+      const work = Promise.resolve().then(() => readActivityEvidence(id)).then(value => {
+        if (disposed || job.stamp !== evidenceVersion(id)) return;
+        if (!Number.isSafeInteger(value?.messageCount) || value.messageCount < 0
+          || !(value.userSendAt === null || typeof value.userSendAt === 'string' && Number.isFinite(Date.parse(value.userSendAt)))) throw failure('Invalid activity evidence');
+        const scalar = { messageCount: Math.floor(value.messageCount), userSendAt: value.userSendAt,
+          ...(Object.hasOwn(value, 'interruption') ? { interruption: clone(value.interruption) } : {}) };
+        const previousEvidence = evidence.get(id);
+        evidence.delete(id); evidence.set(id, scalar);
+        while (evidence.size > evidenceCacheSize) evidence.delete(evidence.keys().next().value);
+        const row = rows.get(id);
+        if (row) notify({ kind: 'evidence', sessionId: id, row: clone({ ...row, ...scalar }),
+          previous: clone({ ...row, ...previousEvidence }), version: version(id) });
+      }).catch(() => {
+        if (disposed || job.stamp !== evidenceVersion(id)) return;
+        stats.evidenceErrors++;
+        if (job.attempts < 3) evidenceQueue.set(id, { ...job, attempts: job.attempts + 1, due: now() + 1000 * 2 ** job.attempts });
+      }).finally(() => {
+        evidenceWorkers--; evidenceFlights.delete(id);
+        if (!disposed && job.stamp !== evidenceVersion(id) && demanded.has(id)) queueEvidence([id]);
+        pumpEvidence();
+      });
+      evidenceFlights.set(id, work);
+    }
+    if (evidenceQueue.size && evidenceWorkers < evidenceConcurrency) {
+      const due = Math.min(...[...evidenceQueue.values()].map(job => job.due));
+      retryTimer = setTimeout(() => { retryTimer = null; pumpEvidence(); }, Math.max(1, due - now()));
+      retryTimer.unref?.();
     }
   }
-
-  async function projectItems(items) {
-      const ids = items.map((item) => String(item.sessionId));
-      // Exact observations already carry authoritative immutable header fields.
-      // Do not perform a corpus-wide metadata read to rediscover those fields.
-      for (const item of items) {
-        if (Number.isFinite(item.createdAt) && typeof item.cwd === 'string' && item.cwd !== '') {
-          createdAtCache.set(String(item.sessionId), { createdAt: new Date(item.createdAt).toISOString(), cwd: item.cwd });
+  function invalidateEvidence(id) {
+    if (!demanded.has(id) && !evidence.has(id) && !evidenceFlights.has(id)) return false;
+    const had = evidence.delete(id);
+    evidenceVersions.set(id, evidenceVersion(id) + 1); evidenceQueue.delete(id);
+    return had;
+  }
+  async function baseline() {
+    requireOpen(); stats.coverage = 'rebuilding';
+    const stamp = catalogRevision;
+    stats.reads++;
+    const value = await sessionController.list({}, AbortSignal.timeout(listTimeoutMs));
+    requireOpen();
+    if (!Array.isArray(value?.items)) throw failure('Native session catalog is unavailable');
+    for (const item of value.items) if (typeof item?.sessionId === 'string') {
+      knownIds.add(item.sessionId);
+      if (ordinary(item)) nonTaskIds.delete(item.sessionId); else nonTaskIds.add(item.sessionId);
+    }
+    const catalogItems = value.items.filter(ordinary);
+    const unsupported = new Set(catalogItems.filter(item => item.formatStatus === 'migration-required').map(item => String(item.sessionId)));
+    if (unsupported.size !== migrationRequired.size || [...unsupported].some(id => !migrationRequired.has(id))) {
+      const changedIds = new Set([...unsupported].filter(id => !migrationRequired.has(id))
+        .concat([...migrationRequired].filter(id => !unsupported.has(id))));
+      migrationRequired.clear(); for (const id of unsupported) migrationRequired.add(id);
+      for (const id of changedIds) {
+        bump(id); // Scope transitions fence in-flight cuts too.
+        if (!unsupported.has(id)) rows.delete(id); // Readmission requires a fresh core and discovery notification.
+      }
+      notify({ kind: 'scope', migrationRequired: migrationRequired.size });
+    }
+    // Only an explicit native migration-required declaration is out of scope.
+    // Current-format I/O/replay errors still fail coverage; never swallow them.
+    const items = catalogItems.filter(item => item.formatStatus !== 'migration-required');
+    if (!strictCore) await metadata(items);
+    // Exact native observations already carry immutable headers; do not scan the
+    // persistent corpus a second time merely to decorate controller summaries.
+    // Necessary core repair survives a caller timeout. Validated progress stays in rows.
+    for (let index = 0; index < items.length; index += Math.max(1, evidenceConcurrency)) {
+      await Promise.all(items.slice(index, index + Math.max(1, evidenceConcurrency)).map(async item => {
+        const id = String(item.sessionId);
+        const signature = coreSignature(item);
+        if (rows.has(id) && signatures.get(id) === signature) return;
+        const cut = await verifyRow(id, item);
+        if (!disposed && cut.generation === coreGeneration && version(id) === cut.stamp) signatures.set(id, signature);
+      }));
+    }
+    if (stamp !== catalogRevision) { stats.rejectedVersions++; throw failure('Session catalog changed during observation'); }
+    const ids = new Set(catalogItems.map(item => String(item.sessionId)));
+    for (const id of [...rows.keys()]) if (!ids.has(id) && rowVisible(rows.get(id))) {
+      // Catalog absence alone is not proof of deletion (drafts/visibility can
+      // differ). Confirm by exact identity and fence older observations first.
+      bump(id); await verifyRow(id);
+      if (!rows.has(id)) {
+        invalidateEvidence(id); demanded.delete(id); evidenceQueue.delete(id); headers.delete(id);
+      }
+    }
+    await settleRows(items);
+    if (stamp !== catalogRevision) { stats.rejectedVersions++; throw failure('Session catalog changed during core repair'); }
+    stats.coverage = 'ready'; stats.lastError = null;
+    stats.lastListedAt = now(); stats.lastListedCount = items.filter(visible).length;
+    if (!initialized) { initialized = true; notify({ kind: 'ready' }); }
+    return { rows: [...rows.values()], catalogRevision, coreGeneration };
+  }
+  async function readCatalog(fresh) {
+    // A fresh caller may share a queued read that has not STARTED yet, never an
+    // older started read. Serialize catalog work to bound cold concurrent scans.
+    if (listFlight && (!fresh || !listFlight.started)) return listFlight.promise;
+    const predecessor = catalogTail;
+    const flight = { started: false, promise: null };
+    flight.promise = predecessor.then(async () => {
+      flight.started = true;
+      for (let attempt = 0; attempt < 8; attempt++) {
+        requireOpen(); const stamp = catalogRevision;
+        try { return await baseline(); }
+        catch (error) {
+          if (disposed || stamp === catalogRevision) { stats.lastError = String(error?.message ?? error); throw error; }
         }
       }
-      const [titles, , activities] = await Promise.all([titlesFor(ids), metaFor(ids), activitiesFor(ids)]);
-      return items.map((item) => {
-        const id = String(item.sessionId);
-        const updatedAt = Number.isFinite(item.updatedAt) ? new Date(item.updatedAt).toISOString() : new Date().toISOString();
-        const meta = createdAtCache.get(id);
-        const activity = activities.get(id);
-        // The session's own model, when the list already carries the
-        // `modelSelection` projection. It is free here — the value rides the
-        // list response — and it is what lets the controller's picker show the
-        // model the session is actually on rather than the Host default.
-        const selection = item.projections?.values?.modelSelection;
-        const selectedModel = selection?.next?.model ?? selection?.lastUsed?.model;
-        // Effort rides the same selection, so it is free here too. The composer
-        // shows it in its model control, and a Host that always answers "default"
-        // makes a real `maker:set-effort` look like it did nothing.
-        const selectedEffort = selection?.next?.reasoningEffort ?? selection?.lastUsed?.reasoningEffort;
-        // The provider that serves that selection, from the same projection. The
-        // controller stores the source beside the model (`RemoteSession.providerId`)
-        // and its new-chat draft follows the most recent session's runtime, so a row
-        // that omits it loses the source the user picked while the model still looks
-        // right — and the next conversation is created without one.
-        const selectedProvider = selection?.next?.provider ?? selection?.lastUsed?.provider;
-        // The current permission preset, when the list already carries the
-        // `permissions` projection. Its absence means no permission service is
-        // composed, which DSH documents as "clients hide the control".
-        const permission = item.projections?.values?.permissions;
-        const currentPermission = typeof permission?.currentValue === 'string' && permission.currentValue !== ''
-          ? permission.currentValue
-          : undefined;
-        return {
-          id,
-          title: titles.get(id),
-          running: item.running === true,
-          updatedAt,
-          // Falls back to the last activity time only when the header read is
-          // unavailable; the phone requires a string here.
-          createdAt: Number.isFinite(item.createdAt) ? new Date(item.createdAt).toISOString() : (meta?.createdAt ?? updatedAt),
-          cwd: typeof item.cwd === 'string' && item.cwd !== '' ? item.cwd : (meta?.cwd ?? null),
-          ...(typeof selectedModel === 'string' && selectedModel !== '' ? { model: selectedModel } : {}),
-          ...(typeof selectedProvider === 'string' && selectedProvider !== '' ? { providerId: selectedProvider } : {}),
-          ...(typeof selectedEffort === 'string' && selectedEffort !== '' ? { effort: selectedEffort } : {}),
-          ...(currentPermission === undefined ? {} : { permissionMode: currentPermission }),
-          ...(activity === undefined ? {} : { messageCount: activity.messageCount, userSendAt: activity.userSendAt, ...(Object.hasOwn(activity, 'interruption') ? { interruption: activity.interruption } : {}) }),
-          blank: item.blank === true,
-        };
+      throw failure('Session catalog is busy; synchronize again');
+    });
+    catalogTail = flight.promise.then(() => undefined, () => undefined);
+    listFlight = flight;
+    try { return await flight.promise; } finally { if (listFlight === flight) listFlight = null; }
+  }
+  async function bounded(work, remaining = listTimeoutMs) {
+    let timer;
+    const timeout = new Promise((_, reject) => { timer = setTimeout(() => reject(failure('Session list is rebuilding; retry synchronization')), Math.max(1, remaining)); });
+    try { return await Promise.race([work, timeout]); } finally { clearTimeout(timer); }
+  }
+  function refresh(id) {
+    if (disposed || typeof readSessionSummary !== 'function') return;
+    if (repairFlight) return; // One repair loop drains the dirty set, not one task per event.
+    if (repairTimer) { clearTimeout(repairTimer); repairTimer = null; }
+    repairFlight = Promise.resolve().then(async () => {
+      for (let pass = 0; pass < 8 && !disposed; pass++) {
+        const pending = [...dirty].filter(([key, stamp]) => !migrationRequired.has(key) && repaired.get(key) !== stamp);
+        if (!pending.length) break;
+        let failed = false;
+        for (const [key, stamp] of pending) {
+          try {
+            await exact(key);
+            if (version(key) === stamp) repaired.set(key, stamp);
+          } catch (error) { failed = true; stats.lastError = String(error?.message ?? error); }
+        }
+        if (failed) break; // Retry IO with backoff, not eight immediate replays.
+      }
+    }).catch(error => { stats.lastError = String(error?.message ?? error); })
+      .finally(() => {
+        repairFlight = null;
+        if (disposed) return;
+        if ([...dirty].some(([key, stamp]) => !migrationRequired.has(key) && repaired.get(key) !== stamp)) {
+          repairTimer = setTimeout(() => { repairTimer = null; refresh(); }, repairBackoff);
+          repairTimer.unref?.(); repairBackoff = Math.min(30_000, repairBackoff * 2);
+        } else repairBackoff = 1000;
       });
   }
-
-  return {
-    invalidateListing,
-    invalidateActivityEvidence(sessionId) {
-      return activityEvidenceCache.delete(sessionId);
-    },
-    /** A list hides drafts; an exact ID read must still resolve a real new draft. */
-    async getSession(sessionId) {
-      if (typeof sessionId !== 'string' || sessionId === '') return undefined;
-      let item;
-      if (typeof readSessionSummary === 'function') {
-        item = await readSessionSummary(sessionId);
-      } else {
-        // Older compositions have no exact observation port. Use a fresh,
-        // unfiltered read, never the stale/shared list used for discovery.
-        const value = await sessionController.list({}, AbortSignal.timeout(listTimeoutMs));
-        item = value?.items?.find((candidate) => String(candidate.sessionId) === sessionId);
+  function invalidate(id) {
+    if (disposed || id && nonTaskIds.has(id)) return;
+    bump(id);
+    if (id && !migrationRequired.has(id)) refresh(id);
+    else if (initialized) void readCatalog(true).catch(error => { stats.lastError = String(error?.message ?? error); });
+  }
+  const disposers = [];
+  if (typeof subscribe === 'function') {
+    const on = (name, fn) => disposers.push(subscribe(name, (...args) => { if (!disposed) { try { fn(...args); } catch (error) { stats.lastError = String(error?.message ?? error); } } }));
+    on('api-session/added', item => {
+      if (typeof item?.sessionId === 'string') knownIds.add(item.sessionId);
+      if (ordinary(item)) { nonTaskIds.delete(String(item.sessionId)); catalogRevision++; invalidate(String(item.sessionId)); }
+      else if (typeof item?.sessionId === 'string') nonTaskIds.add(item.sessionId);
+    });
+    on('api-session/removed', id => { if (nonTaskIds.has(String(id))) return; knownIds.add(String(id)); catalogRevision++; invalidate(String(id)); }); // Live disposal is NOT deletion.
+    on('api-session/status', (id, running) => {
+      invalidate(String(id)); emit(lifecycle, { kind: 'session-status', sessionId: String(id), sequence: 0, phase: running ? 'running' : 'idle' });
+    });
+    on('api-session/activity', id => { if (!strictCore) invalidate(String(id)); });
+    on('api-session/error', id => { emit(lifecycle, { kind: 'session-status', sessionId: String(id), sequence: 0, phase: 'error' }); });
+    on('session/event', (session, event) => {
+      const id = session?.header?.id ?? session?.id;
+      if (!id || session.header?.origin === 'subagent') return;
+      if (['session/title', 'user/message', 'turn/start', 'request/header', 'agent/model-selection', 'permissions/changed'].includes(event?.type)) invalidate(id);
+      if (['user/message', 'assistant/message', 'tool/result', 'turn/end'].includes(event?.type) || event?.surfaceOp?.op === 'replace') {
+        const wanted = demanded.has(id) || evidence.has(id) || evidenceQueue.has(id) || evidenceFlights.has(id);
+        invalidateEvidence(id); if (wanted) queueEvidence([id]);
       }
-      if (!isControllerSession(item) || String(item.sessionId) !== sessionId) return undefined;
-      const [row] = await projectItems([item]);
-      // A draft's missing title is expected, not a minute-long negative result:
-      // the first prompt may name it immediately after this exact read.
-      if (item.blank === true && row.title == null) titleCache.delete(sessionId);
-      return row;
+    });
+  }
+  return {
+    listView: true,
+    listVersion: () => `${coreGeneration}:${catalogRevision}:${viewRevision}`,
+    async listSessions(query = {}, deadline = Date.now() + listTimeoutMs, attempt = 0) {
+      requireOpen();
+      if (attempt >= 8 || Date.now() >= deadline) throw failure('Session list is rebuilding; retry synchronization');
+      const cut = await bounded(readCatalog(query.fresh === true), deadline - Date.now());
+      requireOpen();
+      if (catalogRevision !== cut.catalogRevision || coreGeneration !== cut.coreGeneration) return this.listSessions(query, deadline, attempt + 1);
+      let result = cut.rows.filter(rowVisible).map(row => ({ ...row, ...evidence.get(row.id) }));
+      if (typeof query.projectRows === 'function') result = query.projectRows(result);
+      result = selectSessionRows(result, query);
+      if (query.evidence !== false) queueEvidence(result.map(row => row.id));
+      return clone(result);
     },
-    async listSessions() {
-      const rows = await projectItems(await listItems());
-      // A current sessionQuery title reader is the authority for sidebar discovery.
-      // Hide rows that have never produced a real title; exact getSession remains
-      // available for a freshly created draft before its first prompt names it.
-      if (typeof readTitles !== 'function') return rows;
-      return rows.filter((row) => typeof row.title === 'string' && row.title.trim() !== '');
+    async getSession(id) {
+      requireOpen();
+      if (typeof id !== 'string' || !id) return undefined;
+      const deadline = Date.now() + listTimeoutMs;
+      for (let attempt = 0; attempt < 8; attempt++) {
+        if (Date.now() >= deadline) throw failure('Session core is rebuilding; retry synchronization');
+        const stamp = version(id);
+        let seed;
+        if (typeof readSessionSummary !== 'function') {
+          const value = await sessionController.list({}, AbortSignal.timeout(listTimeoutMs));
+          seed = value?.items?.find(item => String(item.sessionId) === id);
+        }
+        try {
+          const row = await bounded(exact(id, seed), deadline - Date.now());
+          if (version(id) !== stamp) continue;
+          if (row) queueEvidence([id]);
+          return row ? clone({ ...row, ...evidence.get(id) }) : undefined;
+        } catch (error) { if (version(id) === stamp) throw error; }
+      }
+      throw failure('Session is busy; synchronize again');
     },
-
-    /**
-     * Turn states only: no titles, no header reads.
-     *
-     * `maker:list-active` and `maker:session-in-turn` ask "is a turn running", and the
-     * controller polls them. Answering from the full row fold made the most frequently
-     * called channel on this Host pay the most expensive read on this Host — measured at
-     * 8.4s on a profile with 219 sessions, against a handset that times out in 15s.
-     * @returns `{ id, running, updatedAt }` per session.
-     */
-    async listSessionStates(requestedSessionId) {
+    peekSession(id) { const row = rows.get(String(id)); return row && clone({ ...row, ...evidence.get(String(id)) }); },
+    snapshotRows() { return clone([...rows.values()].filter(rowVisible).map(row => ({ ...row, ...evidence.get(row.id) }))); },
+    invalidateListing() { invalidate(); },
+    invalidateMembership() {
+      if (disposed) return;
+      epoch++; catalogRevision++; // Membership barrier does not invalidate unrelated verified cores.
+      if (initialized) void readCatalog(true).catch(error => { stats.lastError = String(error?.message ?? error); });
+    },
+    invalidateTitle(id) { invalidate(String(id)); },
+    invalidateActivityEvidence(id) {
+      const had = invalidateEvidence(id); if (demanded.has(id)) queueEvidence([id]); return had;
+    },
+    invalidateSession: invalidate,
+    onListChange(listener) { changes.add(listener); return () => changes.delete(listener); },
+    onEvent(listener) { lifecycle.add(listener); return () => lifecycle.delete(listener); },
+    async listSessionStates(requestedId) {
       if (typeof readActiveSessions === 'function') {
         try {
           const active = await readActiveSessions();
           if (Array.isArray(active)) {
-            activeStateReads += 1;
-            lastActiveStateError = null;
-            const rows = active.filter(isControllerVisible).map((item) => ({
-              id: String(item.sessionId), running: item.running === true,
-              updatedAt: Number.isFinite(item.updatedAt) ? new Date(item.updatedAt).toISOString() : null,
-            }));
-            // A successful live-registry read proves absent IDs are not running.
-            // Explicit false prevents the watchdog resurrecting a stale push cache
-            // after an Agent was disposed. This is state, not fabricated metadata.
-            if (typeof requestedSessionId === 'string' && requestedSessionId !== ''
-              && !rows.some((row) => row.id === requestedSessionId)) {
-              rows.push({ id: requestedSessionId, running: false, updatedAt: null });
-            }
-            return rows;
+            stats.activeStateReads++; stats.lastActiveStateError = null;
+            const result = active.filter(visible).map(item => ({ id: String(item.sessionId), running: item.running === true,
+              updatedAt: Number.isFinite(item.updatedAt) ? new Date(item.updatedAt).toISOString() : null }));
+            if (typeof requestedId === 'string' && !result.some(row => row.id === requestedId)) result.push({ id: requestedId, running: false, updatedAt: null });
+            return result;
           }
-        } catch (error) {
-          lastActiveStateError = error instanceof Error ? error.message : String(error);
-        }
-        activeStateFallbacks += 1;
+        } catch (error) { stats.lastActiveStateError = String(error?.message ?? error); }
+        stats.activeStateFallbacks++;
       }
-      const items = await listItems();
-      return items.map((item) => ({
-        id: String(item.sessionId),
-        running: item.running === true,
-        updatedAt: Number.isFinite(item.updatedAt) ? new Date(item.updatedAt).toISOString() : null,
-      }));
+      const value = await sessionController.list({}, AbortSignal.timeout(listTimeoutMs));
+      return (value?.items ?? []).filter(visible).map(item => ({ id: String(item.sessionId), running: item.running === true,
+        updatedAt: Number.isFinite(item.updatedAt) ? new Date(item.updatedAt).toISOString() : null }));
     },
-
-    /**
-     * Forget one session's cached title.
-     *
-     * A rename is the one title change this Host causes itself, and it must not wait out
-     * the TTL: the controller reads the row it just wrote back.
-     */
-    invalidateTitle(sessionId) {
-      titleCache.delete(String(sessionId));
-    },
-
-    /**
-     * Wait for the background title warm-up to finish.
-     *
-     * The list itself never waits for this — that is the point of the bound — so this
-     * exists for callers that want the fully populated cache (tests, and a diagnostic
-     * that wants to know how many titles are cached at all).
-     */
-    async titlesSettled() {
-      while (warming !== null) await warming;
-    },
-
-    /** How many titles are cached, for diagnostics. */
-    cachedTitleCount() {
-      return titleCache.size;
-    },
-
-    /**
-     * How the session listing is doing, for diagnostics.
-     *
-     * `staleServes` should stay at 0 in ordinary use. It counts listings answered from the
-     * previous read because the live one missed its deadline — every one of those is a
-     * controller that would otherwise have been shown an empty list (the reported spinner),
-     * so a non-zero value is the record of a degradation that was absorbed, not a healthy
-     * number to watch grow.
-     */
-    listDiagnostics() {
-      return { staleServes, lastStaleReason, lastListedAt: lastListed === null ? null : lastListed.at, lastListedCount: lastListed === null ? null : lastListed.items.length, activeStateReads, activeStateFallbacks, lastActiveStateError };
-    },
-
-    /**
-     * Follow the host's session lifecycle.
-     * @param listener - receives activity items; a non-abort throw becomes a stream failure.
-     * @returns the disposer removing every subscription.
-     */
-    onEvent(listener) {
-      if (typeof subscribe !== 'function') return () => {};
-      /** A listener failure must surface as a rebaseline, not as a broken subscription. */
-      const emit = (item) => {
-        try {
-          listener(item);
-        } catch {
-          listener({ kind: 'stream-failed' });
-        }
-      };
-      const disposers = [
-        subscribe('api-session/added', (summary) => {
-          // A subagent appears as a session to the session service, but never in a
-          // controller's list — so telling the controller "a session was created" would
-          // add a row it can never open, and its next list read would take it away again.
-          if (!isControllerVisible(summary)) return;
-          emit(activity('session-added', summary?.sessionId, summary?.running === true ? 'running' : 'idle'));
-        }),
-        subscribe('api-session/removed', (sessionId) => {
-          emit(activity('session-removed', sessionId, 'idle'));
-        }),
-        subscribe('api-session/status', (sessionId, running) => {
-          emit(activity('session-status', sessionId, running === true ? 'running' : 'idle'));
-        }),
-        subscribe('api-session/activity', (sessionId) => {
-          emit(activity('session-status', sessionId, 'active'));
-        }),
-        subscribe('api-session/error', (sessionId) => {
-          emit(activity('session-status', sessionId, 'error'));
-        }),
-      ];
-      return () => {
-        for (const dispose of disposers) {
-          try {
-            dispose();
-          } catch {
-            // A disposer that throws must not strand the remaining ones.
-          }
-        }
-      };
+    listDiagnostics() { return { ...stats, rows: rows.size, rawRevision: epoch, catalogRevision, coreGeneration, viewRevision, enrichmentRevision, migrationRequired: migrationRequired.size, coreActive, corePending: coreQueue.length,
+      evidence: evidence.size, evidencePending: evidenceQueue.size + evidenceWorkers }; },
+    cachedTitleCount() { return [...rows.values()].filter(row => typeof row.title === 'string').length; },
+    async titlesSettled() { if (repairFlight) await repairFlight; },
+    async evidenceSettled() { while (evidenceFlights.size) await Promise.all([...evidenceFlights.values()]); },
+    dispose() {
+      if (disposed) return; disposed = true; epoch++; catalogRevision++;
+      for (const waiting of coreQueue.splice(0)) waiting.reject(failure('Session list source was disposed'));
+      for (const off of disposers) { try { off?.(); } catch { /* Release all listeners. */ } }
+      if (retryTimer) clearTimeout(retryTimer);
+      if (repairTimer) clearTimeout(repairTimer);
+      changes.clear(); lifecycle.clear(); evidenceQueue.clear(); rows.clear(); evidence.clear(); headers.clear(); signatures.clear(); dirty.clear();
+      repaired.clear(); demanded.clear(); evidenceVersions.clear(); rowFlights.clear(); migrationRequired.clear(); knownIds.clear(); nonTaskIds.clear();
     },
   };
 }

@@ -14,7 +14,7 @@
  * `apps/desktop/src/main/localDb/ipc/historyViewReader.ts`, and the phone's transport):
  *
  * ```
- * page(sessionId, before?)          → { version: 1, items, nextCursor, hasMore }
+ * page(sessionId, before?, options) → { version: 1, items, nextCursor, hasMore }
  * details(sessionId, ref, after?)   → { version: 1, messages, nextCursor, hasMore }
  * intent(sessionId, refs)           → true
  * ```
@@ -47,6 +47,8 @@ import {
   HISTORY_VIEW_VERSION,
 } from './host-history-view-limits.js';
 
+import { projectHistoryWorkLines } from './history-work-lines.js';
+
 /** One history page's byte ceiling is the contract's, not this Host's choice. */
 export { HISTORY_DETAIL_PAGE_BYTES, HISTORY_PAGE_BYTES, HISTORY_PAGE_ITEMS, HISTORY_VIEW_VERSION };
 
@@ -61,10 +63,17 @@ export { HISTORY_DETAIL_PAGE_BYTES, HISTORY_PAGE_BYTES, HISTORY_PAGE_ITEMS, HIST
 export const HISTORY_SCAN_MAX_ROWS = 20_000;
 
 /** FNV-1a over the group's rows: the revision changes whenever the group's body does. */
-function revisionOf(rows) {
+function revisionOf(rows, metrics) {
   let hash = 2166136261;
   for (const row of rows) {
-    const text = JSON.stringify(row);
+    // Source-owned stamps must change for EVERY content change. Unstamped legacy
+    // rows pay the full hash; reference equality never implies immutable content.
+    const stamped = typeof row.historyContentStamp === 'string';
+    const text = JSON.stringify(stamped ? { ...row, content: undefined } : row);
+    if (metrics) {
+      metrics[stamped ? 'stampedHashRows' : 'fullHashRows'] += 1;
+      metrics.hashChars += text.length;
+    }
     for (let index = 0; index < text.length; index += 1) {
       hash = Math.imul(hash ^ text.charCodeAt(index), 16777619);
     }
@@ -129,18 +138,20 @@ function isActivityRow(row) {
  *   default) derives it: a transcript that does not end in an answer is still being written.
  * @returns items in **chronological** order, oldest first.
  */
-export function groupHistoryItems(rows, { running = null, maxWorkRows = WORK_ITEM_MAX_ROWS, chronological: inSourceOrder = false } = {}) {
+export function groupHistoryItems(rows, { running = null, maxWorkRows = WORK_ITEM_MAX_ROWS, chronological: inSourceOrder = false, workLines = false, metrics } = {}) {
   const chronological = inSourceOrder ? rows : [...rows].reverse();
+  if (metrics) metrics.groupedRows += chronological.length;
   const items = [];
   let run = [];
 
   /** Emit the buffered activity run as work items, newest one marked when it is live. */
   const flushRun = (streaming) => {
-    while (run.length > 0) {
-      const chunk = maxWorkRows > 0 ? run.slice(0, maxWorkRows) : run;
-      run = run.slice(chunk.length);
-      items.push(workItem(chunk, streaming && run.length === 0));
+    const size = maxWorkRows > 0 ? maxWorkRows : Math.max(1, run.length);
+    for (let start = 0; start < run.length; start += size) {
+      const chunk = run.slice(start, start + size);
+      items.push(workItem(chunk, streaming && start + size >= run.length, { workLines, metrics }));
     }
+    run = [];
   };
 
   for (const row of chronological) {
@@ -168,7 +179,7 @@ export const WORK_PREVIEW_BYTES = 6 * 1024;
  * @param streaming - whether this run is the one still being written.
  * @returns the item the controller renders.
  */
-function workItem(run, streaming) {
+function workItem(run, streaming, { workLines = false, metrics } = {}) {
   const first = run[0];
   const last = run[run.length - 1];
   const summary = {
@@ -181,8 +192,12 @@ function workItem(run, streaming) {
     isStreaming: streaming,
     messageCount: run.length,
     toolCount: run.filter((row) => row.role === 'tool_use').length,
-    revision: `${last.id}:${run.length}:${revisionOf(run)}`,
+    revision: `${last.id}:${run.length}:${revisionOf(run, metrics)}`,
   };
+  if (workLines && streaming) {
+    summary.lines = projectHistoryWorkLines(run, streaming);
+    return { type: 'work', key: summary.key, summary };
+  }
   // A running group gets a **preview**: the tail the controller can show inside the
   // collapsed row, which is the difference between 「正在干活」 and 「卡住了」.
   //
@@ -211,7 +226,7 @@ function workItem(run, streaming) {
       isStreaming: true,
       messageCount: tail.length,
       toolCount: tail.filter((row) => row.role === 'tool_use').length,
-      revision: `${previewLast.id}:${tail.length}:${revisionOf(tail)}`,
+      revision: `${previewLast.id}:${tail.length}:${revisionOf(tail, metrics)}`,
     };
   }
   return { type: 'work', key: summary.key, summary };
@@ -223,6 +238,63 @@ function itemBytes(item) {
     return Buffer.byteLength(JSON.stringify(item), 'utf8');
   } catch {
     return 0;
+  }
+}
+
+export const HISTORY_WORK_PATCH_MAX_BYTES = 64 * 1024;
+
+/**
+ * Pure replacement comparison against the ACTUALLY delivered latest page. Delivery
+ * lease/CAS, workLines negotiation and successful-send bookkeeping belong to host.
+ * No append, JSON diff, child replacement or guessed revision repair is allowed.
+ */
+export function buildHistoryWorkPatch(sessionId, deliveredPage, nextPage) {
+  const refresh = { kind: 'refresh' };
+  try {
+    if (typeof sessionId !== 'string' || !sessionId) return refresh;
+    const valid = page => page?.version === HISTORY_VIEW_VERSION && Array.isArray(page.items)
+      && typeof page.hasMore === 'boolean' && (page.nextCursor === null || typeof page.nextCursor === 'string');
+    if (!valid(deliveredPage) || !valid(nextPage)) return refresh;
+    if (deliveredPage.hasMore !== nextPage.hasMore || deliveredPage.nextCursor !== nextPage.nextCursor
+      || deliveredPage.items.length !== nextPage.items.length) return refresh;
+    const keys = new Set();
+    let before;
+    let after;
+    for (let index = 0; index < nextPage.items.length; index += 1) {
+      const old = deliveredPage.items[index];
+      const item = nextPage.items[index];
+      if (!item || !old || !item.key || keys.has(item.key) || old.key !== item.key || old.type !== item.type) return refresh;
+      keys.add(item.key);
+      if (item.type === 'work' && item.summary?.isStreaming === true) {
+        if (after || old.summary?.isStreaming !== true || item.children !== undefined || old.children !== undefined) return refresh;
+        before = old;
+        after = item;
+      } else {
+        // This includes every non-running summary, prose, card and nested shape.
+        if (JSON.stringify(old) !== JSON.stringify(item) || old.summary?.isStreaming === true) return refresh;
+        const runningChild = value => value?.summary?.isStreaming === true || value?.children?.some(runningChild);
+        if (item.children?.some(runningChild)) return refresh;
+      }
+    }
+    if (!after) return refresh;
+    const base = before.summary;
+    const next = after.summary;
+    if (base.key !== before.key || next.key !== after.key || !base.firstMessageId || base.firstMessageId !== next.firstMessageId
+      || !base.lastMessageId || !next.lastMessageId || !Number.isSafeInteger(base.messageCount) || base.messageCount <= 0
+      || !Number.isSafeInteger(next.messageCount) || next.messageCount < base.messageCount
+      || (base.messageCount === next.messageCount && base.lastMessageId !== next.lastMessageId)
+      || typeof base.revision !== 'string' || !base.revision || typeof next.revision !== 'string' || !next.revision
+      || !Array.isArray(base.lines) || !Array.isArray(next.lines)) return refresh;
+    if (JSON.stringify(base) === JSON.stringify(next)) return { kind: 'unchanged' };
+    // A hidden-body stamp may advance after its opening line saturates. Expanded
+    // details have a separate revision cadence; collapsed displays need no push.
+    if (JSON.stringify({ ...base, revision: undefined }) === JSON.stringify({ ...next, revision: undefined })) return { kind: 'unchanged' };
+    if (base.revision === next.revision) return refresh;
+    const patch = { version: HISTORY_VIEW_VERSION, sessionId, baseRevision: base.revision,
+      item: { type: 'work', key: after.key, summary: next } };
+    return itemBytes(patch) <= HISTORY_WORK_PATCH_MAX_BYTES ? { kind: 'patch', patch } : refresh;
+  } catch {
+    return refresh;
   }
 }
 
@@ -266,6 +338,67 @@ export function createHistoryViewController({
 
   /** `sessionId` → the work keys the controller currently has expanded. */
   const expanded = new Map();
+  const projections = new Map();
+  const metrics = { groupedRows: 0, fullHashRows: 0, stampedHashRows: 0, hashChars: 0, sealedPrefixRowsReused: 0, cacheHits: 0, rebuilds: 0, suffixUpdates: 0 };
+
+  /** Optional snapshot contract (never inferred from array/object identity):
+   * projection:{identity,version,sealedPrefixLength}. Within one identity, sealed
+   * prefix rows NEVER change/reorder/disappear, and its length only increases.
+   * Version covers every row/content change; rewind/gap must change identity.
+   * This permanent-prefix promise is safe even when page reads skip versions.
+   * Source historyContentStamp, when present, covers every content change.
+   */
+  function projectedItems(sessionId, read, { running, workLines }) {
+    const meta = read.projection;
+    const versioned = meta && meta.identity != null && meta.version != null
+      && Number.isSafeInteger(meta.sealedPrefixLength) && meta.sealedPrefixLength >= 0 && meta.sealedPrefixLength <= read.rows.length;
+    if (!versioned) {
+      projections.delete(sessionId);
+      metrics.rebuilds += 1;
+      return groupHistoryItems(read.rows, { chronological: true, running, workLines, metrics });
+    }
+    let modes = projections.get(sessionId);
+    if (!modes) modes = new Map();
+    // Small session LRU. These are disposable projections, not transcript owners.
+    projections.delete(sessionId);
+    projections.set(sessionId, modes);
+    if (projections.size > 3) projections.delete(projections.keys().next().value);
+    let cache = modes.get(workLines);
+    if (cache && cache.identity === meta.identity && cache.sealed <= meta.sealedPrefixLength && cache.length <= read.rows.length) {
+      if (cache.version === meta.version && cache.running === running && cache.length === read.rows.length) {
+        metrics.cacheHits += 1;
+        return cache.items;
+      }
+      // Retain only entries fully inside the PREVIOUS immutable prefix. A newly
+      // sealed old live row still needs one last projection before it is cached.
+      while (cache.entries.length && cache.entries.at(-1).end > cache.sealed) cache.entries.pop();
+      const last = cache.entries.at(-1);
+      if (last?.item.type === 'work' && (last.item.summary.messageCount < WORK_ITEM_MAX_ROWS || last.item.summary.isStreaming || last.end === read.rows.length)) cache.entries.pop();
+      const start = cache.entries.at(-1)?.end ?? 0;
+      cache.items.length = cache.entries.length;
+      metrics.sealedPrefixRowsReused += start;
+      metrics.suffixUpdates += 1;
+      const suffix = groupHistoryItems(read.rows.slice(start), { chronological: true, running, workLines, metrics });
+      let position = start;
+      for (const item of suffix) {
+        position += item.type === 'work' ? item.summary.messageCount : item.messages.length;
+        cache.entries.push({ item, end: position });
+        cache.items.push(item);
+      }
+    } else {
+      metrics.rebuilds += 1;
+      const items = groupHistoryItems(read.rows, { chronological: true, running, workLines, metrics });
+      let position = 0;
+      const entries = items.map(item => {
+        position += item.type === 'work' ? item.summary.messageCount : item.messages.length;
+        return { item, end: position };
+      });
+      cache = { items, entries };
+      modes.set(workLines, cache);
+    }
+    Object.assign(cache, { identity: meta.identity, version: meta.version, sealed: meta.sealedPrefixLength, length: read.rows.length, running });
+    return cache.items;
+  }
 
   /** The transcript for one session, or a refusal the controller understands. */
   async function transcriptFor(sessionId) {
@@ -294,7 +427,8 @@ export function createHistoryViewController({
     //
     // - it saves no scan. `rows` is the reader's transcript (`readMessages.all`, i.e.
     //   `ensureTranscript`), so the full read has **already happened and been cached** before
-    //   this function is entered; `page()` below only windows that array in O(page).
+    //   this function is entered; refusal cannot undo it. Versioned snapshots now
+    //   reuse the sealed projection prefix; legacy sources are conservatively regrouped.
     // - it does not degrade, it kills. The controller's `historyViewController.refresh()`
     //   returns immediately **forever** once its error matches `UNSUPPORTED_CAPABILITY`
     //   (`packages/maker-shared/src/historyViewController.ts:95`), and only `reset()` clears
@@ -306,15 +440,16 @@ export function createHistoryViewController({
     // `UNSUPPORTED_CAPABILITY` and `CHANNEL_NOT_ALLOWED` are therefore reserved for "this Host
     // has no projection capability at all" — a deployment fact — and never for a property of
     // one session. See ADR-0007's decision evolution.
-    return { ok: true, rows: all.rows, resolve: all.resolve };
+    return { ok: true, rows: all.rows, resolve: all.resolve, projection: all.projection };
   }
 
   /**
    * One page of work items, newest window by default.
    * @param sessionId - the session.
    * @param before - a cursor from a previous page: the oldest id that page returned.
+   * @param options - workLines:true negotiates bounded running lines, not a body preview.
    */
-  async function page(sessionId, before = undefined) {
+  async function page(sessionId, before = undefined, options = {}) {
     const read = await transcriptFor(sessionId);
     if (read.ok !== true) return read;
     let endRow = read.rows.length;
@@ -323,10 +458,10 @@ export function createHistoryViewController({
       if (endRow < 0) return { ok: false, code: 'NOT_FOUND', message: 'history cursor is no longer in this session' };
     }
     // Cut by source position before grouping: an anchor may now lie inside a merged work.
-    const items = groupHistoryItems(read.rows.slice(0, endRow), {
-      chronological: true,
-      running: !before && (typeof sessionRunning === 'function' ? sessionRunning(sessionId) === true : null),
-    });
+    const workLines = options?.workLines === true;
+    const running = !before && (typeof sessionRunning === 'function' ? sessionRunning(sessionId) === true : null);
+    const items = !before ? projectedItems(sessionId, read, { running, workLines })
+      : groupHistoryItems(read.rows.slice(0, endRow), { chronological: true, running, workLines, metrics });
     const end = items.length;
     const selected = [];
     let bytes = 1024;
@@ -420,5 +555,8 @@ export function createHistoryViewController({
     return [...(expanded.get(sessionId) ?? new Set())];
   }
 
-  return { page, details, intent, expandedFor, invalidate: sessionId => expanded.delete(sessionId) };
+  return { page, details, intent, expandedFor,
+    metrics: () => ({ ...metrics }),
+    invalidate: sessionId => { projections.delete(sessionId); return expanded.delete(sessionId); },
+  };
 }

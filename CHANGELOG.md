@@ -1,5 +1,41 @@
 # Changelog
 
+## 0.1.44 — 2026-11-17
+
+- Publish the same runtime implementation as the locally accepted `0.1.44-local.6`, with formal release identity only; retain Cindy handshake `0.1.82` and the existing exact DSH peer matrix, including tested `0.2.2-rc.3`.
+- Synchronize native assistant/control/history projections; bound list delivery and optional scalar enrichment, repair known dirty identities without restarting a whole catalog for no-op request headers, and preserve fresh/source/grant/rename/encoding fences.
+- **Migration boundary:** discovery temporarily excludes only sessions explicitly declared `migration-required` by DSH. Logs remain untouched, explicit reads preserve genuine native outcomes, and native migration back to current format restores discovery. This can hide legacy sessions until native migration; it is not data deletion or automatic migration repair.
+- Stop projecting scheduled/started native retries as history messages. Preserve native retry policy and terminal failure ownership; finite TRANSPORT retries use the existing nonterminal reconnect display, without invented limits or labels.
+- Keep the five-second read budget and default-off generic reseed gate. Local user acceptance confirms the specified task and repeated refresh on local.6; earlier budget failures and large-corpus cold-coverage limits remain recorded, not a zero-timeout promise. No Cindy code change, account-cache deletion or automatic Host restart is part of publication.
+
+## Local candidate history
+
+## 0.1.44-local.6 — 2026-11-17
+
+- Separate catalog membership/global invalidation from raw per-row dirty notifications and normalized core view revision. Ordinary request headers with unchanged list facts repair their identity instead of forcing every caller to enumerate the corpus again.
+- Verify supported dirty rows before materializing a complete catalog cut; reject stale per-row completions, real current-format I/O errors and global/membership replacements. Use the validated cut's collection generation rather than re-enumerating again merely because an internally reconciled earlier generation existed at request start.
+- Do not let known or newly declared subagent lifecycle events invalidate the ordinary task catalog. Keep fresh after-start catalog barriers, rename/permission/source/grant/encoding guards, migration scope and the 5-second budget unchanged.
+- Add regressions for busy request-header/no-op invalidations, a row becoming dirty after its catalog slot, and subagent lifecycle scope. Real native comparison at 20 raw invalidations/second reproduces local.5's 5s failure; candidate lists succeed in 719/730/835ms, with unchanged domain view, increasing row revision and one catalog attempt. This controlled read-only test is not post-install handset acceptance.
+
+## 0.1.44-local.5 — 2026-11-16
+
+- Fix intermittent list starvation while optional message-count/first-user/interruption enrichment completes: keep an independent enrichment revision, do not revoke core snapshot proofs or invalidate the router's complete catalog flight for these patches, and retain their existing push delivery.
+- Keep all native core, source/grant/subscription, rename/create and asynchronous encoding fences unchanged. No stale-success fallback, generic reseed gate change or migration-scope expansion.
+- Add a Host-level regression with real awaited catalog work overlapping ongoing evidence; it fails on local.4 and responds before enrichment drains after the fix. Verify candidate source/router reads against the running native corpus through a temporary loopback-only probe, not only synthetic performance fixtures; remove the probe after diagnosis. Installation is separate from post-restart handset acceptance.
+
+## 0.1.44-local.4 — 2026-11-16
+
+- Fix local.3's permanently rebuilding list when a legacy artifact fails native migration. With explicit user approval, list discovery temporarily excludes only rows natively declared `migration-required`; source artifacts are untouched, direct-read failures are not treated as absence, and native migration back to current format restores discovery.
+- Prefer native exact inspection of only the four list-core projections instead of calculating every installed projection; retain each verified row signature across unrelated events instead of repeatedly replaying the cold corpus. New drafts invalidate their own ID, forks invalidate membership only, and compaction invalidates only its target.
+- Add regression coverage for rejected legacy migrations, genuine current-format read errors, restoration after native migration, retained cold progress, and native draft creation without full-corpus invalidation. Generic reseed remains default-denied; no DSH restart or handset acceptance is implied by local installation.
+
+## 0.1.44-local.3 — 2026-11-16
+
+- Unify native session list/get/push projection, remove settled router/source stale-success and title TTL, and derive both activity sort fields from native creation/last-prompt truth. Keep first-display-user evidence separate.
+- Select status/window/pins before bounded scalar enrichment; list evidence cannot evict the open conversation transcript cache. Add bounded list delivery, source/grant/connection/subscription fences, native turn activity and state-driven repair.
+- Encode declared list results with gzip/SHA256/notModified before final frame budgeting; do not claim delta or reliable transport. Keep generic empty-payload reseed disabled unless the target consumer has been explicitly validated; source snippets do not authorize APK compatibility.
+- Local installation candidate for DSH `0.2.2-rc.3`, not a registry publication or completed handset acceptance. User owns the restart. Preserve the existing Unreleased changes above.
+
 ## 0.1.43 — 2026-11-14
 
 - Accept the exact DSH `0.2.2-rc.3` Agent/Session/Settings carrier alongside all previously supported versions, without bundling DSH core packages or accepting future prereleases.

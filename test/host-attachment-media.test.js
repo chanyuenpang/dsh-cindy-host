@@ -222,7 +222,9 @@ test('production plugin and Host composition serve generated image references an
   const f = fixture({ size: 512 }); let reads = 0;
   const services = {
     sessionController: { list: async () => ({ items: [{ sessionId: 's1', createdAt: 1000, updatedAt: 2000, cwd: '/project' }] }) },
-    sessionQuery: { readSession: async () => ({ header: { id: 's1', cwd: '/project', createdAt: 1000 }, events: [f.event] }) },
+    sessionQuery: { readSession: async () => ({ header: { id: 's1', cwd: '/project', createdAt: 1000 }, events: [f.event] }),
+      observeSession: async () => ({ header: { id: 's1', cwd: '/project', createdAt: 1000 },
+        projections: { values: { title: 'image', sessionListMetadata: { blank: false, lastPromptAt: 2000 } } }, [Symbol.dispose]() {} }) },
     attachments: { readImage: async ref => { reads++; assert.deepEqual(ref, f.ref); return { ref, data: f.bytes }; } },
   };
   const ctx = { get: key => services[key], on: () => () => {}, inject: (keys, callback) => { if (keys.every(key => services[key])) callback(ctx); return () => {}; }, effect: run => run() };

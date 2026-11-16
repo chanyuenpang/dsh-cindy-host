@@ -235,7 +235,20 @@ test('activity evidence uses the folded rows and first durable user timestamp', 
     interruption: null,
   });
   assert.equal(await reader.count('s1'), 2);
-  assert.equal(reads, 1, 'activity and count reuse one transcript fold');
+  assert.equal(reads, 2, 'list-only evidence does not seed the detail transcript LRU');
+  await reader.activity('s1');
+  assert.equal(reads, 2, 'a warm detail remains reusable for exact evidence');
+});
+
+test('list evidence cannot evict the open conversation detail cache', async () => {
+  const reads = new Map();
+  const reader = createMessageReader({ cacheSessions: 1, readSessionLog: async id => {
+    reads.set(id, (reads.get(id) ?? 0) + 1); return { events: [] };
+  } });
+  await reader.count('viewed');
+  for (let index = 0; index < 20; index++) await reader.activity(`list-${index}`);
+  assert.equal(reader.stats().sessions, 1);
+  await reader.count('viewed'); assert.equal(reads.get('viewed'), 1);
 });
 
 test('seed singleflight is per session, not a global read lock', async () => {

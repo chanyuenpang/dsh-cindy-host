@@ -40,8 +40,8 @@ test('every listener this plugin registers goes through the guarded entry point'
   assert.equal(guardedCalls, registrations, `${guardedCalls} guarded wrappers for ${registrations} named registrations`);
   assert.equal(
     [...source.matchAll(/subscribe: \(name, listener\) => ctx\.on\(name, listener\)/g)].length,
-    1,
-    'the one passthrough is still there, and still the only one',
+    0,
+    'the native list source now receives the shared guarded subscribe capability, with no raw passthrough',
   );
 });
 

@@ -22,7 +22,7 @@ function makeSeam() {
       const record = records.get(id);
       if (!record) throw Object.assign(new Error('missing'), { code: 'SESSION_QUERY_SESSION_NOT_FOUND' });
       return { header: { id, createdAt: at, cwd: 'G:/project', ...record.header }, events: [],
-        projections: { values: { sessionListMetadata: { blank: true }, ...record.values } },
+        projections: { values: { title: record.header?.title ?? null, sessionListMetadata: { blank: true, lastPromptAt: null }, ...record.values } },
         [Symbol.dispose]() { disposed++; } };
     },
     async readSession(id) {
@@ -42,8 +42,37 @@ function makeSeam() {
   };
   const services = { sessionController: controller, sessionQuery: query };
   const seam = buildDshSource({ get: name => services[name], on: () => () => {}, inject: () => () => {} }, 'sessionController');
-  return { seam, records, controller, disposed: () => disposed, setError: value => { error = value; } };
+  return { seam, records, controller, query, services, disposed: () => disposed, setError: value => { error = value; } };
 }
+
+test('native list core inspection computes exactly four domains without all-projection or event reads', async t => {
+  const f = makeSeam(); t.after(() => f.seam.source.dispose()); let inspections = 0;
+  f.query.observeSession = () => assert.fail('all-projection observation is not the list core path');
+  f.query.inspectSession = async (id, getter, signal) => {
+    inspections++; assert.ok(signal instanceof AbortSignal);
+    return getter({ header: { id, cwd: 'G:/project', createdAt: at },
+      get events() { assert.fail('list core cannot copy native events'); } });
+  };
+  f.services.sessionProjections = { snapshot(session, keys) {
+    assert.deepEqual(keys, ['title', 'sessionListMetadata', 'modelSelection', 'permissions']);
+    return { asOfSeq: 10, values: { title: 'Native four-domain cut', sessionListMetadata: { blank: false, lastPromptAt: at + 1 } } };
+  } };
+  const row = await f.seam.source.getSession('new');
+  assert.equal(row.title, 'Native four-domain cut'); assert.equal(row.updatedAt, new Date(at + 1).toISOString()); assert.equal(inspections, 1);
+});
+
+test('creating a native draft retains already validated unrelated catalog cores', async t => {
+  const f = makeSeam(); t.after(() => f.seam.source.dispose());
+  f.records.set('existing', { header: { title: 'Existing' }, values: { sessionListMetadata: { blank: false, lastPromptAt: at } } });
+  const observations = new Map(); const observe = f.query.observeSession.bind(f.query);
+  f.query.observeSession = async (id, options) => { observations.set(id, (observations.get(id) ?? 0) + 1); return observe(id, options); };
+  await f.seam.source.listSessions({ evidence: false });
+  await f.seam.createSession({ sessionId: 'new' });
+  f.records.get('new').values = { sessionListMetadata: { blank: false, lastPromptAt: at + 1 } };
+  f.seam.source.invalidateSession('new'); await f.seam.source.titlesSettled();
+  assert.equal((await f.seam.source.listSessions({ fresh: true, evidence: false })).length, 2);
+  assert.equal(observations.get('existing'), 1, 'create is an ID/membership change, not a whole-corpus core invalidation');
+});
 
 test('known blank ID reads bypass discovery filtering and retain applied model metadata', async () => {
   const blank = summary('new', { blank: true, projections: { values: { modelSelection: {
@@ -105,7 +134,7 @@ test('create then get/history works before first enqueue using the live observat
   const missing = await invoke(router, 'local-db:sessions:get', ['unknown']);
   assert.equal(missing.payload.ok, false);
   assert.equal(missing.payload.error.code, 'NOT_FOUND');
-  assert.equal(f.disposed(), 1);
+  assert.ok(f.disposed() >= 1, 'exact observations release their leases on every path');
 });
 
 test('exact observation releases leases and never invents absence for I/O errors', async () => {
@@ -150,14 +179,16 @@ test('source create fences the in-flight list independently of router cache', as
   const before = f.seam.source.listSessions();
   await tick();
   await f.seam.createSession({ sessionId: 'new' });
+  f.records.get('new').values = { sessionListMetadata: { blank: false, lastPromptAt: at } };
   const after = f.seam.source.listSessions();
   await tick();
-  assert.equal(reads, 2);
-  assert.equal((await after)[0].id, 'new');
+  assert.equal(reads, 1, 'one bounded catalog worker; the invalidated scan cannot supply old success');
   old.resolve({ items: [] });
-  await before;
+  assert.equal((await after)[0].id, 'new');
+  assert.equal((await before)[0].id, 'new', 'even the old caller must catch up before replying');
   f.controller.list = async () => { throw new Error('temporarily unavailable'); };
-  assert.equal((await f.seam.source.listSessions())[0].id, 'new', 'stale fallback retained the post-create page, not old empty result');
+  await assert.rejects(f.seam.source.listSessions({ fresh: true }), /temporarily unavailable/, 'failure cannot masquerade as a fresh old page');
+  assert.equal(f.seam.source.peekSession('new').id, 'new', 'validated local progress remains available to diagnostics, not a stale-success reply');
 });
 
 test('legacy get retries a missing cached ID instead of proving absence from a warm list', async () => {

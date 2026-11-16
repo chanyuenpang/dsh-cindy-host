@@ -24,6 +24,7 @@ function fixture() {
       listSessions: async () => { metadataReads++; return []; },
       readTitleSnapshots: async ids => ids.map(sessionId => ({ sessionId, status: 'fulfilled', value: { title: { title: 'A title' } } })),
       observeSession: async id => ({ header: { ...session.header, id }, projections: { values: {
+        title: 'A title', sessionListMetadata: { blank: false, lastPromptAt: at + 100 },
         modelSelection: { next: { provider: 'provider', model: 'model', reasoningEffort: 'high' } }, permissions: { currentValue: 'read-only' },
       } }, [Symbol.dispose]() {} }),
     },

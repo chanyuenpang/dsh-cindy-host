@@ -83,6 +83,9 @@ export function toCindySessionListRow(item, { now = () => new Date(), device, de
     source: 'desktop',
     createdAt,
     updatedAt,
+    // Same native recency clock on reads and patches; first user evidence must
+    // never shadow it in Cindy's lastActivityAt ?? userSendAt ?? updatedAt helper.
+    lastActivityAt: item.lastActivityAt ?? updatedAt,
     // `'active' | 'archived' | 'deleted'`; the controller's default status filter
     // is `'active'`, so this field decides whether a row is visible at all.
     //

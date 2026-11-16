@@ -21,6 +21,8 @@
  * emitted rather than invented.
  */
 
+import { controlProjectionUpdates } from './session-control-projections.js';
+
 /** Projection key DSH's goal service registers. */
 export const GOAL_PROJECTION_KEY = 'goal';
 
@@ -61,11 +63,11 @@ export function createProjectionTracker() {
       return;
     }
     if (frame.type !== 'projection') return;
-    if (typeof frame.sessionId !== 'string' || frame.sessionId === '') return;
-    if (typeof frame.key !== 'string' || frame.key === '') return;
-    const values = bySession.get(frame.sessionId) ?? new Map();
-    values.set(frame.key, frame.value);
-    bySession.set(frame.sessionId, values);
+    for (const { sessionId, values: changes } of controlProjectionUpdates(frame)) {
+      const values = bySession.get(sessionId) ?? new Map();
+      for (const [key, value] of Object.entries(changes)) values.set(key, value);
+      bySession.set(sessionId, values);
+    }
   }
 
   /** One projection value, or undefined when the stream has never carried it. */

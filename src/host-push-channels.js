@@ -16,7 +16,7 @@
 
 /** Push channel → the emitting path in this Host. */
 export const HOST_PUSH_CHANNELS = new Map([
-  ['maker:event', 'host.js announceTurnRunning/announceTurnIdle + publishNativeJobUpdates (real native task status)'],
+  ['maker:event', 'host.js announceTurnRunning/announceTurnIdle + publishNativeJobUpdates + publishLiveRows (native text delta/full-prefix repair)'],
   ['maker:schedule:event', 'host.js observeRemindersSource (committed native ready invalidation)'],
   ['sidebar-settings:project-order-changed', 'host.js observeProjectOrderSource (native order snapshot + owner stamp)'],
   ['local-db:messages:created', 'host.js pushSessionMessage (live fold)'],
@@ -26,14 +26,16 @@ export const HOST_PUSH_CHANNELS = new Map([
   // appeared after re-entering the session (报：重新进入会话之后对话就出来了). The audit
   // used to record this channel as deliberately unsent because the view it invalidates was
   // the one this Host refused; the Host serves the view now, so the reason expired with it.
-  ['maker:history-view-changed', 'host.js pushSessionMessage (the view a session is showing)'],
+  ['maker:history-view-changed', 'host.js pushSessionMessage + syncNativeHistory (authorized structural/detail repair)'],
+  ['maker:history-work-patch', 'host.js syncNativeHistory (accepted fitted latest-page lease + safe running leaf replacement)'],
+  ['local-db:messages:deleted', 'host.js pushSessionUpdate/publishLiveRows (authorized live retirement)'],
   ['maker:input:projection', 'host.js pushInputProjection (queue changes)'],
   ['maker:goal:status-changed', 'host.js pushGoalStatus + applyControlFrame (goal projection)'],
   ['maker:interaction-request', 'host.js askApproval/askUserQuestion'],
   ['maker:interaction-dismissed', 'host.js onDismissed (answered, timed out, withdrawn)'],
-  ['local-db:sessions:created', 'session-publisher.publishLifecycle'],
-  ['local-db:sessions:patched', 'session-publisher.publishLifecycle'],
-  ['local-db:sessions:activity', 'session-publisher.publishActivity'],
+  ['local-db:sessions:created', 'session-list-delivery.created + gated reseed; legacy session-publisher.publishLifecycle'],
+  ['local-db:sessions:patched', 'host.publishRowPatch → session-list-delivery.patch; legacy session-publisher.publishLifecycle'],
+  ['local-db:sessions:activity', 'native turn boundary → session-list-delivery.activity; legacy session-publisher.publishActivity'],
 ]);
 
 export default HOST_PUSH_CHANNELS;

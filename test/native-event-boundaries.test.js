@@ -22,8 +22,12 @@ test('native source event ports use the Host-owned guarded subscription boundary
     seam.reminders.onChange(() => {}),
     seam.projectOrder.onChange(() => {}),
   ];
-  assert.deepEqual(registrations.map(entry => entry.event), ['domain/changed', 'schedule/changed', 'domain/changed']);
+  assert.deepEqual(registrations.map(entry => entry.event), [
+    'api-session/added', 'api-session/removed', 'api-session/status', 'api-session/activity', 'api-session/error', 'session/event',
+    'domain/changed', 'schedule/changed', 'domain/changed',
+  ]);
   assert.ok(registrations.every(entry => typeof entry.listener === 'function'));
   for (const stop of stops) stop();
   assert.equal(disposed, 3);
+  seam.source.dispose(); assert.equal(disposed, 9, 'native list listeners have the same guarded lifecycle owner');
 });

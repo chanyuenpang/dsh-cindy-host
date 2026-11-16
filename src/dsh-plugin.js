@@ -3,6 +3,7 @@ import { createRequire } from 'node:module';
 import { homedir } from 'node:os';
 import { join } from 'node:path';
 import { createDshInputDeliveryBackend } from './dsh-input-delivery.js';
+import { createNativeAssistantSource } from './native-assistant-source.js';
 import { diagnosticPreferenceStore } from './diagnostic-presentation.js';
 import { ensureNativeContinuationPlanOff } from './continuation-protocol.js';
 import { DEFAULT_HOST_SETTINGS, SETTINGS_NAMESPACE, validateHostSettings } from './host-settings.js';
@@ -663,6 +664,12 @@ export function buildDshSource(ctx, serviceName, options = {}) {
     const readMessages = sessionQuery === undefined
       ? undefined
       : createMessageReader({ readSessionLog: (sessionId) => sessionQuery.readSession(sessionId), readImageAttachment });
+    const liveAssistant = typeof sessionController.follow === 'function' ? createNativeAssistantSource({
+      follow: (sessionId, signal) => sessionController.follow({
+        address: { kind: 'session', sessionId }, activate: false, assistantStream: true, maxMessages: 1,
+      }, signal),
+      onError: error => options.onLiveError?.(error),
+    }) : undefined;
     /**
      * Turn image handles into bytes for **whatever is about to reach the phone**.
      *
@@ -712,13 +719,40 @@ export function buildDshSource(ctx, serviceName, options = {}) {
       const rows = await (inputDeliveryBackend.available() ? inputDeliveryBackend.readRows(sessionId) : readMessages.all(sessionId));
       return options.projectMessages?.(rows) ?? rows;
     };
+    const projectedPrefixes = new Map();
+    function displayPrefix(sessionId, snapshot) {
+      if (typeof options.projectMessages !== 'function') return snapshot;
+      const preferenceVersion = options.projectMessagesVersion?.();
+      const previous = projectedPrefixes.get(sessionId);
+      if (preferenceVersion !== undefined && previous?.snapshot === snapshot && previous.preferenceVersion === preferenceVersion) return previous.display;
+      const projected = options.projectMessages(snapshot.rows);
+      const rewritten = projected.length !== snapshot.rows.length || projected.some((row, index) => row !== snapshot.rows[index]);
+      const sameOwner = previous && previous.sourceIdentity === snapshot.projection?.identity && previous.preferenceVersion === preferenceVersion;
+      const projectionIdentity = sameOwner ? previous.projectionIdentity : {};
+      const display = { ...snapshot, rows: projected,
+        ...(rewritten ? { projection: snapshot.projection && preferenceVersion !== undefined
+          ? { ...snapshot.projection, identity: projectionIdentity } : undefined } : {}) };
+      if (preferenceVersion !== undefined) {
+        projectedPrefixes.delete(sessionId);
+        projectedPrefixes.set(sessionId, { snapshot, preferenceVersion, sourceIdentity: snapshot.projection?.identity, projectionIdentity, display });
+        if (projectedPrefixes.size > 3) projectedPrefixes.delete(projectedPrefixes.keys().next().value);
+      }
+      return display;
+    }
     const historyView = readMessages === undefined
       ? undefined
       : createHistoryViewController({
         snapshot: async (sessionId) => {
-          const snapshot = await (inputDeliveryBackend.available()
-            ? inputDeliveryBackend.historySnapshot(sessionId) : readMessages.historySnapshot(sessionId));
-          return { ...snapshot, rows: options.projectMessages?.(snapshot.rows) ?? snapshot.rows };
+          // A native live lease uses the contiguous cached display reader, never a
+          // durability flush/full log replay for every token. Receipt evidence still
+          // goes exclusively through inputDeliveryBackend's validated durable prefix.
+          const snapshot = await (liveAssistant?.supported(sessionId)
+            ? readMessages.historySnapshot(sessionId)
+            : inputDeliveryBackend.available() ? inputDeliveryBackend.historySnapshot(sessionId) : readMessages.historySnapshot(sessionId));
+          // Project the durable prefix once per source/presentation revision, not
+          // for every live token. Live public rows cannot carry dismissed-error state.
+          const prefix = displayPrefix(sessionId, snapshot);
+          return liveAssistant?.overlay(sessionId, prefix) ?? prefix;
         },
         // The turn state has to be **wired** here; the controller's own default is `() => false`.
         // That default is why a running turn was never marked `isStreaming`, which cost two things
@@ -732,10 +766,20 @@ export function buildDshSource(ctx, serviceName, options = {}) {
       });
     // Bound once, not inline: the rename path has to be able to invalidate this source's
     // cached title, and a property of the object literal below is not in scope here.
+    const listCoreKeys = ['title', 'sessionListMetadata', 'modelSelection', 'permissions'];
+    const summaryCut = (sessionId, header, projections) => {
+      if (header.id !== sessionId || header.cwd === undefined) return undefined;
+      const metadata = projections?.values?.sessionListMetadata;
+      return { sessionId: header.id, createdAt: header.createdAt,
+        updatedAt: Math.max(header.createdAt, metadata?.lastPromptAt ?? 0), cwd: header.cwd,
+        origin: header.origin, parentSessionId: header.parentSession, blank: metadata?.blank === true,
+        running: options.isSessionRunning?.(sessionId) === true, projections };
+    };
     const sessionSource = createSessionControllerSource({
       sessionController,
       readActiveSessions: () => readActiveSessionSummaries(ctx),
-      subscribe: (name, listener) => ctx.on(name, listener),
+      subscribe,
+      strictCore: true,
       readTitles: sessionQuery === undefined ? undefined : (ids) => readTitles(sessionQuery, ids),
       readSessionMeta: sessionQuery === undefined ? undefined : (ids) => readSessionMeta(sessionQuery, ids),
       readActivityEvidence: typeof readMessages?.activity === 'function' ? (sessionId) => readMessages.activity(sessionId) : undefined,
@@ -744,21 +788,16 @@ export function buildDshSource(ctx, serviceName, options = {}) {
       readSessionSummary: typeof sessionQuery?.observeSession !== 'function' ? undefined : async (sessionId) => {
         let observation;
         try {
+          const projections = ctx.get('sessionProjections');
+          if (typeof sessionQuery.inspectSession === 'function' && typeof projections?.snapshot === 'function') {
+            // Native inspect retains/releases its exact cut. Only compute list
+            // domains, not every installed history/tool/cost projection.
+            return await sessionQuery.inspectSession(sessionId,
+              session => summaryCut(sessionId, session.header, projections.snapshot(session, listCoreKeys)),
+              AbortSignal.timeout(15_000));
+          }
           observation = await sessionQuery.observeSession(sessionId, { projectionMode: 'all', signal: AbortSignal.timeout(15_000) });
-          const header = observation.header;
-          if (header.id !== sessionId || header.cwd === undefined) return undefined;
-          const metadata = observation.projections?.values?.sessionListMetadata;
-          return {
-            sessionId: header.id,
-            createdAt: header.createdAt,
-            updatedAt: Math.max(header.createdAt, metadata?.lastPromptAt ?? 0),
-            cwd: header.cwd,
-            origin: header.origin,
-            parentSessionId: header.parentSession,
-            blank: metadata?.blank === true,
-            running: options.isSessionRunning?.(sessionId) === true,
-            projections: observation.projections,
-          };
+          return summaryCut(sessionId, observation.header, observation.projections);
         } catch (error) {
           if (error?.code === 'SESSION_QUERY_SESSION_NOT_FOUND') return undefined;
           throw error; // An I/O or replay failure is not evidence of absence.
@@ -766,6 +805,15 @@ export function buildDshSource(ctx, serviceName, options = {}) {
           observation?.[Symbol.dispose]?.();
         }
       },
+    });
+    // Follow the projection owner's feed too (model/permissions are not list activity).
+    const listProjectionKeys = new Set(['title', 'sessionListMetadata', 'modelSelection', 'permissions']);
+    ctx.inject(['sessionProjections'], projectionCtx => {
+      const owner = projectionCtx.get('sessionProjections');
+      if (typeof owner?.onChanged !== 'function') return;
+      return owner.onChanged((session, key) => {
+        if (listProjectionKeys.has(key) && session?.header?.origin !== 'subagent') sessionSource.invalidateSession(session.id);
+      });
     });
     // The runtime observes native archive commits even when the relay is offline.
     sessionSource.archive = sessionArchive;
@@ -779,7 +827,7 @@ export function buildDshSource(ctx, serviceName, options = {}) {
         readMessages?.invalidate?.(sessionId);
         historyView?.invalidate?.(sessionId);
         sessionSource.invalidateActivityEvidence?.(sessionId);
-        sessionSource.invalidateListing?.();
+        sessionSource.invalidateSession?.(sessionId);
       },
     });
     ctx.inject(['commands'], commandCtx => {
@@ -792,7 +840,7 @@ export function buildDshSource(ctx, serviceName, options = {}) {
       getQuery: () => ctx.get('sessionQuery'),
       getSession: sessionId => sessionSource.getSession(sessionId),
       isHidden: sessionId => sessionArchive.isArchived(sessionId) === true,
-      invalidate: () => sessionSource.invalidateListing?.(),
+      invalidate: () => sessionSource.invalidateMembership?.(),
     });
     sessionSource.forkSession = forkSession;
     const keywordSearch = createDshKeywordSearch({
@@ -838,6 +886,7 @@ export function buildDshSource(ctx, serviceName, options = {}) {
       kind: 'session-controller',
       sessionArchive,
       readMessages,
+      liveAssistant,
       readAllMessages: readMessages === undefined ? undefined : committedRows,
       inputDeliveryBackend,
       countMessages,
@@ -897,7 +946,7 @@ export function buildDshSource(ctx, serviceName, options = {}) {
           ...(options.sessionId === undefined ? {} : { sessionId: options.sessionId }),
           ...(workspace === undefined ? (cwd === undefined ? {} : { cwd }) : { workspaceId: workspace.id }),
         });
-        sessionSource.invalidateListing();
+        sessionSource.invalidateSession(created.sessionId);
         const installed = {};
         if (typeof options?.model === 'string' && options.model !== '') {
           const applied = await applyModelSelection({
@@ -1385,6 +1434,8 @@ export function buildDiagnostics({ runtime, sourceKind, seam, listingDiagnostics
   return {
     dataSource: sourceKind,
     transfers: field(() => runtime?.getTransferDiagnostics?.() ?? null, null),
+    nativeAssistant: field(() => seam?.liveAssistant?.stats?.() ?? null, null),
+    historyProjection: field(() => seam?.historyView?.metrics?.() ?? null, null),
     projectionRunning: runtime?.projectionRunning === true,
     projectedSessions: field(() => (runtime ? runtime.model.list().length : 0), 0),
     // What a controller actually asked for and what it got back, with the
@@ -1458,7 +1509,11 @@ export function buildDiagnostics({ runtime, sourceKind, seam, listingDiagnostics
     // How the session listing is doing. `staleServes > 0` means a controller was answered
     // from the previous read because the live one missed its deadline — an absorbed
     // degradation, and the difference between a rendered list and the reported spinner.
-    listing: field(() => (typeof listingDiagnostics === 'function' ? listingDiagnostics() : null), null),
+    listing: field(() => {
+      const native = typeof listingDiagnostics === 'function' ? listingDiagnostics() : null;
+      const delivery = runtime?.getListDeliveryDiagnostics?.();
+      return delivery ? { ...native, delivery } : native;
+    }, null),
     // Rows this Host deliberately did not show the phone. Hidden is not dropped: the count is how
     // a projection decision stays distinguishable from a lost message.
     suppressedNotices: field(() => (runtime && typeof runtime.getSuppressedNotices === 'function' ? runtime.getSuppressedNotices() : 0), 0),
@@ -1484,6 +1539,7 @@ export function buildDiagnostics({ runtime, sourceKind, seam, listingDiagnostics
 export function capabilityProvider(sources) {
   return {
     readMessages: sources.readMessages,
+    liveAssistant: sources.liveAssistant,
     readAllMessages: sources.readAllMessages,
     inputDeliveryBackend: sources.inputDeliveryBackend,
     countMessages: sources.countMessages,
@@ -1935,7 +1991,9 @@ export function apply(ctx, config) {
         // every turn boundary.
         isSessionRunning: (sessionId) => runtime?.isSessionRunning?.(sessionId) === true,
         projectMessages: rows => runtime?.projectMessages?.(rows) ?? rows,
+        projectMessagesVersion: () => runtime?.getMessagePresentationVersion?.(),
         getProjectOrderOwner: () => runtime?.getProjectOrderOwner?.(),
+        onLiveError: error => noteBoundaryError('native-assistant-stream', error),
       });
       // The filesystem is a separate service; the controller's file reads are
       // only wired when this profile composes one.
@@ -1987,6 +2045,8 @@ export function apply(ctx, config) {
         built.reminders?.dispose();
         built.projectOrder?.dispose();
         built.referenceHistory?.dispose();
+        built.liveAssistant?.stop();
+        built.source?.dispose?.();
         if (sourceKind === built.kind) sourceKind = 'none';
         currentSource = undefined;
         currentSeam = {};
@@ -2049,8 +2109,11 @@ export function apply(ctx, config) {
     if (currentSeam !== undefined && currentSeam !== null && typeof currentSeam.readMessages === 'function'
       && typeof currentSeam.readMessages.noteEvent === 'function') {
       currentSeam.readMessages.noteEvent(sessionId, event);
-      currentSource?.invalidateActivityEvidence?.(sessionId);
+      if (!currentSource?.listView) currentSource?.invalidateActivityEvidence?.(sessionId);
     }
+    // The native live owner joins only a named committed end (type + seq), not
+    // turn/step guesses. Fold durable rows first so retirement cannot expose stale history.
+    currentSeam?.liveAssistant?.noteEvent(sessionId, event);
     // Make the failed history row readable before publishing its terminal identity.
     // Everything above is synchronous, so a new turn cannot interleave here.
     if (event?.type === 'turn/end' && typeof runtime.pushTurnIdle === 'function') runtime.pushTurnIdle(sessionId, event);
@@ -2066,6 +2129,10 @@ export function apply(ctx, config) {
     if (isHarnessNotice(event) && typeof runtime.noteSuppressedNotice === 'function') runtime.noteSuppressedNotice();
     // Nothing to do unless a controller is watching; the fold is not free.
     if (runtime.watchersFor(sessionId) === 0) return;
+    // History mutations (including todo/state) need their own wake signal even
+    // when deriveEventMessage renders no row. Never wait for the next text reply.
+    if (Number.isSafeInteger(event?.seq) && event.seq >= 0) runtime.invalidateHistoryView?.(sessionId);
+    if (event?.type === 'agent/inbox/spliced') void runtime.refreshInputProjection?.(sessionId, true);
     // Awaited, because `pushSessionMessage` inlines the row's images first: a photo has to be
     // renderable in the frame that carries it, not one read later.
     for (const row of foldSessionEvent(event, { sessionId })) await runtime.pushSessionMessage(sessionId, row);

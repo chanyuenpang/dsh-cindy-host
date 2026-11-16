@@ -102,7 +102,9 @@ test('runtime teardown cancels native compaction without sending model prompts',
 test('DSH source dynamically injects and forwards real scoped commands', async () => {
   const injections = new Map(); let activations = 0; const agent = {};
   const services = { sessionController: { list: async () => ({ items: [{ sessionId: 'one', cwd: '/workspace', createdAt: 1, updatedAt: 1 }] }),
-    resolveAgent: async () => { activations++; return { agent }; } } };
+    resolveAgent: async () => { activations++; return { agent }; } },
+    sessionQuery: { observeSession: async id => ({ header: { id, createdAt: 1, cwd: '/workspace' },
+      projections: { values: { title: 'one', sessionListMetadata: { blank: false, lastPromptAt: 1 } } }, [Symbol.dispose]() {} }) } };
   const ctx = { get: name => services[name], on: () => () => {}, effect: run => run(),
     inject(names, callback) { injections.set(names.join(','), callback); return () => {}; } };
   const seam = buildDshSource(ctx, 'sessionController');

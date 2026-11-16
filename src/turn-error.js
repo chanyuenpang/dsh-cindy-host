@@ -1,5 +1,6 @@
 /** Display-only native turn diagnostics. DSH owns failure, recovery and retry policy. */
 import { advanceInterruptionMetadata } from './diagnostic-presentation.js';
+import { reduceRetryPresentation } from './retry-presentation.js';
 const SAFE_MESSAGES = new Map([
   ['AUTH', 'Model authentication failed. Check the provider configuration.'],
   ['ACCOUNT_SIGNED_OUT', '任务已因退出 DeepSeek 登录而停止。'],
@@ -29,7 +30,7 @@ export function turnErrorRow(event, sessionId) {
     createdAt: new Date(event.time).toISOString(), content };
 }
 
-/** One safe allowlist for terminal model failures and scheduled retry details. */
+/** Safe terminal failure summaries; retry status never copies provider prose. */
 export function safeFailureContent(failure) {
   const code = SAFE_MESSAGES.has(failure?.code) ? failure.code : null;
   const status = Number.isInteger(failure?.status) && failure.status >= 100 && failure.status <= 599 ? failure.status : null;
@@ -77,15 +78,7 @@ export function turnDiagnosticRow(event, sessionId) {
         content = '本轮已结束。当前 Host 尚不能显示此结束原因的详细信息，请在 DSH 桌面查看。';
         break;
     }
-  } else if (event.type === 'llm/retry') {
-    if (!['normal', 'always'].includes(data?.mode) || !Number.isSafeInteger(data?.retry) || data.retry < 1 || !Number.isFinite(data.delayMs) || data.delayMs < 0) return null;
-    const maximum = data.mode === 'always' ? '不限' : Number.isSafeInteger(data.maxRetries) && data.maxRetries >= data.retry ? data.maxRetries : null;
-    if (maximum === null) return null;
-    content = `模型请求失败，DSH 已安排重试（${data.retry}/${maximum}），等待 ${Math.max(1, Math.ceil(data.delayMs / 1000))} 秒。${safeFailureContent(data.failure).message}`;
-  } else if (event.type === 'llm/retry-started') {
-    if (!Number.isSafeInteger(data?.retry) || data.retry < 1) return null;
-    content = `DSH 已开始第 ${data.retry} 次模型请求重试。`;
-  } else return null;
+  } else return null; // Retry events are transient run state, never transcript rows.
   const id = `${sessionId}:turn-notice:${event.seq}`;
   return { id, clientId: id, sessionId, role: 'system', toolUseId: null, agentMeta: null,
     createdAt: new Date(event.time).toISOString(), content };
@@ -103,7 +96,7 @@ export function turnStateFromEvents(events, sessionId) {
   if (!Array.isArray(events)) throw new TypeError('Native turn recovery requires a session event snapshot');
   let boundary = null;
   let nativeMetadata = null;
-  let retryNotice = null;
+  let retryPresentation = null;
   let seq = -1;
   for (const event of events) {
     if (!Number.isSafeInteger(event?.seq) || event.seq < 0 || event.seq <= seq
@@ -112,13 +105,11 @@ export function turnStateFromEvents(events, sessionId) {
     }
     seq = event.seq;
     nativeMetadata = advanceInterruptionMetadata(nativeMetadata, event, sessionId);
-    if (event.type === 'turn/start' || event.type === 'turn/end') { boundary = event; retryNotice = null; }
-    else if (['step/start', 'assistant/message'].includes(event.type)) retryNotice = null;
-    else if (boundary?.type === 'turn/start' && boundary.data?.turn === event.data?.turn
-      && ['llm/retry', 'llm/retry-started'].includes(event.type)) retryNotice = turnDiagnosticRow(event, sessionId);
+    if (event.type === 'turn/start' || event.type === 'turn/end') boundary = event;
+    retryPresentation = reduceRetryPresentation(retryPresentation, event);
   }
   if (!boundary) return null;
-  if (boundary.type === 'turn/start') return { seq, boundarySeq: boundary.seq, running: true, error: null, nativeMetadata, ...(retryNotice ? { retryNotice } : {}) };
+  if (boundary.type === 'turn/start') return { seq, boundarySeq: boundary.seq, running: true, error: null, nativeMetadata, retryPresentation };
   const diagnostic = turnDiagnosticRow(boundary, sessionId);
   const error = diagnostic?.role === 'error' ? diagnostic : null;
   // A malformed failure is not evidence of a successful ending.

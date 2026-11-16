@@ -35,15 +35,18 @@ test('user cancellation, sign-out, blocking and output limit are not process cra
   assert.match(unknown.content, /尚不能显示/); assert.doesNotMatch(unknown.content, /SECRET/);
 });
 
-test('only a scheduled native retry is visible; safe details do not invent a terminal error', () => {
-  const row = turnDiagnosticRow(retry, 's1');
-  assert.equal(row.role, 'system'); assert.match(row.content, /已安排重试.*等待 2 秒/); assert.ok(row.content.includes('1/3'));
-  assert.match(row.content, /RATE_LIMIT; HTTP 429/); assert.doesNotMatch(row.content, /SECRET/);
-  assert.equal(turnDiagnosticRow({ ...retry, type: 'assistant/attempt' }, 's1'), null);
-  const state = turnStateFromEvents([start, retry], 's1');
-  assert.equal(state.running, true); assert.equal(state.error, null); assert.equal(state.retryNotice.id, row.id);
-  assert.equal(turnStateFromEvents([start, retry, { ...end('completed'), seq: 2 }], 's1').retryNotice, undefined);
-  assert.equal(turnDiagnosticRow({ ...retry, data: { ...retry.data, retry: -1 } }, 's1'), null);
+test('scheduled and started retries are transient state, never diagnostic rows', () => {
+  const scheduled = { ...retry, data: { ...retry.data, retryId: 'r1' } };
+  const started = { ...scheduled, type: 'llm/retry-started', seq: 2, data: { turn: 1, step: 1, retryId: 'r1', retry: 1 } };
+  for (const event of [scheduled, started, { ...retry, type: 'assistant/attempt' }]) {
+    assert.equal(turnDiagnosticRow(event, 's1'), null);
+    assert.deepEqual(foldSessionEvent(event, { sessionId: 's1' }), []);
+  }
+  const state = turnStateFromEvents([start, scheduled, started], 's1');
+  assert.equal(state.running, true); assert.equal(state.error, null);
+  assert.equal(state.retryPresentation.retry.phase, 'started');
+  assert.equal(JSON.stringify(state.retryPresentation).includes('SECRET'), false);
+  assert.equal(turnStateFromEvents([start, scheduled, { ...end('completed'), seq: 2 }], 's1').retryPresentation, undefined);
 });
 
 function crashedLog() {

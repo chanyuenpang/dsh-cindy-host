@@ -22,64 +22,34 @@ function request(channel, args = [], src = 'phone-1') {
   return { v: 1, kind: 'invoke', id: 'req-1', src, payload: { channel, args } };
 }
 
-test('the list channel answers from its cache instead of blocking on a read', async () => {
-  // Measured live (2026-09-18 19:08–19:15): eighteen `local-db:sessions:list` invokes aborted
-  // with TimeoutError while a build saturated the machine, and the phone read a failed list as
-  // "the device is offline". The abort is at the invoke level, so the source's own stale-serve
-  // guard cannot see it — the channel itself must not block after the first read.
-  let clock = 1_000_000;
-  let reads = 0;
-  let gate = null;
+test('list has no settled stale page and forwards the fresh barrier', async () => {
+  const queries = []; let rows = ROWS, failed = false;
   const router = createChannelRouter({
-    listSessions: async () => {
-      reads += 1;
-      if (gate !== null) await gate;
-      return ROWS;
-    },
+    listSessions: async query => { queries.push(query); if (failed) throw new Error('source failed'); return rows; },
     subscribers: new Set(),
-    getDevice: () => ({ deviceId: 'dev-host', deviceName: 'DSH Host' }),
-    now: () => clock,
   });
-
-  // Cold start: the one read that must be awaited.
-  const first = await router(request('local-db:sessions:list'));
-  assert.equal(first.payload.ok, true);
-  assert.equal(first.payload.result.length, ROWS.length);
-  assert.equal(reads, 1);
-
-  // Within the freshness window nothing is re-read at all — a poll costs zero reads.
-  clock += 1_000;
-  const fresh = await router(request('local-db:sessions:list'));
-  assert.equal(fresh.payload.ok, true);
-  assert.equal(reads, 1, 'a fresh page is answered without any read');
-
-  // Past the window the answer still comes from the cache while one refresh runs behind it:
-  // a slow read must never become a slow probe.
-  clock += 10_000;
-  gate = new Promise((resolve) => { setTimeout(resolve, 50); });
-  const started = Date.now();
-  const stale = await router(request('local-db:sessions:list'));
-  const elapsed = Date.now() - started;
-  assert.equal(stale.payload.ok, true);
-  assert.equal(stale.payload.result.length, ROWS.length);
-  assert.ok(elapsed < 30, `a cached page must answer without waiting for the refresh (took ${elapsed}ms)`);
-  await gate;
-  await new Promise((resolve) => setImmediate(resolve));
-  assert.equal(reads, 2, 'exactly one refresh runs behind the answer');
-  gate = null;
-
-  // With no page to fall back on, a failed read still fails — and it fails the way the live Host
-  // recorded it (`handlerErrors: invoke:local-db:sessions:list … aborted`): the router lets the
-  // error out and the Host turns it into a refusal. The cache is a fallback for a slow machine,
-  // never a way to hide a Host that has never listed anything.
-  const cold = createChannelRouter({
-    listSessions: async () => { reads += 1; throw new Error('The operation was aborted due to timeout'); },
-    subscribers: new Set(),
-    getDevice: () => ({ deviceId: 'dev-host', deviceName: 'DSH Host' }),
-  });
-  await assert.rejects(() => cold(request('local-db:sessions:list')), /aborted due to timeout/);
+  assert.equal((await router(request('local-db:sessions:list'))).payload.result[0].title, 'Alpha');
+  rows = [{ ...ROWS[0], title: 'Changed' }];
+  const changed = await router(request('local-db:sessions:list', [20, 'active', { includePinned: true, fresh: true }]));
+  assert.equal(changed.payload.result[0].title, 'Changed');
+  assert.deepEqual(queries[1], { limit: 20, status: 'active', includePinned: true, fresh: true });
+  await router(request('local-db:sessions:list'));
+  assert.equal(queries.length, 3, 'only in-flight reads, never settled pages, may be shared');
+  failed = true;
+  await assert.rejects(router(request('local-db:sessions:list')), /source failed/, 'a prior success cannot hide failure');
 });
 
+
+test('an exact row completion from before invalidation cannot become a get or write echo', async () => {
+  let release, reads = 0;
+  const hold = new Promise(resolve => { release = resolve; });
+  const router = createChannelRouter({ subscribers: new Set(), listSessions: async () => ROWS,
+    getSession: async id => { if (++reads === 1) { await hold; return { ...ROWS[0], id, title: 'old' }; } return { ...ROWS[0], id, title: 'new' }; },
+  });
+  const pending = router(request('local-db:sessions:get', [String(ROWS[0].id)]));
+  await new Promise(resolve => setImmediate(resolve)); router.invalidateSessionRows(); release();
+  const reply = await pending; assert.equal(reply.payload.result.title, 'new'); assert.equal(reads, 2);
+});
 
 test('the list channel honors Cindy status, limit, and includePinned arguments', async () => {
   const rows = [

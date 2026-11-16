@@ -10,8 +10,8 @@ export class ReadOnlyProjection {
 
   async start(source) {
     this.source = source;
-    await this.rebaseline();
     this.unsubscribe = source.onEvent((event) => this.apply(event));
+    await this.rebaseline();
   }
 
   async stop() {

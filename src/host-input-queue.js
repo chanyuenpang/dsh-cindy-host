@@ -15,6 +15,8 @@
  * composer — which is why this Host emits only entries it can fill honestly.
  */
 
+import { controlProjectionUpdates } from './session-control-projections.js';
+
 /** The one agent kind this Host presents; the controller's union is closed. */
 const DSH_AGENT_KIND = 'pi';
 const DSH_MODEL = 'pi';
@@ -312,11 +314,23 @@ export function createInputQueueTracker() {
     if (frame.type === 'baseline') {
       queues.clear();
       jobs.clear();
+      for (const { sessionId, values } of controlProjectionUpdates(frame)) {
+        if (values.inbox && typeof values.inbox === 'object') setItems(sessionId, queueItemsFromInbox(values.inbox));
+        if (Array.isArray(values.jobs)) jobs.set(sessionId, values.jobs);
+      }
       for (const [sessionId, items] of Object.entries(frame.value?.queues ?? {})) {
         setItems(sessionId, items);
       }
       for (const [sessionId, entries] of Object.entries(frame.value?.jobs ?? {})) {
         if (Array.isArray(entries)) jobs.set(sessionId, entries);
+      }
+      return;
+    }
+    if (frame.type === 'projection') {
+      for (const { sessionId, values } of controlProjectionUpdates(frame)) {
+        // Absent/unavailable is not evidence of an empty native inbox.
+        if (values.inbox && typeof values.inbox === 'object') setItems(sessionId, queueItemsFromInbox(values.inbox));
+        if (Array.isArray(values.jobs)) { if (values.jobs.length) jobs.set(sessionId, values.jobs); else jobs.delete(sessionId); }
       }
       return;
     }

@@ -30,14 +30,21 @@ import { createChannelRouter, invokeError, refusalError } from './cindy-channels
 import { NATIVE_PIN_MEMBERSHIP_AT } from './dsh-session-archive.js';
 import { createApprovalRegistry } from './host-approvals.js';
 import { createInputQueueTracker, queuedRowFromController } from './host-input-queue.js';
+import { controlProjectionUpdates } from './session-control-projections.js';
+import { createNativeInboxRefresh } from './native-inbox-refresh.js';
+import { createSessionListDelivery } from './session-list-delivery.js';
+import { listEventAffectsCore } from './dsh-session-source.js';
+import { createSessionListEncoder } from './session-list-transfer.js';
 import { createProjectionTracker, toGoalStatusPayload } from './host-goals.js';
 import { ReadOnlyProjection } from './projection.js';
 import { SessionReadModel } from './session-read-model.js';
 import { ProjectionReadModelSink } from './projection-read-model-sink.js';
 import { publishLifecycle, runningStatusEvent, turnEventFor } from './session-publisher.js';
-import { createReasoningPublisher } from './reasoning-publisher.js';
+import { createReasoningPublisher, REASONING_RATE_BYTES, REASONING_BURST_BYTES } from './reasoning-publisher.js';
 import { createHistoryDeliveryState } from './history-delivery-state.js';
+import { buildHistoryWorkPatch } from './host-history-view.js';
 import { turnDiagnosticRow, turnDiagnosticPayload } from './turn-error.js';
+import { reduceRetryPresentation, retryPresentationEvent } from './retry-presentation.js';
 import { advanceInterruptionMetadata, diagnosticOwner, interruptionFields, projectDismissedErrors } from './diagnostic-presentation.js';
 import { acceptLink } from './host-authorization.js';
 import { AuthorizationPolicy } from './authorization-policy.js';
@@ -330,9 +337,11 @@ export async function startHost(initialSource, settings = DEFAULT_HOST_SETTINGS,
   const subscribers = new Set();
   /** Devices following one session's live stream: `sessionId -> Set<deviceId>`. */
   const sessionSubscribers = new Map();
-  const historyDelivery = createHistoryDeliveryState((deviceId, sessionId) =>
-    acceptedControllers.has(deviceId) && policy.canAccept(deviceId) && !sessionIsHidden(sessionId)
-      && sessionSubscribers.get(sessionId)?.has(deviceId) === true);
+  function canWatchSession(deviceId, sessionId) {
+    return !stopped && active && acceptedControllers.has(deviceId) && policy.canAccept(deviceId)
+      && !sessionIsHidden(sessionId) && sessionSubscribers.get(sessionId)?.has(deviceId) === true;
+  }
+  const historyDelivery = createHistoryDeliveryState(canWatchSession);
   /**
    * Sessions a controller has attached to at least once in this process.
    *
@@ -369,6 +378,15 @@ export async function startHost(initialSource, settings = DEFAULT_HOST_SETTINGS,
   });
   /** DSH's input queue and jobs, folded from the control stream. */
   const inputQueue = createInputQueueTracker();
+  const nativeInputRevisions = new Map(); let nativeInputBaseline = 0;
+  const nativeInboxRefresh = createNativeInboxRefresh({
+    getReader: () => options.resolveCapabilities?.()?.readSessionState,
+    version: id => generation + ':' + nativeInputBaseline + ':' + (nativeInputRevisions.get(id) ?? 0),
+    current: () => !stopped,
+    adopt: (id, items) => inputQueue.adopt(id, items),
+    publish: id => pushSessionUpdate(id, 'maker:input:projection', inputQueue.projectionFor(id, sessionRowFor(id))),
+    onError: error => recordHandlerError('native-inbox-refresh', error),
+  });
   /** Session projections off the same stream — notably `goal`. */
   const projections = createProjectionTracker();
   const acceptedControllers = new Set();
@@ -784,6 +802,37 @@ export async function startHost(initialSource, settings = DEFAULT_HOST_SETTINGS,
    */
   async function ensureProjection() {
     if (projection !== null || source === undefined || source === null) return;
+    if (source.listView) {
+      const owner = source, revision = sourceRevision;
+      const updateModel = () => { if (stopped || source !== owner || sourceRevision !== revision) return; model.rows = new Map(owner.snapshotRows().map(row => [row.id,
+        { sessionId: row.id, title: row.title, phase: row.running ? 'running' : 'idle', updatedAt: row.updatedAt }])); };
+      const offRows = owner.onListChange(event => {
+        if (stopped || source !== owner || sourceRevision !== revision) return;
+        if (listEventAffectsCore(event)) { routeInvoke.invalidateSessionRows(); updateModel(); }
+        if (event.kind === 'ready' || event.kind === 'scope') { listDelivery.reseed(subscribers); return; }
+        if (!event.row) {
+          publishRowPatch(event.sessionId, { status: 'deleted', ...(event.previous ? { updatedAt: event.previous.updatedAt, lastActivityAt: event.previous.lastActivityAt } : {}) }); listDelivery.reseed(subscribers); return;
+        }
+        if (event.initial) return;
+        const [row] = projectSessionRows([owner.peekSession(event.sessionId) ?? event.row]);
+        if (row.blank || !row.title) return;
+        const wire = routeInvoke.sessionWireRow(row);
+        const previous = event.previous && routeInvoke.sessionWireRow(projectSessionRows([event.previous])[0]);
+        const fields = ['title', 'updatedAt', 'lastActivityAt', 'status', 'pinnedAt', 'userSendAt', '_count',
+          'model', 'agentKind', 'providerId', 'effort', 'permissionMode', 'running', 'workingDir', 'workspaceKind',
+          'activeTurnStartedAt', 'interruptedTurnStartedAt', 'lastTurnEndedAt', 'clearedAt'];
+        const patch = {};
+        for (const key of fields) if (!previous || JSON.stringify(wire[key]) !== JSON.stringify(previous[key])) patch[key] = wire[key] ?? null;
+        if (Object.keys(patch).length) publishRowPatch(event.sessionId, patch);
+        if (event.discovered) listDelivery.created(subscribers, event.sessionId);
+        if (event.discovered || !previous || ['updatedAt', 'status', 'pinnedAt'].some(key => Object.hasOwn(patch, key))) listDelivery.reseed(subscribers);
+      });
+      const offActivity = owner.onEvent(item => { if (source === owner && sourceRevision === revision) publishTurnEvent(item); });
+      projection = { stop() { offRows(); offActivity(); } };
+      // Baseline recovery must not hold relay setup or subscribe acknowledgement hostage.
+      void owner.listSessions({ evidence: false }).then(updateModel).catch(error => recordHandlerError('session-list-baseline', error));
+      return;
+    }
     projection = new ReadOnlyProjection(new ProjectionReadModelSink(model, (item) => {
       // List-level pushes are recorded through the same tally as session-scoped
       // ones: a running badge on the session list depends on them, so they must
@@ -837,6 +886,7 @@ export async function startHost(initialSource, settings = DEFAULT_HOST_SETTINGS,
     }
     const turn = turnEventFor(item);
     if (turn === null) return;
+    if (item.phase === 'waiting') clearRetryProgress(item.sessionId);
     pushSessionUpdate(turn.payload.sessionId, turn.channel, turn.payload);
   }
 
@@ -850,8 +900,12 @@ export async function startHost(initialSource, settings = DEFAULT_HOST_SETTINGS,
    */
   async function setSource(next) {
     if (source !== next) {
+      listDelivery.clear(); listPeerLeases.clear();
+      clearLiveAssistantWatches();
+      historyDelivery.clear();
       sourceRevision++;
       nativeBoundaries.clear();
+      retryPresentations.clear();
       interruptionStates.clear();
       nativePresentationMetadata.clear();
       turnVersions.clear();
@@ -871,6 +925,7 @@ export async function startHost(initialSource, settings = DEFAULT_HOST_SETTINGS,
     sessionRowCache.clear();
     observeArchiveSource();
     observeRemindersSource();
+    syncLiveAssistantWatchers();
     if (projection !== null) {
       const closing = projection;
       projection = null;
@@ -985,11 +1040,38 @@ export async function startHost(initialSource, settings = DEFAULT_HOST_SETTINGS,
   const subscriptionLeases = new Map();
   const nativeBoundaries = new Map();
   const turnVersions = new Map();
+  const retryPresentations = new Map();
+  function noteRetryPresentation(sessionId, event) {
+    const previous = retryPresentations.get(sessionId);
+    const next = reduceRetryPresentation(previous, event);
+    if (next === previous) return false;
+    retryPresentations.set(sessionId, next);
+    // Includes progress clears: an awaited old recovery may not revive a retry.
+    turnVersions.set(sessionId, (turnVersions.get(sessionId) ?? 0) + 1);
+    return true;
+  }
+  function clearRetryProgress(sessionId) {
+    const state = retryPresentations.get(sessionId);
+    if (!state?.retry) return;
+    retryPresentations.set(sessionId, { ...state, retry: null });
+    turnVersions.set(sessionId, (turnVersions.get(sessionId) ?? 0) + 1);
+    return true;
+  }
+  function runningEvents(sessionId, event = runningStatusEvent()) {
+    // Neutral summary/link status must not permanently erase native retry progress.
+    const retry = event.data?.status === 'running' ? retryPresentationEvent(retryPresentations.get(sessionId)) : null;
+    return retry ? [event, retry] : [event];
+  }
 
   function renewTurnLease(deviceId, sessionId) {
     const key = terminalAnnounceKey(deviceId, sessionId);
     subscriptionLeases.set(key, (subscriptionLeases.get(key) ?? 0) + 1);
     terminalIdentities.delete(key);
+    historyDelivery.forget(deviceId, sessionId);
+    const live = liveAssistantWatches.get(sessionId);
+    if (live) rememberNativeDelivery(sessionId, deviceId, live.delivered.get(deviceId), live.owner);
+    live?.delivered.delete(deviceId);
+    live?.notices.delete(deviceId);
   }
   const TERMINAL_ANNOUNCE_WINDOW_MS = 30_000;
   /**
@@ -1080,9 +1162,19 @@ export async function startHost(initialSource, settings = DEFAULT_HOST_SETTINGS,
       publishRowPatch(sessionId, presentationFields(sessionId, live.running));
       if (live.running) {
         setCachedRunning(sessionId, true);
-        const payload = { sessionId, event: runningStatusEvent(state.retryNotice?.content ?? 'running') };
-        recordPush(sessionId, 'maker:event', 1, payload);
-        send({ v: PROTOCOL_VERSION, kind: 'push', dst: deviceId, payload: { channel: 'maker:event', payload } });
+        const known = retryPresentations.get(sessionId);
+        // A native live-output/input-wait clear can be newer than this log's retry
+        // without appending another committed event yet. Do not undo it on resubscribe.
+        if (!known || (state.retryPresentation?.seq ?? state.seq) > known.seq) {
+          if (state.running && state.retryPresentation) retryPresentations.set(sessionId, state.retryPresentation);
+          else retryPresentations.delete(sessionId);
+        }
+        // Establish the maker turn gate first; nonterminal error only sets wide running.
+        for (const event of runningEvents(sessionId)) {
+          const payload = { sessionId, event };
+          recordPush(sessionId, 'maker:event', 1, payload);
+          send({ v: PROTOCOL_VERSION, kind: 'push', dst: deviceId, payload: { channel: 'maker:event', payload } });
+        }
         return;
       }
       if (state.running) return; // An unfinished historical turn is not live-registry evidence.
@@ -1165,12 +1257,14 @@ export async function startHost(initialSource, settings = DEFAULT_HOST_SETTINGS,
    */
   function markDeviceReachable(deviceId) {
     if (!offlineDevices.delete(deviceId)) return [];
+    if (source?.listView) listDelivery.recover(deviceId);
     const sessions = [...(watchedSessionsByDevice.get(deviceId) ?? [])];
     for (const sessionId of sessions) {
       announceWatchedTurnState(deviceId, sessionId);
       pushHistoryViewChanged(sessionId);
       replayUserQuestions(sessionId);
     }
+    syncLiveAssistantWatchers();
     return sessions;
   }
 
@@ -1206,6 +1300,7 @@ export async function startHost(initialSource, settings = DEFAULT_HOST_SETTINGS,
     const known = status.snapshot().devices.find((device) => device.deviceId === deviceId);
     acceptedControllers.add(deviceId);
     observeRemindersSource();
+    syncLiveAssistantWatchers();
     status.upsertDevice(deviceId, { isController: true, linkedAt: now().toISOString(), online: true });
     status.refreshConnectionState();
     // A device that linked with no presence broadcast is a bare id until the
@@ -1252,6 +1347,7 @@ export async function startHost(initialSource, settings = DEFAULT_HOST_SETTINGS,
         acceptedControllers.delete(deviceId);
         historyDelivery.forget(deviceId);
         observeRemindersSource();
+        syncLiveAssistantWatchers();
         subscribers.delete(deviceId);
         status.removeDevice(deviceId);
         status.refreshConnectionState();
@@ -1300,7 +1396,9 @@ export async function startHost(initialSource, settings = DEFAULT_HOST_SETTINGS,
   function subscribeTopics(deviceId, topics) {
     for (const topic of topics) {
       if (topic === 'sessions') {
+        if (!subscribers.has(deviceId)) listPeerLeases.set(deviceId, (listPeerLeases.get(deviceId) ?? 0) + 1);
         subscribers.add(deviceId);
+        if (source?.listView) listDelivery.subscribe(deviceId);
         // Remembered for the same reason a session topic is (the device's turn state has to be
         // announced when it speaks again). Nothing reads it today: it existed to hand the topic
         // back to a device that had been dropped for being unreachable, and that drop is gone.
@@ -1322,6 +1420,7 @@ export async function startHost(initialSource, settings = DEFAULT_HOST_SETTINGS,
         replayUserQuestions(sessionId);
       }
     }
+    syncLiveAssistantWatchers();
   }
 
   function unsubscribeTopics(deviceId, topics) {
@@ -1337,16 +1436,23 @@ export async function startHost(initialSource, settings = DEFAULT_HOST_SETTINGS,
         if (devices.size === 0) sessionSubscribers.delete(sessionId);
       }
     }
+    listPeerLeases.set(deviceId, (listPeerLeases.get(deviceId) ?? 0) + 1);
+    listDelivery.forget(deviceId);
+    if (source?.listView) listDelivery.recover(deviceId);
+    syncLiveAssistantWatchers();
   }
 
   /** Drop every subscription a device holds, on disconnect. */
   function forgetSubscriptions(deviceId) {
+    listPeerLeases.set(deviceId, (listPeerLeases.get(deviceId) ?? 0) + 1);
+    listDelivery.forget(deviceId);
     historyDelivery.forget(deviceId);
     subscribers.delete(deviceId);
     for (const [sessionId, devices] of sessionSubscribers) {
       devices.delete(deviceId);
       if (devices.size === 0) sessionSubscribers.delete(sessionId);
     }
+    syncLiveAssistantWatchers();
   }
 
   /** How many controllers are following one session's live stream. */
@@ -1471,11 +1577,9 @@ export async function startHost(initialSource, settings = DEFAULT_HOST_SETTINGS,
    */
   function pushSessionUpdate(sessionId, channel, payload) {
     if (channel === 'maker:input:projection' && activeDelivery) payload = activeDelivery.currentProjection(sessionId, [], payload);
-    const guarded = channel === 'local-db:messages:created' || channel === 'maker:event';
     const thinking = channel === 'local-db:messages:created' && payload?.message?.role === 'thinking';
-    const devices = guarded
-      ? new Set([...(sessionSubscribers.get(sessionId) ?? [])].filter(id => !sessionIsHidden(sessionId) && acceptedControllers.has(id) && policy.canAccept(id)))
-      : sessionSubscribers.get(sessionId);
+    // Deletions, patches and invalidations have the same authorization boundary as body text.
+    const devices = new Set([...(sessionSubscribers.get(sessionId) ?? [])].filter(id => canWatchSession(id, sessionId)));
     // Only a successfully delivered view opts this controller out of raw thinking.
     if (thinking && devices) for (const deviceId of devices) {
       if (historyDelivery.ready(deviceId, sessionId)) devices.delete(deviceId);
@@ -1486,6 +1590,10 @@ export async function startHost(initialSource, settings = DEFAULT_HOST_SETTINGS,
     if (watchers === 0) return;
     for (const deviceId of devices) {
       send({ v: PROTOCOL_VERSION, kind: 'push', dst: deviceId, payload: { channel, payload } });
+    }
+    if (channel === 'maker:event' && payload?.event?.type === 'status' && payload.event.data?.isRunning === true) {
+      const retry = runningEvents(sessionId, payload.event)[1];
+      if (retry) pushSessionUpdate(sessionId, channel, { sessionId, event: retry });
     }
   }
 
@@ -1511,14 +1619,364 @@ export async function startHost(initialSource, settings = DEFAULT_HOST_SETTINGS,
     setTimeout: setTimeoutImpl, clearTimeout: clearTimeoutImpl,
   });
 
+  // Native content has one short-window scheduler, shared by all controllers of a session.
+  // The source owns assembly; these maps contain only disposable transport receipts.
+  const liveAssistantWatches = new Map();
+  // Reconnect receipts are bounded, account/realm/Host-bound, and never a transcript cache.
+  const nativeRetirements = new Map();
+  function nativeOwner() {
+    const host = status.snapshot().host;
+    return host?.userId && host?.deviceId
+      ? JSON.stringify([mediaBase, normalizeAuthBaseUrl(socketSession?.authBaseUrl), host.userId, host.deviceId]) : null;
+  }
+  function rememberNativeDelivery(sessionId, deviceId, delivered, owner) {
+    if (!owner || !delivered?.rows.size) return;
+    const bytes = [...delivered.rows.values()].reduce((sum, row) => sum + Buffer.byteLength(row.text, 'utf8') + 256, 0);
+    if (bytes > 1024 * 1024) {
+      recordHandlerError('live-retirement-budget', new Error('Retirement receipt exceeds 1MiB; explicit history repair required'));
+      return;
+    }
+    const key = terminalAnnounceKey(deviceId, sessionId);
+    nativeRetirements.delete(key);
+    nativeRetirements.set(key, { owner, delivered, bytes });
+    let total = [...nativeRetirements.values()].reduce((sum, receipt) => sum + receipt.bytes, 0);
+    while (nativeRetirements.size > 32 || total > 4 * 1024 * 1024) {
+      const oldest = nativeRetirements.keys().next().value;
+      total -= nativeRetirements.get(oldest).bytes;
+      nativeRetirements.delete(oldest);
+      recordHandlerError('live-retirement-budget', new Error('Old retirement receipt evicted; explicit history repair required'));
+    }
+  }
+  const NATIVE_SYNC_MS = 50;
+  const NATIVE_RAW_BYTES = 64 * 1024;
+  const NATIVE_TEXT_BATCH_BYTES = 256 * 1024;
+  const EXPANDED_REFRESH_MS = 500;
+  function sendSessionTo(deviceId, sessionId, channel, payload) {
+    if (!canWatchSession(deviceId, sessionId)) return false;
+    recordPush(sessionId, channel, offlineDevices.has(deviceId) ? 0 : 1, payload);
+    const sent = send({ v: PROTOCOL_VERSION, kind: 'push', dst: deviceId, payload: { channel, payload } });
+    // A delayed old-attempt full-prefix retirement barrier is still a text event
+    // to Cindy. It clears reconnectAttempt, but is not evidence of model recovery.
+    if (sent && channel === 'maker:event' && payload?.event?.type === 'text') {
+      const retry = retryPresentationEvent(retryPresentations.get(sessionId));
+      if (retry) sendSessionTo(deviceId, sessionId, channel, { sessionId, event: retry });
+    }
+    return sent;
+  }
+  function liveWatchCurrent(sessionId, state) {
+    return !stopped && active && liveAssistantWatches.get(sessionId) === state
+      && !state.abort.signal.aborted && generation === state.generation && sourceRevision === state.sourceRevision
+      && state.owner !== null && state.owner === nativeOwner()
+      && options.resolveCapabilities?.()?.liveAssistant === state.port;
+  }
+  function dropLiveAssistantWatch(sessionId) {
+    const state = liveAssistantWatches.get(sessionId);
+    if (!state) return;
+    // Retire against the old source before aborting it. Failed/offline sends retain a bounded receipt.
+    for (const [deviceId, delivered] of state.delivered) rememberNativeDelivery(sessionId, deviceId, delivered, state.owner);
+    state.rows = [];
+    if (state.owner === nativeOwner()) publishLiveRows(sessionId, state);
+    for (const [key, receipt] of nativeRetirements) if (!receipt.delivered.rows.size) nativeRetirements.delete(key);
+    liveAssistantWatches.delete(sessionId);
+    if (state.timer !== null) clearTimeoutImpl(state.timer);
+    if (state.detailTimer !== null) clearTimeoutImpl(state.detailTimer);
+    state.abort.abort();
+    try { state.dispose?.(); } catch (error) { recordHandlerError('live-assistant-dispose', error); }
+  }
+  function clearLiveAssistantWatches() {
+    for (const sessionId of liveAssistantWatches.keys()) dropLiveAssistantWatch(sessionId);
+  }
+  function scheduleLiveAssistant(sessionId, state, immediate = false, delay = NATIVE_SYNC_MS) {
+    if (!liveWatchCurrent(sessionId, state)) return;
+    if (immediate) {
+      if (state.timer !== null) clearTimeoutImpl(state.timer);
+      state.timer = null;
+      flushLiveAssistant(sessionId, state);
+    } else if (state.timer === null || state.timerAt > Number(now()) + delay) {
+      if (state.timer !== null) clearTimeoutImpl(state.timer);
+      state.timerAt = Number(now()) + delay;
+      state.timer = setTimeoutImpl(() => {
+        state.timer = null;
+        flushLiveAssistant(sessionId, state);
+      }, delay);
+      state.timer?.unref?.();
+    }
+  }
+  function nativeDelivery(sessionId, state, deviceId) {
+    const lease = subscriptionLeases.get(terminalAnnounceKey(deviceId, sessionId));
+    let delivered = state.delivered.get(deviceId);
+    if (!delivered || delivered.lease !== lease) {
+      const key = terminalAnnounceKey(deviceId, sessionId);
+      const receipt = nativeRetirements.get(key);
+      nativeRetirements.delete(key);
+      delivered = receipt?.owner === state.owner ? receipt.delivered : { rows: new Map(), waitingDurable: new Set(), detailRevision: null, detailAt: -Infinity };
+      Object.assign(delivered, { lease, tokens: REASONING_BURST_BYTES, tokenAt: Number(now()) });
+      state.delivered.set(deviceId, delivered);
+    }
+    return delivered;
+  }
+  function sendNativeNotice(sessionId, state, deviceId) {
+    const stamp = `${state.eventVersion}:${state.historyRevision}`;
+    if (state.notices.get(deviceId) === stamp) return false;
+    const receipt = historyDelivery.capture(deviceId, sessionId);
+    if (!sendSessionTo(deviceId, sessionId, 'maker:history-view-changed', { sessionId })) return false;
+    state.notices.set(deviceId, stamp);
+    if (receipt) historyDelivery.invalidate(receipt);
+    return true;
+  }
+  function publishLiveRows(sessionId, state) {
+    let rawRetryMs = Infinity;
+    const ids = new Set(state.rows.map(row => row.clientId ?? row.id));
+    for (const deviceId of sessionSubscribers.get(sessionId) ?? []) {
+      if (!canWatchSession(deviceId, sessionId)) {
+        rememberNativeDelivery(sessionId, deviceId, state.delivered.get(deviceId), state.owner);
+        state.delivered.delete(deviceId); continue;
+      }
+      const delivered = nativeDelivery(sessionId, state, deviceId);
+      const clock = Number(now());
+      delivered.tokens = Math.min(REASONING_BURST_BYTES, delivered.tokens + Math.max(0, clock - delivered.tokenAt) * REASONING_RATE_BYTES / 1000);
+      delivered.tokenAt = clock;
+      for (const id of delivered.waitingDurable) if (!ids.has(id) && !delivered.rows.has(id)) delivered.waitingDurable.delete(id);
+      const removed = [...delivered.rows.keys()].filter(id => !ids.has(id)).filter(id => {
+        const row = delivered.rows.get(id);
+        if (row.role !== 'assistant') return true;
+        // Mobile queues text deltas for 32ms; a non-delta full snapshot flushes that queue BEFORE deletion.
+        // Using the actually sent prefix (not a truncated or future body) prevents a queued delta resurrecting this id.
+        const barrier = { sessionId, persistId: id, event: { type: 'text', data: {
+          text: row.text, isFullText: true, isFinal: false, createdAt: row.createdAt } } };
+        if (sendSessionTo(deviceId, sessionId, 'maker:event', barrier)) return true;
+        if (!delivered.waitingDurable.has(id)) {
+          delivered.waitingDurable.add(id); state.oversizedRepairs++;
+          recordHandlerError('live-retirement-repair', new Error('Live retirement barrier not delivered; synchronize again'));
+          sendNativeNotice(sessionId, state, deviceId);
+        }
+        return false;
+      });
+      if (removed.length && sendSessionTo(deviceId, sessionId, 'local-db:messages:deleted', { sessionId, clientIds: removed })) {
+        for (const id of removed) { delivered.rows.delete(id); delivered.waitingDurable.delete(id); }
+      }
+      for (const row of state.rows) {
+        const id = row.clientId ?? row.id;
+        if (typeof id !== 'string') continue;
+        const previous = delivered.rows.get(id);
+        if (row.role === 'thinking') {
+          if (historyDelivery.ready(deviceId, sessionId)) continue;
+          const text = row.content?.text;
+          const isStreaming = row.content?.isStreaming === true;
+          if (typeof text !== 'string' || (previous?.text === text && previous.isStreaming === isStreaming)) continue;
+          const payload = { sessionId, message: row };
+          const bytes = frameByteLength(payload);
+          if (bytes > NATIVE_RAW_BYTES) continue; // Never label a truncated body full.
+          if (bytes > delivered.tokens) {
+            rawRetryMs = Math.min(rawRetryMs, Math.ceil((bytes - delivered.tokens) * 1000 / REASONING_RATE_BYTES));
+            continue;
+          }
+          if (sendSessionTo(deviceId, sessionId, 'local-db:messages:created', payload)) {
+            delivered.tokens -= bytes;
+            delivered.rows.set(id, { text, role: row.role, isStreaming });
+          }
+        } else if (row.role === 'assistant') {
+          const text = typeof row.content === 'string' ? row.content : row.content?.text;
+          if (typeof text !== 'string' || previous?.text === text) continue;
+          const append = previous && text.startsWith(previous.text);
+          let remaining = append ? text.slice(previous.text.length) : text;
+          if (Buffer.byteLength(remaining, 'utf8') > NATIVE_TEXT_BATCH_BYTES) {
+            // History deliberately omits live body text. This is waiting-for-durable, NOT a successful repair.
+            // Emit one bounded diagnostic/notice per block+controller lease, never a truncated full prefix.
+            if (!delivered.waitingDurable.has(id)) {
+              delivered.waitingDurable.add(id); state.oversizedRepairs++;
+              sendNativeNotice(sessionId, state, deviceId);
+              recordHandlerError('live-assistant-waiting-durable', new Error('Live text exceeds repair budget; waiting-durable'));
+            }
+            continue;
+          }
+          delivered.waitingDurable.delete(id);
+          if (!append) {
+            const payload = { sessionId, persistId: id, event: { type: 'text', data: {
+              text, isFullText: true, isFinal: false, createdAt: row.createdAt } } };
+            if (sendSessionTo(deviceId, sessionId, 'maker:event', payload)) delivered.rows.set(id, { text, role: row.role, createdAt: row.createdAt });
+          } else while (remaining.length) {
+            // 12K UTF-16 units fit even for all multibyte text. Do not split a surrogate pair.
+            let end = Math.min(12 * 1024, remaining.length);
+            if (end < remaining.length && /[\uD800-\uDBFF]/.test(remaining[end - 1])) end--;
+            const delta = remaining.slice(0, end);
+            if (!sendSessionTo(deviceId, sessionId, 'maker:event', { sessionId, persistId: id,
+              event: { type: 'text', data: { text: delta, isFinal: false } } })) break;
+            const sentText = (delivered.rows.get(id)?.text ?? '') + delta;
+            delivered.rows.set(id, { text: sentText, role: row.role, createdAt: row.createdAt });
+            remaining = remaining.slice(end);
+          }
+        }
+      }
+    }
+    if (Number.isFinite(rawRetryMs)) scheduleLiveAssistant(sessionId, state, false, Math.max(NATIVE_SYNC_MS, rawRetryMs));
+  }
+  async function syncNativeHistory(sessionId, state) {
+    if (!liveWatchCurrent(sessionId, state) || !state.historyDirty) return;
+    // Cancellation/retirement never waits behind a slow candidate read.
+    if (state.structural) {
+      if (state.detailTimer !== null) clearTimeoutImpl(state.detailTimer);
+      state.detailTimer = null;
+      state.structural = false; state.historyDirty = false;
+      for (const deviceId of sessionSubscribers.get(sessionId) ?? []) {
+        sendNativeNotice(sessionId, state, deviceId);
+      }
+      return;
+    }
+    if (state.historyFlight) { state.historyAgain = true; return; }
+    state.historyFlight = true;
+    state.historyDirty = false;
+    const revision = state.historyRevision;
+    const view = options.resolveCapabilities?.()?.historyView;
+    const devices = [...(sessionSubscribers.get(sessionId) ?? [])].filter(id => canWatchSession(id, sessionId));
+    const leases = devices.map(deviceId => ({ deviceId, receipt: historyDelivery.capture(deviceId, sessionId),
+      subscription: subscriptionLeases.get(terminalAnnounceKey(deviceId, sessionId)) }));
+    const valid = entry => liveWatchCurrent(sessionId, state) && state.historyRevision === revision
+      && options.resolveCapabilities?.()?.historyView === view && canWatchSession(entry.deviceId, sessionId)
+      && subscriptionLeases.get(terminalAnnounceKey(entry.deviceId, sessionId)) === entry.subscription
+      && (entry.receipt ? historyDelivery.current(entry.receipt) : !historyDelivery.capture(entry.deviceId, sessionId));
+    try {
+      // One immutable candidate per session/batch, never one transcript computation per phone.
+      let candidate = null;
+      if (typeof view?.page === 'function' && leases.some(entry => entry.receipt?.workLines && (entry.receipt?.page || entry.receipt?.expanded?.length))) {
+        const result = await view.page(sessionId, undefined, { workLines: true });
+        if (result?.ok === true) candidate = result.result;
+      }
+      for (const entry of leases) {
+        if (!valid(entry)) continue;
+        const lease = entry.receipt;
+        const delivery = nativeDelivery(sessionId, state, entry.deviceId);
+        const expanded = lease?.expanded?.length > 0;
+        const work = candidate?.items?.find(item => item.type === 'work' && lease?.expanded?.includes(item.key));
+        const detailChanged = expanded && work?.summary?.revision !== undefined && work.summary.revision !== delivery.detailRevision;
+        // Expanded bodies have their own bounded refresh cadence; a notice replaces (never accompanies) a patch.
+        if (expanded && work) {
+          const delay = EXPANDED_REFRESH_MS - (Number(now()) - delivery.detailAt);
+          if (detailChanged && delay <= 0) {
+            if (sendNativeNotice(sessionId, state, entry.deviceId)) {
+              delivery.detailAt = Number(now()); delivery.detailRevision = work.summary.revision;
+            }
+          } else if (detailChanged && state.detailTimer === null) {
+            // A final hidden-body change still gets a trailing detail refresh when chunks stop.
+            state.detailTimer = setTimeoutImpl(() => {
+              state.detailTimer = null;
+              if (!liveWatchCurrent(sessionId, state)) return;
+              state.historyDirty = true;
+              scheduleLiveAssistant(sessionId, state, true);
+            }, delay);
+            state.detailTimer?.unref?.();
+          }
+          continue;
+        }
+        const result = lease?.workLines && lease.page && candidate
+          ? buildHistoryWorkPatch(sessionId, lease.page, candidate) : { kind: 'refresh' };
+        if (result.kind === 'unchanged') continue;
+        if (result.kind === 'patch') {
+          if (valid(entry) && sendSessionTo(entry.deviceId, sessionId, 'maker:history-work-patch', result.patch)) {
+            const next = { ...lease.page, items: lease.page.items.map(item => item.key === result.patch.item.key ? result.patch.item : item) };
+            historyDelivery.acceptPatch(lease, next);
+          }
+        } else sendNativeNotice(sessionId, state, entry.deviceId);
+      }
+    } catch (error) {
+      if (liveWatchCurrent(sessionId, state)) {
+        recordHandlerError('native-history-sync', error);
+        for (const entry of leases) if (valid(entry)) {
+          sendNativeNotice(sessionId, state, entry.deviceId);
+        }
+      }
+    } finally {
+      state.historyFlight = false;
+      if (state.historyAgain || state.historyDirty) {
+        state.historyAgain = false;
+        scheduleLiveAssistant(sessionId, state);
+      }
+    }
+  }
+  function flushLiveAssistant(sessionId, state) {
+    if (!liveWatchCurrent(sessionId, state)) return;
+    publishLiveRows(sessionId, state);
+    void syncNativeHistory(sessionId, state);
+  }
+  /** Reconcile late capability/source activation and watcher/authorization lifecycle. No IO is awaited. */
+  function syncLiveAssistantWatchers() {
+    const port = options.resolveCapabilities?.()?.liveAssistant;
+    for (const [sessionId, state] of liveAssistantWatches) {
+      if (!liveWatchCurrent(sessionId, state) || ![...(sessionSubscribers.get(sessionId) ?? [])].some(id => canWatchSession(id, sessionId))) {
+        dropLiveAssistantWatch(sessionId);
+      } else {
+        for (const deviceId of state.delivered.keys()) if (!canWatchSession(deviceId, sessionId)) {
+          rememberNativeDelivery(sessionId, deviceId, state.delivered.get(deviceId), state.owner);
+          state.delivered.delete(deviceId);
+        }
+      }
+    }
+    if (!active || stopped || !nativeOwner() || typeof port?.watch !== 'function') return;
+    for (const [sessionId, devices] of sessionSubscribers) {
+      if (![...devices].some(id => canWatchSession(id, sessionId))) continue;
+      let state = liveAssistantWatches.get(sessionId);
+      if (state) { scheduleLiveAssistant(sessionId, state, true); continue; }
+      state = { port, owner: nativeOwner(), generation, sourceRevision, abort: new AbortController(), dispose: null, timer: null, timerAt: 0, detailTimer: null,
+        rows: [], delivered: new Map(), notices: new Map(), eventVersion: 0, oversizedRepairs: 0, historyDirty: false, historyRevision: 0, structural: false,
+        historyFlight: false, historyAgain: false };
+      liveAssistantWatches.set(sessionId, state);
+      const oldTimer = historyViewPushes.get(sessionId);
+      if (oldTimer !== undefined) { clearTimeoutImpl(oldTimer); historyViewPushes.delete(sessionId); }
+      try {
+        const dispose = port.watch(sessionId, change => {
+          if (!liveWatchCurrent(sessionId, state) || !Array.isArray(change?.rows)) return;
+          const previousIds = state.rows.map(row => row.clientId ?? row.id);
+          state.rows = change.rows; state.eventVersion++;
+          const retryState = retryPresentations.get(sessionId);
+          const attempt = change.attempt;
+          const newerAttempt = retryState?.retry && attempt?.turn === retryState.turn
+            && Number.isSafeInteger(attempt.startedAfterSeq) && attempt.startedAfterSeq >= retryState.seq;
+          if (newerAttempt && state.rows.some(row => ['assistant', 'thinking'].includes(row.role)
+            && (typeof row.content === 'string' ? row.content : row.content?.text)?.length > 0) && clearRetryProgress(sessionId)) {
+            pushSessionUpdate(sessionId, 'maker:event', { sessionId, event: runningStatusEvent() });
+          }
+          const ids = new Set(state.rows.map(row => row.clientId ?? row.id));
+          const retired = previousIds.some(id => !ids.has(id));
+          if (change.historyChanged !== false || retired) {
+            state.historyDirty = true; state.historyRevision++;
+            state.structural ||= retired || (change.immediate === true && state.rows.length === 0);
+            historyDelivery.changed(sessionId);
+          }
+          scheduleLiveAssistant(sessionId, state, change.immediate === true || retired);
+        }, state.abort.signal);
+        if (typeof dispose === 'function') state.dispose = dispose;
+        else if (dispose?.then) void dispose.then(fn => {
+          if (typeof fn !== 'function') return;
+          if (liveWatchCurrent(sessionId, state)) state.dispose = fn; else fn();
+        }).catch(error => { if (liveWatchCurrent(sessionId, state)) recordHandlerError('live-assistant-watch', error); });
+      } catch (error) {
+        dropLiveAssistantWatch(sessionId);
+        recordHandlerError('live-assistant-watch', error);
+      }
+    }
+  }
+
   /**
    * Tell the controllers watching a session that its history view changed.
    * @param sessionId - the session whose projection changed.
    */
-  function pushHistoryViewChanged(sessionId) {
+  function pushHistoryViewChanged(sessionId, immediate = false) {
     if (typeof sessionId !== 'string' || sessionId === '') return;
     historyDelivery.changed(sessionId);
     if (watchersFor(sessionId) === 0) return;
+    const native = liveAssistantWatches.get(sessionId);
+    if (native) {
+      native.historyDirty = true; native.historyRevision++; native.eventVersion++; native.structural ||= immediate;
+      scheduleLiveAssistant(sessionId, native, immediate);
+      return;
+    }
+    if (immediate) {
+      const pending = historyViewPushes.get(sessionId);
+      if (pending !== undefined) clearTimeoutImpl(pending);
+      historyViewPushes.delete(sessionId);
+      pushSessionUpdate(sessionId, 'maker:history-view-changed', { sessionId });
+      return;
+    }
     if (historyViewPushes.has(sessionId)) return;
     const timer = setTimeoutImpl(() => {
       historyViewPushes.delete(sessionId);
@@ -1597,8 +2055,27 @@ export async function startHost(initialSource, settings = DEFAULT_HOST_SETTINGS,
    */
   const sessionRowCache = new Map();
   function sessionRowFor(sessionId) {
-    return sessionRowCache.get(sessionId);
+    // Native list sources own their rows. This map is only for legacy fixture/API sources.
+    return source?.listView ? source.peekSession(sessionId) : sessionRowCache.get(sessionId);
   }
+  const listPeerLeases = new Map();
+  const listEncoder = createSessionListEncoder(options.listTransferOptions);
+  const listDelivery = createSessionListDelivery({
+    stamp: id => `${generation}:${sourceRevision}:${listPeerLeases.get(id) ?? 0}:${current?.controllers?.[id]?.grantRevision ?? 0}`,
+    eligible: id => !stopped && active && acceptedControllers.has(id) && policy.canAccept(id)
+      && (subscribers.has(id) || [...sessionSubscribers.values()].some(devices => devices.has(id))),
+    // No generic invalidation is enabled merely because a peer claims a version.
+    // The integration owner must supply recorded target-consumer validation.
+    reseedValidated: id => subscribers.has(id) && options.listReseedValidated?.(id) === true,
+    send: (id, channel, payload) => {
+      if (ws?.bufferedAmount > 8 * 1024 * 1024) return false;
+      const sent = send({ v: PROTOCOL_VERSION, kind: 'push', dst: id, payload: { channel, payload } });
+      if (sent) recordPush(payload.sessionId ?? null, channel, 1, payload);
+      return sent;
+    },
+    now: () => now().getTime(),
+    ...(options.listDeliveryOptions ?? {}),
+  });
 
   let deliveryNamespace = options.inputDeliveryNamespace ?? null;
   var activeDelivery = null;
@@ -1652,25 +2129,29 @@ export async function startHost(initialSource, settings = DEFAULT_HOST_SETTINGS,
 
   const routeInvoke = createChannelRouter({
     getSession: async (sessionId) => {
-      if (source == null) throw new Error('no DSH session source is attached');
-      const row = typeof source.getSession === 'function'
-        ? await source.getSession(sessionId)
-        : (await source.listSessions()).find((candidate) => String(candidate.id) === sessionId);
+      const owner = source, revision = sourceRevision, connection = generation;
+      if (owner == null) throw new Error('no DSH session source is attached');
+      const row = typeof owner.getSession === 'function'
+        ? await owner.getSession(sessionId)
+        : (await owner.listSessions()).find(candidate => String(candidate.id) === sessionId);
+      if (source !== owner || revision !== sourceRevision || connection !== generation) throw refusalError('NOT_AVAILABLE', 'Session source changed');
       if (row == null) return undefined;
       await refreshInterruption(sessionId, row);
-      const [flagged] = projectSessionRows([row]);
-      if (flagged !== undefined) sessionRowCache.set(String(flagged.id), flagged);
+      if (source !== owner || revision !== sourceRevision || connection !== generation) throw refusalError('NOT_AVAILABLE', 'Session source changed');
+      const [flagged] = projectSessionRows([owner.listView ? owner.peekSession(sessionId) ?? row : row]);
+      if (!owner.listView && flagged !== undefined) sessionRowCache.set(String(flagged.id), flagged);
       return flagged;
     },
-    listSessions: async () => {
-      if (source === undefined || source === null) throw new Error('no DSH session source is attached');
-      const rows = await source.listSessions();
-      // The archive/delete/pin flags ride the source row's `status`/`pinnedAt`, which
-      // is how they reach the wire row (`cindy-session-row.js`) at every read path —
-      // list, get, and the row echoed back to a writer.
-      const flagged = projectSessionRows(rows);
-      sessionRowCache.clear();
-      for (const row of flagged) sessionRowCache.set(String(row.id), row);
+    listSessions: async (query = {}) => {
+      const owner = source, revision = sourceRevision, connection = generation;
+      if (owner == null) throw new Error('no DSH session source is attached');
+      const rows = await owner.listSessions({ ...query, projectRows: projectSessionRows });
+      if (source !== owner || revision !== sourceRevision || connection !== generation) throw refusalError('NOT_AVAILABLE', 'Session source changed');
+      const flagged = owner.listView ? rows : projectSessionRows(rows);
+      if (!owner.listView) {
+        sessionRowCache.clear();
+        for (const row of flagged) sessionRowCache.set(String(row.id), row);
+      }
       return flagged;
     },
     /**
@@ -1757,6 +2238,7 @@ export async function startHost(initialSource, settings = DEFAULT_HOST_SETTINGS,
         itemIds: (sessionId) => inputQueue.itemIds(sessionId),
       },
       /** Project a queue DSH actually reported, rather than the folded one. */
+      refreshInputProjection: nativeInboxRefresh.refresh,
       projectionFromItems: (sessionId, items, pending = null) => inputQueue.projectionFor(sessionId, sessionRowFor(sessionId), pending, items),
       /**
        * Tell every watcher what the queue looks like now.
@@ -1804,6 +2286,9 @@ export async function startHost(initialSource, settings = DEFAULT_HOST_SETTINGS,
       // the phone reaches any other screen watching the same session.
       pushGoalStatus: (sessionId, status) => pushSessionUpdate(sessionId, 'maker:goal:status-changed', { sessionId, goal: status }),
       ...provided,
+      // Intent is a controller/link lease, not advisory state shared by all phones.
+      historyView: provided.historyView ? { ...provided.historyView,
+        intent: (sessionId, refs, deviceId) => historyDelivery.intent(deviceId, sessionId, refs) } : null,
       ackInterrupted: (sid, peer) => diagnosticAction(sid, peer),
       dismissError: (sid, cid, peer) => diagnosticAction(sid, peer, cid),
       ...(typeof provided.readMessages === 'function' ? { readMessages: async (...args) => projectMessages(await provided.readMessages(...args)) } : {}),
@@ -1951,7 +2436,9 @@ export async function startHost(initialSource, settings = DEFAULT_HOST_SETTINGS,
       if ((nativeBoundaries.get(sessionId)?.seq ?? -1) >= event.seq) return;
       nativeBoundaries.set(sessionId, { seq: event.seq, turn: event.data?.turn });
     }
+    noteRetryPresentation(sessionId, event);
     turnVersions.set(sessionId, (turnVersions.get(sessionId) ?? 0) + 1);
+    if (liveAssistantWatches.has(sessionId)) pushHistoryViewChanged(sessionId, true);
     if (event) {
       const meta = advanceInterruptionMetadata(nativePresentationMetadata.get(sessionId), event, sessionId);
       nativePresentationMetadata.set(sessionId, meta); interruptionStates.set(sessionId, meta.interruption);
@@ -2038,7 +2525,9 @@ export async function startHost(initialSource, settings = DEFAULT_HOST_SETTINGS,
    * @param running - the turn state DSH just reported.
    */
   function publishRowTurnState(sessionId, running) {
-    publishRowPatch(sessionId, { running, ...presentationFields(sessionId, running), updatedAt: now().toISOString() });
+    publishRowPatch(sessionId, { running, ...presentationFields(sessionId, running) });
+    if (source?.listView && !sessionIsHidden(sessionId)) listDelivery.activity(subscribers,
+      { sessionId, phase: running ? 'running' : 'completed', compactDetail: '', attention: false });
   }
 
   /**
@@ -2052,11 +2541,20 @@ export async function startHost(initialSource, settings = DEFAULT_HOST_SETTINGS,
    * @param patch - the fields the controller's `local-db:sessions:patched` handler applies.
    */
   function publishRowPatch(sessionId, patch) {
-    const payload = { sessionId, patch };
     const devices = new Set(subscribers);
     for (const deviceId of sessionSubscribers.get(sessionId) ?? []) devices.add(deviceId);
+    if (source?.listView) {
+      const core = source.peekSession(sessionId);
+      const at = core?.lastActivityAt ?? patch.lastActivityAt;
+      if (typeof at !== 'string' || !Number.isFinite(Date.parse(at))) return;
+      patch = { ...patch, updatedAt: at, lastActivityAt: at };
+      listDelivery.patch(devices, sessionId, patch, Object.hasOwn(patch, 'status') || Object.hasOwn(patch, 'running'));
+      return;
+    }
+    const legacyAt = sessionRowFor(sessionId)?.updatedAt ?? model.rows.get(sessionId)?.updatedAt;
+    if (typeof legacyAt === 'string' && Number.isFinite(Date.parse(legacyAt))) patch = { ...patch, updatedAt: legacyAt, lastActivityAt: legacyAt };
+    const payload = { sessionId, patch };
     recordPush(sessionId, 'local-db:sessions:patched', devices.size, payload);
-    if (devices.size === 0) return;
     for (const dst of devices) if (acceptedControllers.has(dst) && policy.canAccept(dst)) send({ v: PROTOCOL_VERSION, kind: 'push', dst, payload: { channel: 'local-db:sessions:patched', payload } });
   }
 
@@ -2081,14 +2579,22 @@ export async function startHost(initialSource, settings = DEFAULT_HOST_SETTINGS,
     });
   }
   function publishSessionCreated(sessionId) {
+    if (source?.listView) {
+      // A create command may still be an unnamed draft. Native visibility commits
+      // emit discovery later, rather than telling the phone to pull an absent row.
+      source.invalidateSession(sessionId);
+      return;
+    }
     if (ws !== null) publishLifecycle(ws, subscribers, { kind: 'session-added', sessionId },
       (channel, count, payload) => recordPush(sessionId, channel, count, payload));
   }
   function publishSessionMeta(sessionId, patch) {
     if (patch?.clearedAt !== undefined || patch?.status === 'deleted' || patch?.status === 'archived') {
       for (const deviceId of sessionSubscribers.get(sessionId) ?? []) historyDelivery.forget(deviceId, sessionId);
+      syncLiveAssistantWatchers();
     }
-    publishRowPatch(sessionId, { ...patch, updatedAt: now().toISOString() });
+    publishRowPatch(sessionId, patch);
+    if (source?.listView) listDelivery.reseed(subscribers);
   }
 
   /**
@@ -2105,18 +2611,25 @@ export async function startHost(initialSource, settings = DEFAULT_HOST_SETTINGS,
    * @param deviceId - the controller that re-linked.
    */
   async function announceRunningSessions(deviceId) {
+    const owner = source; const revision = sourceRevision; const connection = generation;
+    const versions = new Map(turnVersions);
     let rows;
     try {
       rows = await listSessionRowsForAnnouncement();
     } catch {
       return;
     }
+    if (stopped || !active || source !== owner || sourceRevision !== revision || generation !== connection
+      || !acceptedControllers.has(deviceId) || !policy.canAccept(deviceId)) return;
     const running = rows.filter((row) => row?.running === true && !sessionIsHidden(row.id));
-    if (running.length === 0) return;
     for (const row of running) {
-      const payload = { sessionId: String(row.id), event: runningStatusEvent() };
-      recordPush(String(row.id), 'maker:event', 1, payload);
-      send({ v: PROTOCOL_VERSION, kind: 'push', dst: deviceId, payload: { channel: 'maker:event', payload } });
+      const sessionId = String(row.id);
+      if (versions.get(sessionId) !== turnVersions.get(sessionId)) continue;
+      for (const event of runningEvents(sessionId)) {
+        const payload = { sessionId, event };
+        recordPush(sessionId, 'maker:event', 1, payload);
+        send({ v: PROTOCOL_VERSION, kind: 'push', dst: deviceId, payload: { channel: 'maker:event', payload } });
+      }
     }
   }
 
@@ -2138,6 +2651,8 @@ export async function startHost(initialSource, settings = DEFAULT_HOST_SETTINGS,
       if ((nativeBoundaries.get(sessionId)?.seq ?? -1) >= event.seq) return;
       nativeBoundaries.set(sessionId, { seq: event.seq, turn: event.data?.turn });
     }
+    if (event) noteRetryPresentation(sessionId, event);
+    else retryPresentations.delete(sessionId);
     turnVersions.set(sessionId, (turnVersions.get(sessionId) ?? 0) + 1);
     interruptionStates.set(sessionId, null);
     if (event) nativePresentationMetadata.set(sessionId, advanceInterruptionMetadata(nativePresentationMetadata.get(sessionId), event, sessionId));
@@ -2404,10 +2919,25 @@ export async function startHost(initialSource, settings = DEFAULT_HOST_SETTINGS,
       recordInvoke(channel, reply, undefined, frame?.src, ask);
       return reply;
     }
+    const isListRead = channel === 'local-db:sessions:list' || channel === 'local-db:sessions:get';
+    const deadline = Date.now() + (options.listReadTimeoutMs ?? 5000);
     try {
-      const reply = await routeInvoke(frame);
-      recordInvoke(channel, reply, undefined, frame?.src, ask);
-      return reply;
+      for (let retry = 0; retry < 8; retry++) {
+        if (isListRead && Date.now() >= deadline) throw refusalError('NOT_AVAILABLE', 'Session list read budget expired');
+        const owner = source, revision = owner?.listVersion?.();
+        let timer, reply;
+        const pending = routeInvoke(frame);
+        try {
+          reply = isListRead ? await Promise.race([pending, new Promise((_, reject) => {
+            timer = setTimeout(() => reject(refusalError('NOT_AVAILABLE', 'Session list is rebuilding; synchronize again')), Math.max(1, deadline - Date.now()));
+          })]) : await pending;
+        } finally { if (timer) clearTimeout(timer); }
+        if (isListRead && owner === source && revision !== owner?.listVersion?.()) continue;
+        if (isListRead && reply) Object.defineProperty(reply, '_listVersion', { value: owner?.listVersion?.() });
+        recordInvoke(channel, reply, undefined, frame?.src, ask);
+        return reply;
+      }
+      throw refusalError('NOT_AVAILABLE', 'Session list is changing; synchronize again');
     } catch (failure) {
       recordInvoke(channel, null, failure, frame?.src, ask);
       throw failure;
@@ -2475,6 +3005,7 @@ export async function startHost(initialSource, settings = DEFAULT_HOST_SETTINGS,
           userId: typeof payload.userId === 'string' ? payload.userId : null,
           protocolVersion: typeof payload.serverProtocolVersion === 'number' ? payload.serverProtocolVersion : null,
         });
+        for (const [key, receipt] of nativeRetirements) if (receipt.owner !== nativeOwner()) nativeRetirements.delete(key);
         if (typeof payload.userId === 'string' && typeof payload.deviceId === 'string') bindDeliveryNamespace([mediaBase, normalizeAuthBaseUrl(socketSession?.authBaseUrl), payload.userId, payload.deviceId].join('|'));
         status.setState('waiting');
         syncDeviceName();
@@ -2527,12 +3058,15 @@ export async function startHost(initialSource, settings = DEFAULT_HOST_SETTINGS,
       case 'link-open': {
         if (typeof frame.id !== 'string' || typeof frame.src !== 'string') return;
         if (!policy.canAccept(frame.src)) return;
+        listPeerLeases.set(frame.src, (listPeerLeases.get(frame.src) ?? 0) + 1);
+        listDelivery.forget(frame.src);
         historyDelivery.forget(frame.src);
         for (const sessionId of watchedSessionsByDevice.get(frame.src) ?? []) renewTurnLease(frame.src, sessionId);
         // A link-open is itself proof the relay has a route to this device.
         markDeviceReachable(frame.src);
         linkController(frame.src);
         send(acceptLink(frame, acceptedControllers));
+        if (source?.listView) listDelivery.recover(frame.src);
         // A controller that has just re-linked knows nothing about this Host's live state.
         //
         // Subscriptions live in this process's memory, so a Host restart (or any reconnect)
@@ -2558,8 +3092,10 @@ export async function startHost(initialSource, settings = DEFAULT_HOST_SETTINGS,
         for (const sessionId of watchedSessionsByDevice.get(frame.src) ?? []) renewTurnLease(frame.src, sessionId);
         filePeer.closePeer(frame.src);
         acceptedControllers.delete(frame.src);
+        listDelivery.forget(frame.src);
         historyDelivery.forget(frame.src);
         observeRemindersSource();
+        syncLiveAssistantWatchers();
         status.upsertDevice(frame.src, { isController: false });
         status.refreshConnectionState();
         return;
@@ -2594,23 +3130,41 @@ export async function startHost(initialSource, settings = DEFAULT_HOST_SETTINGS,
         const historyRead = historyDelivery.begin(frame);
         const invokeGeneration = generation;
         const invokeSocket = ws;
+        const invokeSource = source, invokeRevision = sourceRevision;
+        const invokeGrant = current?.controllers?.[frame.src]?.grantRevision;
+        const invokeLease = listPeerLeases.get(frame.src);
+        const validInvokeOwner = () => policy.canAccept(frame.src) && acceptedControllers.has(frame.src)
+          && current?.controllers?.[frame.src]?.grantRevision === invokeGrant;
         void handleInvoke(frame).then(
-          (reply) => {
+          async (reply) => {
             // `null` means the request was unaddressable; the relay guard above
             // already rejects those, so this only defends the invariant.
-            if (reply === null || invokeGeneration !== generation || invokeSocket !== ws) {
+            if (reply === null || invokeGeneration !== generation || invokeSocket !== ws || !validInvokeOwner() || (historyRead && !historyDelivery.pending(historyRead))) {
               historyDelivery.finish(historyRead, false); return;
+            }
+            if ((frame.payload?.channel === 'local-db:sessions:list' || frame.payload?.channel === 'local-db:sessions:get')
+              && (source !== invokeSource || sourceRevision !== invokeRevision || listPeerLeases.get(frame.src) !== invokeLease)) {
+              send(invokeError(frame, 'NOT_AVAILABLE', 'Session list scope changed; synchronize again'));
+              return;
             }
             // Fitting and sending are Host code on a reply that ultimately came from DSH, so
             // they are exactly where an unexpected shape would surface — and a throw from
             // inside a `.then` callback is an unhandled rejection, which this process treats
             // as fatal. The controller still needs an answer, so it gets one.
             try {
-              const fitted = fitReplyToFrame(reply, frame);
+              let encoded = reply;
+              if (frame.payload?.channel === 'local-db:sessions:list' && frame.payload?.transfer) encoded = await listEncoder.encode(reply, frame);
+              if (invokeGeneration !== generation || invokeSocket !== ws || !validInvokeOwner()) return;
+              if ((frame.payload?.channel === 'local-db:sessions:list' || frame.payload?.channel === 'local-db:sessions:get')
+                && (source !== invokeSource || sourceRevision !== invokeRevision || listPeerLeases.get(frame.src) !== invokeLease
+                  || reply._listVersion !== source?.listVersion?.())) {
+                send(invokeError(frame, 'NOT_AVAILABLE', 'Session list changed during encoding; synchronize again')); return;
+              }
+              const fitted = fitReplyToFrame(encoded, frame);
               const sent = send(fitted);
               const page = fitted?.payload?.result;
               const complete = sent && fitted?.payload?.ok === true && page?.version === 1 && Array.isArray(page.items);
-              if (historyDelivery.finish(historyRead, complete)) pushHistoryViewChanged(historyRead.sessionId);
+              if (historyDelivery.finish(historyRead, complete, page)) pushHistoryViewChanged(historyRead.sessionId);
             } catch (error) {
               historyDelivery.finish(historyRead, false);
               recordHandlerError('invoke-reply', error);
@@ -2628,9 +3182,13 @@ export async function startHost(initialSource, settings = DEFAULT_HOST_SETTINGS,
             // restart were unattributable, and "which read is missing its budget" is the whole
             // question. `frame.payload.channel` is the only thing that answers it.
             historyDelivery.finish(historyRead, false);
-            if (invokeGeneration !== generation || invokeSocket !== ws) return;
+            if (invokeGeneration !== generation || invokeSocket !== ws || !validInvokeOwner()) return;
             recordHandlerError(`invoke:${typeof frame?.payload?.channel === 'string' ? frame.payload.channel : '?'}`, error);
-            send({ v: PROTOCOL_VERSION, kind: 'invoke-result', id: frame.id, dst: frame.src, payload: { ok: false, error: { code: 'INTERNAL', message: 'DSH Host failed to serve this channel' } } });
+            const unavailable = error?.refusalCode === 'NOT_AVAILABLE' || error?.code === 'NOT_AVAILABLE';
+            send({ v: PROTOCOL_VERSION, kind: 'invoke-result', id: frame.id, dst: frame.src, payload: { ok: false, error: {
+              code: unavailable ? 'NOT_AVAILABLE' : 'INTERNAL',
+              message: unavailable ? 'Native session state is rebuilding; synchronize again' : 'DSH Host failed to serve this channel',
+            } } });
           },
         );
         return;
@@ -2784,12 +3342,15 @@ export async function startHost(initialSource, settings = DEFAULT_HOST_SETTINGS,
     disposeReminderObservation?.(); disposeReminderObservation = null;
     if (!preserveExports) exportOwner.invalidate();
     generation += 1;
+    listDelivery.clear(); listPeerLeases.clear();
+    routeInvoke.invalidateSessionRows();
     deviceNameSync.reset(current?.deviceName?.trim() || null);
     filePeer.closeAll();
     stopHeartbeat();
     // A pending view invalidation has no socket to reach once this returns; firing it later
     // would push to a link that is gone.
     clearHistoryViewPushes();
+    clearLiveAssistantWatches();
     reasoningPublisher.clear();
     historyDelivery.clear();
     acceptedControllers.clear();
@@ -2797,6 +3358,7 @@ export async function startHost(initialSource, settings = DEFAULT_HOST_SETTINGS,
     sessionSubscribers.clear();
     liveTurnState.clear();
     nativeBoundaries.clear();
+    retryPresentations.clear();
     interruptionStates.clear();
     nativePresentationMetadata.clear();
     turnVersions.clear();
@@ -2863,6 +3425,7 @@ export async function startHost(initialSource, settings = DEFAULT_HOST_SETTINGS,
     policy.update(next);
     historyDelivery.clear();
     observeRemindersSource();
+    syncLiveAssistantWatchers();
     filePeer.pruneUnauthorized();
     fileExports.pruneUnauthorized();
     const wanted = next?.transportEnabled === true || next?.remoteControlEnabled === true;
@@ -2917,7 +3480,10 @@ export async function startHost(initialSource, settings = DEFAULT_HOST_SETTINGS,
       if (!active || stopped || !source || !owner || !deviceId || !['waiting', 'connected'].includes(status.snapshot().state)) return undefined;
       return { dataOwnerId: 'dsh:' + owner.runtimeId + ':' + deviceId + ':' + sourceRevision, ownerGeneration: owner.epoch };
     },
-    getStatus: () => ({ ...status.snapshot(), pluginVersion: HOST_PLUGIN_VERSION, nameSync: deviceNameSync.snapshot(), inputDelivery: { ready: activeDelivery !== null, version: activeDelivery ? 1 : null, pending: activeDelivery?.diagnostics().slice(0, 30) ?? [], lastError: deliveryLastError } }),
+    getStatus: () => ({ ...status.snapshot(), pluginVersion: HOST_PLUGIN_VERSION, nameSync: deviceNameSync.snapshot(), inputDelivery: { ready: activeDelivery !== null, version: activeDelivery ? 1 : null, pending: activeDelivery?.diagnostics().slice(0, 30) ?? [], lastError: deliveryLastError }, liveAssistant: [...liveAssistantWatches].map(([sessionId, state]) => ({
+      sessionId, oversizedRepairs: state.oversizedRepairs,
+      waitingDurable: [...state.delivered.values()].reduce((count, delivered) => count + delivered.waitingDurable.size, 0),
+    })) }),
     deleteDevice,
     subscribeStatus: (listener) => status.subscribe(listener),
     /** The most recent invokes this Host served, for the status route's diagnostics. */
@@ -3000,19 +3566,25 @@ export async function startHost(initialSource, settings = DEFAULT_HOST_SETTINGS,
     }),
     /** Push one live session message to the controllers watching that session. */
     pushSessionMessage,
+    invalidateHistoryView: pushHistoryViewChanged,
+    refreshInputProjection: nativeInboxRefresh.refresh,
     projectMessages,
     pushSessionReasoning: reasoningPublisher.noteEvent,
-    // Only explicit native scheduled/started retry events assert ongoing work.
-    // Failed attempts alone never terminate or start a turn.
+    // One projection for native retry scheduling, matched starts and real progress.
+    // Attempts never create transcript rows or independently end a turn.
     pushSessionDiagnostic: (sessionId, event) => {
-      if (!['llm/retry', 'llm/retry-started'].includes(event?.type)) return;
-      const row = turnDiagnosticRow(event, sessionId);
+      if (typeof sessionId !== 'string' || !sessionId) return;
       const boundary = nativeBoundaries.get(sessionId);
-      if (!row || (boundary?.seq ?? -1) >= event.seq
-        || (boundary?.turn !== undefined && boundary.turn !== event.data?.turn)) return;
-      turnVersions.set(sessionId, (turnVersions.get(sessionId) ?? 0) + 1);
+      if ((boundary?.seq ?? -1) > event?.seq
+        || (boundary?.turn !== undefined && boundary.turn !== event?.data?.turn)) return;
+      const previous = retryPresentations.get(sessionId);
+      if (!noteRetryPresentation(sessionId, event)) return;
+      if (['turn/start', 'turn/end'].includes(event.type)) return; // boundary publisher owns these
+      if (!['llm/retry', 'llm/retry-started'].includes(event.type) && !previous?.retry) return;
       setCachedRunning(sessionId, true);
-      pushSessionUpdate(sessionId, 'maker:event', { sessionId, event: runningStatusEvent(row.content) });
+      // Neutral status establishes the maker turn gate; the shared send path appends
+      // finite transport progress last, so Cindy cannot immediately clear it again.
+      pushSessionUpdate(sessionId, 'maker:event', { sessionId, event: runningStatusEvent() });
     },
     /**
      * Announce a real turn boundary to a session's watchers.
@@ -3076,30 +3648,32 @@ export async function startHost(initialSource, settings = DEFAULT_HOST_SETTINGS,
     askUserQuestion,
     /** Fold one `sessionController.control()` frame into the input queue. */
     applyControlFrame: (frame) => {
+      const updates = controlProjectionUpdates(frame);
+      const ids = new Set(updates.map(update => update.sessionId));
+      if (typeof frame?.sessionId === 'string' && frame.sessionId) ids.add(frame.sessionId);
+      if (frame?.type === 'baseline') {
+        nativeInputBaseline++; nativeInputRevisions.clear();
+        for (const id of [...Object.keys(frame.value?.queues ?? {}), ...Object.keys(frame.value?.jobs ?? {})]) ids.add(id);
+      } else for (const id of ids) {
+        if (frame.type === 'queue' || updates.some(update => update.sessionId === id && Object.hasOwn(update.values, 'inbox'))) {
+          nativeInputRevisions.set(id, (nativeInputRevisions.get(id) ?? 0) + 1);
+        }
+      }
+      const before = new Map([...ids].map(id => [id, toGoalStatusPayload(id, projections.goalOf(id))]));
       inputQueue.apply(frame);
-      // Reuse DSH's existing source-owned control stream: no per-phone job
-      // stream, output cursor or extra observer remains alive after disconnect.
+      projections.apply(frame);
       if (frame?.type === 'jobs' && typeof frame.sessionId === 'string') publishNativeJobUpdates(frame.sessionId, frame.jobs);
       if (frame?.type === 'baseline') for (const [id, jobs] of Object.entries(frame.value?.jobs ?? {})) publishNativeJobUpdates(id, jobs);
-      // A goal the Host advances on its own — the round driver counting a round,
-      // the phase turning `complete` — changes the projection exactly like a user
-      // write does, and the controller's goal card refreshes from
-      // `maker:goal:status-changed` alone. Pushing only on our own writes left the
-      // card frozen at whatever it was when the session was opened.
-      const before = typeof frame?.sessionId === 'string' && frame.type !== 'baseline'
-        ? toGoalStatusPayload(frame.sessionId, projections.goalOf(frame.sessionId))
-        : undefined;
-      projections.apply(frame);
-      // A queue or job change is the controller's `maker:input:projection`
-      // topic. Pushing it is what keeps the composer live after an enqueue that
-      // the controller only saw the answer to.
-      const sessionId = frame?.type === 'baseline' ? null : frame?.sessionId;
-      if (typeof sessionId === 'string' && sessionId !== '') {
+      for (const {sessionId, values} of updates) if (Array.isArray(values.jobs)) publishNativeJobUpdates(sessionId, values.jobs);
+      for (const sessionId of ids) {
         const after = toGoalStatusPayload(sessionId, projections.goalOf(sessionId));
-        if (after !== undefined && JSON.stringify(after) !== JSON.stringify(before)) {
-          pushSessionUpdate(sessionId, 'maker:goal:status-changed', { sessionId, goal: after });
+        if (after !== undefined && JSON.stringify(after) !== JSON.stringify(before.get(sessionId))) {
+          pushSessionUpdate(sessionId, 'maker:goal:status-changed', {sessionId, goal: after});
         }
-        pushSessionUpdate(sessionId, 'maker:input:projection', inputQueue.projectionFor(sessionId, sessionRowFor(sessionId)));
+        if (frame.type === 'baseline' || frame.type === 'queue' || frame.type === 'jobs' ||
+          updates.some(update => update.sessionId === sessionId && (Object.hasOwn(update.values, 'inbox') || Object.hasOwn(update.values, 'jobs')))) {
+          pushSessionUpdate(sessionId, 'maker:input:projection', inputQueue.projectionFor(sessionId, sessionRowFor(sessionId)));
+        }
       }
     },
     /** The controller's `InputProjection` for one session. */
@@ -3160,7 +3734,10 @@ export async function startHost(initialSource, settings = DEFAULT_HOST_SETTINGS,
     // Explicit successful login/select only; never called by Export or refresh.
     beginIdentityChange: () => disconnect({ keepSwitch: true }),
     getTransferDiagnostics: () => ({ ...transferDiagnostics.snapshot(), jobs: fileExports.getStats() }),
+    getListDeliveryDiagnostics: () => ({ ...listDelivery.diagnostics(), transfer: listEncoder.diagnostics() }),
     setSource,
+    syncLiveAssistantWatchers,
+    getMessagePresentationVersion: () => JSON.stringify([presentationOwner(), presentationData()]),
     stop,
     get sessionDeviceId() {
       return session?.deviceId ?? null;
