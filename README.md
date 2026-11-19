@@ -4,17 +4,20 @@ A Host-side adapter connecting current Cindy clients to DeepSeek Harness.
 
 ## Requirements and installation
 
-Version **0.1.44** publishes the locally accepted `0.1.44-local.6` implementation: native conversation/control synchronization and bounded, row-versioned session-list repair. Cindy's handshake identity remains `0.1.82`; this is not a Cindy app update.
+Version **0.1.45** adds DSH `0.2.2-rc.5` compatibility to the native conversation/control synchronization and session-list repair shipped in `0.1.44`. Cindy's handshake identity remains `0.1.82`; this is not a Cindy app update.
 
 **Upgrade boundary:** list discovery temporarily excludes sessions explicitly reported by DSH as `migration-required`; their logs are not deleted. Native migration back to the current format restores discovery. Initial coverage of a large corpus and resource pressure can still exceed the five-second read budget. Do not clear credentials or repeatedly sign in to mask synchronization failures. See [0.1.44 scope and verification](<doc/releases/0.1.44.md>).
 
-It supports the exact **DSH 0.2.2-rc.1, 0.2.2-rc.2 and 0.2.2-rc.3** carriers, while retaining `0.2.2-alpha.2`, `0.2.1-rc.3`, `0.2.1-rc.4` and `0.2.1-rc.5`. DSH 0.2.2 requires **Node.js >=24.9**; older carriers retain this plugin's Node.js >=22.16 minimum. Agent/session/settings peers are explicitly allowed, not a blanket promise for future prereleases. The previously released 0.1.43 compatibility validation remains documented in [its release record](<doc/releases/0.1.43.md>); current validation and the limited local handset acceptance belong to [0.1.44](<doc/releases/0.1.44.md>). Installation, running-version activation, relay and handset acceptance are distinct checks.
+It supports the exact **DSH 0.2.2-rc.1, 0.2.2-rc.2, 0.2.2-rc.3 and 0.2.2-rc.5** carriers, while retaining `0.2.2-alpha.2`, `0.2.1-rc.3`, `0.2.1-rc.4` and `0.2.1-rc.5`. DSH 0.2.2 requires **Node.js >=24.9**; older carriers retain this plugin's Node.js >=22.16 minimum. Agent/session/settings peers are explicitly allowed, not a blanket promise for future prereleases. See the [RC5 validation record](<doc/releases/0.1.45.md>) and the previous [0.1.44 verification](<doc/releases/0.1.44.md>). Installation, running-version activation, relay and handset acceptance are distinct checks.
 
-Install `dsh-cindy-host@0.1.44` through the Desktop plugin manager; CLI-managed profiles can use:
+To install the locally built `0.1.45` candidate in a CLI-managed profile:
 
 ```sh
-dsh plugin --profile <profile> add dsh-cindy-host@0.1.44
+npm pack
+dsh plugin --profile <profile> add <absolute-path-to-dsh-cindy-host-0.1.45.tgz>
 ```
+
+For the current npm release (`0.1.44`, which does not support `0.2.2-rc.5`), use the Desktop plugin manager or `dsh plugin --profile <profile> add dsh-cindy-host@0.1.44`.
 
 Reload the Host plugin after installation. A full DSH restart is separate. Keep existing Cindy sign-in, device identity and settings; do not run two Host processes with the same identity.
 

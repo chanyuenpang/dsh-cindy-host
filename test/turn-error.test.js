@@ -22,6 +22,19 @@ test('failed turn has a bounded safe row and matching terminal identity', () => 
   assert.equal(payload.event.data.willRetry, false);
 });
 
+test('DSH content refusal has a safe, terminal diagnostic in history and live pushes', () => {
+  const event = failed(2, { code: 'CONTENT_REFUSED', status: undefined, requestId: 'SECRET' });
+  const [row] = foldSessionEvent(event, { sessionId: 's1' });
+  assert.deepEqual(row.content, {
+    code: 'CONTENT_REFUSED', reason: 'dsh-turn-error',
+    message: 'The model provider refused this request. (CONTENT_REFUSED)',
+  });
+  assert.equal(turnErrorPayload(row).event.data.code, 'CONTENT_REFUSED');
+  assert.equal(turnErrorPayload(row).event.data.willRetry, false);
+  const legacy = turnErrorRow(failed(2, { code: 'MALFORMED_RESPONSE', status: undefined }), 's1');
+  assert.equal(legacy.content.code, undefined, 'a legacy malformed response is not necessarily a refusal');
+});
+
 test('unknown failure fields and status are not reflected or inferred from prose', () => {
   const row = turnErrorRow(failed(2, { code: 'SECRET', status: 'SECRET', requestId: 'SECRET', cause: { token: 'SECRET' } }), 's1');
   assert.deepEqual(row.content, { message: 'This turn failed. See the local DSH diagnostics for details.', reason: 'dsh-turn-error' });

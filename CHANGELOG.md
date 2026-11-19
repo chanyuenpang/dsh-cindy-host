@@ -1,5 +1,10 @@
 # Changelog
 
+## 0.1.45 (unpublished) — 2026-11-19
+
+- Accept the exact DSH `0.2.2-rc.5` Agent/Session/Settings carrier; keep previously supported versions and continue to reject unverified versions, including `0.2.2-rc.4`. DSH core packages still come from the runtime, not the plugin.
+- Display the native `CONTENT_REFUSED` terminal error with a fixed message in Cindy history and live updates, without exposing provider text. Keep Cindy handshake identity `0.1.82` separate from the plugin version.
+
 ## 0.1.44 — 2026-11-17
 
 - Publish the same runtime implementation as the locally accepted `0.1.44-local.6`, with formal release identity only; retain Cindy handshake `0.1.82` and the existing exact DSH peer matrix, including tested `0.2.2-rc.3`.

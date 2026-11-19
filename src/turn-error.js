@@ -15,6 +15,7 @@ const SAFE_MESSAGES = new Map([
   ['TRANSPORT', 'The model connection failed.'],
   ['SERVER', 'The model service failed.'],
   ['EMPTY_RESPONSE', 'The model returned an empty response.'],
+  ['CONTENT_REFUSED', 'The model provider refused this request.'],
   ['NO_ADAPTER', 'The selected model route is unavailable.'],
 ]);
 
