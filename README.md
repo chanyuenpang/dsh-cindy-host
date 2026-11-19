@@ -10,14 +10,11 @@ Version **0.1.45** adds DSH `0.2.2-rc.5` compatibility to the native conversatio
 
 It supports the exact **DSH 0.2.2-rc.1, 0.2.2-rc.2, 0.2.2-rc.3 and 0.2.2-rc.5** carriers, while retaining `0.2.2-alpha.2`, `0.2.1-rc.3`, `0.2.1-rc.4` and `0.2.1-rc.5`. DSH 0.2.2 requires **Node.js >=24.9**; older carriers retain this plugin's Node.js >=22.16 minimum. Agent/session/settings peers are explicitly allowed, not a blanket promise for future prereleases. See the [RC5 validation record](<doc/releases/0.1.45.md>) and the previous [0.1.44 verification](<doc/releases/0.1.44.md>). Installation, running-version activation, relay and handset acceptance are distinct checks.
 
-To install the locally built `0.1.45` candidate in a CLI-managed profile:
+Install `dsh-cindy-host@0.1.45` through the Desktop plugin manager, or install it in a CLI-managed profile:
 
 ```sh
-npm pack
-dsh plugin --profile <profile> add <absolute-path-to-dsh-cindy-host-0.1.45.tgz>
+dsh plugin --profile <profile> add dsh-cindy-host@0.1.45
 ```
-
-For the current npm release (`0.1.44`, which does not support `0.2.2-rc.5`), use the Desktop plugin manager or `dsh plugin --profile <profile> add dsh-cindy-host@0.1.44`.
 
 Reload the Host plugin after installation. A full DSH restart is separate. Keep existing Cindy sign-in, device identity and settings; do not run two Host processes with the same identity.
 
