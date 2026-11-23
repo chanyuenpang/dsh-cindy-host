@@ -23,7 +23,7 @@ const anchor = pathToFileURL(join(runtimeDir, 'package.json'));
 const requireRuntime = createRequire(anchor);
 const load = name => import(pathToFileURL(requireRuntime.resolve(`@deepseek-ai/${name}`)));
 const version = JSON.parse(await readFile(requireRuntime.resolve('@deepseek-ai/dsh-session/package.json'), 'utf8')).version;
-assert.ok(['0.2.2-alpha.2', '0.2.2-rc.1', '0.2.2-rc.2', '0.2.2-rc.3', '0.2.2-rc.5'].includes(version), 'This fixture matrix targets reviewed DSH 0.2.2 carriers only');
+assert.ok(['0.2.2-alpha.2', '0.2.2-rc.1', '0.2.2-rc.2', '0.2.2-rc.3', '0.2.2-rc.5', '0.2.3-alpha.2'].includes(version), 'This fixture matrix targets the reviewed DSH carriers with a preset lease');
 const manifest = JSON.parse(await readFile(join(pluginDir, 'package.json'), 'utf8'));
 const requirePlugin = createRequire(pathToFileURL(join(pluginDir, 'package.json')));
 for (const peer of ['dsh-session', 'schemastery']) {
@@ -32,10 +32,10 @@ for (const peer of ['dsh-session', 'schemastery']) {
 const { evaluatePluginCompatibility } = await load('dsh-app-boot');
 let count = 0;
 function passed(name) { count++; console.log(`PASS ${name}`); }
-for (const supported of ['0.2.1-rc.3', '0.2.1-rc.4', '0.2.1-rc.5', '0.2.2-alpha.2', '0.2.2-rc.1', '0.2.2-rc.2', '0.2.2-rc.3', '0.2.2-rc.5']) {
+for (const supported of ['0.2.1-rc.3', '0.2.1-rc.4', '0.2.1-rc.5', '0.2.2-alpha.2', '0.2.2-rc.1', '0.2.2-rc.2', '0.2.2-rc.3', '0.2.2-rc.5', '0.2.3-alpha.2']) {
   assert.equal(evaluatePluginCompatibility(manifest, {}, supported), undefined);
 }
-for (const unsupported of ['0.2.2-alpha.1', '0.2.2-alpha.3', '0.2.2-rc.4', '0.2.2-rc.6', '0.2.2', '0.3.0']) {
+for (const unsupported of ['0.2.2-alpha.1', '0.2.2-alpha.3', '0.2.2-rc.4', '0.2.2-rc.6', '0.2.2', '0.2.3-alpha.1', '0.2.3-alpha.3', '0.2.3', '0.3.0']) {
   assert.ok(evaluatePluginCompatibility(manifest, {}, unsupported));
 }
 passed('actual DSH compatibility evaluator admits reviewed carriers and rejects unreviewed ones');
@@ -43,6 +43,7 @@ const semver = requireRuntime('semver');
 const schemaVersion = JSON.parse(await readFile(requireRuntime.resolve('@deepseek-ai/schemastery/package.json'), 'utf8')).version;
 assert.ok(semver.satisfies(schemaVersion, manifest.peerDependencies['@deepseek-ai/schemastery']));
 assert.ok(!semver.satisfies('3.18.6-alpha.2', manifest.peerDependencies['@deepseek-ai/schemastery']));
+assert.ok(!semver.satisfies('3.20.0-alpha.2', manifest.peerDependencies['@deepseek-ai/schemastery']));
 passed('the actual DSH Schemastery satisfies the plugin peer, without admitting future alphas');
 for (const [module, exportName, methods] of [
   ['dsh-api-session-controller', 'SessionController', ['list', 'create', 'resolveAgent', 'selectModel', 'modelCatalog', 'prompt', 'updateQueue', 'cancel']],

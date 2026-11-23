@@ -1,5 +1,14 @@
 /** Explicit unavailable features, not claims of client support or successful execution. */
 export const UNSUPPORTED_INVOKES = new Map([
+  ['agent-island:task-activity', 'No Cindy Agent Island snapshot producer is composed; DSH session activity uses its existing session projection.'],
+  ['maker:list-plugin-engines', 'Cindy plugin engines have no registry in this Host. The mobile catalog falls back to an empty plugin-engine list on refusal.'],
+  ['maker:refresh-plugin-engines', 'There is no Cindy plugin-engine registry to refresh; the mobile refresh tolerates refusal.'],
+  ['maker:get-plugin-engine-usage', 'Cindy plugin-engine subscription usage has no corresponding owner in DSH; it is separate from native session usage.'],
+  ['model-groups:get', 'This Host does not own Cindy model-group policy. The mobile catalog falls back to no model groups on refusal.'],
+  ['model-groups:resolve', 'Cindy model-group resolution requires the controlled device policy store; native DSH model selection is separate.'],
+  ['model-groups:commit', 'This Host produces no Cindy model-group decision receipt that it could commit.'],
+  ['model-groups:bind-session', 'This Host does not store Cindy model-group bindings on DSH sessions.'],
+  ['model-groups:route-note', 'This Host does not write Cindy model-group routing notes into DSH history.'],
   ['device-link:agent-net-switch:v1', 'No remote agent network/proxy switching adapter is exposed; native DSH network policy is not overridden.'],
   ['maker:settings:navigate', 'Remote Cindy settings navigation is not a DSH settings mutation or UI-navigation contract.'],
   ['maker:subscription-accounts', 'No Cindy subscription-account pool or credential-routing registry is exposed.'],

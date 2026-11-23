@@ -1,5 +1,10 @@
 # Changelog
 
+## 0.1.46 — 2026-11-23
+
+- Add exact Agent, Session and Settings peers for DSH `0.2.3-alpha.2` and its Schemastery `3.20.0-alpha.1` peer. The host supplies the DSH packages. The DSH alpha CLI requires Node.js `^24.22.3 || >=26.13.1`.
+- Record explicit refusals for Cindy's Agent Island activity, plugin-engine registry and usage, and model-group policy calls. Cindy's mobile plugin-engine and model-group catalog reads handle the refusal.
+
 ## 0.1.45 — 2026-11-19
 
 - Accept the exact DSH `0.2.2-rc.5` Agent/Session/Settings carrier; keep previously supported versions and continue to reject unverified versions, including `0.2.2-rc.4`. DSH core packages still come from the runtime, not the plugin.
